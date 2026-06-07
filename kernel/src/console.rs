@@ -5,6 +5,13 @@ use frame::sync::SpinIrq;
 use crate::process::Pid;
 use crate::wait::WaitQueue;
 
+mod fb;
+mod font;
+
+pub fn install_screen_sink() {
+    frame::io::uart::set_console_sink(fb::putbytes);
+}
+
 const RING_CAPACITY: usize = 4096;
 const LINE_MAX: usize = 4096;
 
@@ -56,6 +63,9 @@ struct State {
     line: Vec<u8>,
     eof_pending: bool,
     last_reader: Option<Pid>,
+    kbd_shift: bool,
+    kbd_ctrl: bool,
+    kbd_caps: bool,
 }
 
 impl State {
@@ -66,6 +76,9 @@ impl State {
             line: Vec::new(),
             eof_pending: false,
             last_reader: None,
+            kbd_shift: false,
+            kbd_ctrl: false,
+            kbd_caps: false,
         }
     }
 }
@@ -143,8 +156,11 @@ fn process_input(b: u8, t: &[u8; 36], st: &mut State) {
     let isig = (lflag & ISIG) != 0;
 
     if isig && intr != 0 && b == intr {
-        if let Some(pid) = st.last_reader {
-            const SIGINT: u32 = 2;
+        const SIGINT: u32 = 2;
+        let fg = crate::syscall::console_fg_pgrp();
+        if fg != 0 {
+            crate::sched::signal_pgrp(Pid(fg), SIGINT);
+        } else if let Some(pid) = st.last_reader {
             let info = crate::signal::SigInfo::for_fault(SIGINT, 0);
             let _ = crate::sched::send_signal_with_info(pid, SIGINT, info);
         }
@@ -236,6 +252,130 @@ pub fn poll_rx_from_tick() {
     if woke {
         let waiters = READERS.drain();
         for pid in waiters {
+            let _ = crate::sched::wake_pid(pid);
+        }
+    }
+}
+
+
+const KBD_LSHIFT: u16 = 42;
+const KBD_RSHIFT: u16 = 54;
+const KBD_LCTRL: u16 = 29;
+const KBD_RCTRL: u16 = 97;
+const KBD_CAPSLOCK: u16 = 58;
+
+fn keycode_to_ascii(kc: u16, shift: bool) -> Option<u8> {
+    let (lo, hi): (u8, u8) = match kc {
+        1 => (0x1b, 0x1b), // Esc
+        2 => (b'1', b'!'),
+        3 => (b'2', b'@'),
+        4 => (b'3', b'#'),
+        5 => (b'4', b'$'),
+        6 => (b'5', b'%'),
+        7 => (b'6', b'^'),
+        8 => (b'7', b'&'),
+        9 => (b'8', b'*'),
+        10 => (b'9', b'('),
+        11 => (b'0', b')'),
+        12 => (b'-', b'_'),
+        13 => (b'=', b'+'),
+        14 => (0x7f, 0x7f), 
+        15 => (b'\t', b'\t'),
+        16 => (b'q', b'Q'),
+        17 => (b'w', b'W'),
+        18 => (b'e', b'E'),
+        19 => (b'r', b'R'),
+        20 => (b't', b'T'),
+        21 => (b'y', b'Y'),
+        22 => (b'u', b'U'),
+        23 => (b'i', b'I'),
+        24 => (b'o', b'O'),
+        25 => (b'p', b'P'),
+        26 => (b'[', b'{'),
+        27 => (b']', b'}'),
+        28 => (b'\r', b'\r'), 
+        30 => (b'a', b'A'),
+        31 => (b's', b'S'),
+        32 => (b'd', b'D'),
+        33 => (b'f', b'F'),
+        34 => (b'g', b'G'),
+        35 => (b'h', b'H'),
+        36 => (b'j', b'J'),
+        37 => (b'k', b'K'),
+        38 => (b'l', b'L'),
+        39 => (b';', b':'),
+        40 => (b'\'', b'"'),
+        41 => (b'`', b'~'),
+        43 => (b'\\', b'|'),
+        44 => (b'z', b'Z'),
+        45 => (b'x', b'X'),
+        46 => (b'c', b'C'),
+        47 => (b'v', b'V'),
+        48 => (b'b', b'B'),
+        49 => (b'n', b'N'),
+        50 => (b'm', b'M'),
+        51 => (b',', b'<'),
+        52 => (b'.', b'>'),
+        53 => (b'/', b'?'),
+        55 => (b'*', b'*'), 
+        57 => (b' ', b' '), 
+        _ => return None,
+    };
+    Some(if shift { hi } else { lo })
+}
+
+pub(crate) fn feed_keycode(keycode: u16, press: bool) {
+    if kbd_mode_get() != K_XLATE {
+        return;
+    }
+    let t = live_termios();
+    let mut woke = false;
+    {
+        let mut st = STATE.lock();
+        match keycode {
+            KBD_LSHIFT | KBD_RSHIFT => {
+                st.kbd_shift = press;
+                return;
+            }
+            KBD_LCTRL | KBD_RCTRL => {
+                st.kbd_ctrl = press;
+                return;
+            }
+            KBD_CAPSLOCK => {
+                if press {
+                    st.kbd_caps = !st.kbd_caps;
+                }
+                return;
+            }
+            _ => {}
+        }
+        if !press {
+            return; 
+        }
+        let Some(mut b) = keycode_to_ascii(keycode, st.kbd_shift) else {
+            return;
+        };
+
+        if st.kbd_caps && b.is_ascii_alphabetic() {
+            b ^= 0x20;
+        }
+          if st.kbd_ctrl {
+            let up = b.to_ascii_uppercase();
+            if (b'@'..=b'_').contains(&up) {
+                b = up & 0x1f;
+            } else if b == b'?' {
+                b = 0x7f;
+            }
+        }
+        let before = st.cooked.len + st.eof_pending as usize;
+        process_input(b, &t, &mut st);
+        let after = st.cooked.len + st.eof_pending as usize;
+        if after > before {
+            woke = true;
+        }
+    }
+    if woke {
+        for pid in READERS.drain() {
             let _ = crate::sched::wake_pid(pid);
         }
     }

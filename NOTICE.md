@@ -45,6 +45,20 @@ direct dependencies. Transitive dependencies are visible in
 separate workspace from the main kernel build). It is not
 linked into the kernel ELF.
 
+## Embedded fonts
+
+The console framebuffer text renderer embeds a 1-bit bitmap glyph table
+in `kernel/src/console/font.rs`:
+
+| Font | Variant | License | Source |
+|---|---|---|---|
+| Unscii | `unscii-16` (8×16) | Public Domain | http://viznut.fi/unscii/ |
+
+Unscii is by Viznut; the `unscii-16` variant is dedicated to the public
+domain. We embed only that variant — **not** `unscii-16-full`, which is
+GPL because it incorporates GNU Unifont — and only its printable-ASCII
+range (U+0020..U+007E).
+
 ## Specifications consulted
 
 Per the clean-room policy in [docs/CLEAN-ROOM.md](docs/CLEAN-ROOM.md),
@@ -70,12 +84,13 @@ system's source code. The specifications consulted include:
   RFC numbers are cited in the source comments of the relevant
   networking modules.
 
-Each piece of code in `kernel/`, `frame/`, `frame_host/`,
-`drivers/`, and `runtime/` is original work written by the
-Cyphera Kernel authors with reference to the specifications
-above. No source code from the Linux kernel, FreeBSD, OpenBSD,
-NetBSD, illumos, Darwin, or any other operating system was
-consulted while writing Cyphera Kernel.
+Apart from the public-domain console font noted under "Embedded
+fonts" above, each piece of code in `kernel/`, `frame/`,
+`frame_host/`, `drivers/`, and `runtime/` is original work written by
+the Cyphera Kernel authors with reference to the specifications above.
+No source code from the Linux kernel, FreeBSD, OpenBSD, NetBSD,
+illumos, Darwin, or any other operating system was consulted while
+writing Cyphera Kernel.
 
 ## Trademarks
 

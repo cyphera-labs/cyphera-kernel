@@ -49,6 +49,37 @@ fn char_stat() -> Stat {
     Stat::fresh(InodeKind::CharDevice, 0, 0o666)
 }
 
+pub fn vda() -> Arc<dyn Inode> {
+    Arc::new(Vda)
+}
+
+struct Vda;
+
+impl Inode for Vda {
+    fn kind(&self) -> InodeKind {
+        InodeKind::CharDevice
+    }
+    fn stat(&self) -> Stat {
+        char_stat()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
+            return Err(FsError::InvalidArgument);
+        }
+        crate::io::block_read(offset / 512, buf)
+            .map(|()| buf.len())
+            .map_err(|_| FsError::Io)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+        if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
+            return Err(FsError::InvalidArgument);
+        }
+        crate::io::block_write(offset / 512, buf)
+            .map(|()| buf.len())
+            .map_err(|_| FsError::Io)
+    }
+}
+
 struct Null;
 
 impl Inode for Null {

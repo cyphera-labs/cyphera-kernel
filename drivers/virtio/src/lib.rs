@@ -274,6 +274,26 @@ pub fn fb_write(offset: usize, src: &[u8]) -> usize {
     n
 }
 
+pub fn fb_scroll_up(rows: usize) {
+    let (ptr, len, w, _) = match framebuffer_info() {
+        Some(x) => x,
+        None => return,
+    };
+    let shift = rows.saturating_mul(w as usize).saturating_mul(4);
+    if shift == 0 || shift >= len {
+        return;
+    }
+    // SAFETY: ptr/len describe the host-allocated framebuffer (kernel
+    // lifetime). `copy` is overlap-safe (memmove); it moves [shift..len)
+    // down to [0..len-shift), then the freed tail [len-shift..len) is
+    // zeroed. shift < len, so both ranges are in-bounds.
+    unsafe {
+        let base = ptr as *mut u8;
+        core::ptr::copy(base.add(shift), base, len - shift);
+        core::ptr::write_bytes(base.add(len - shift), 0, shift);
+    }
+}
+
 pub fn gpu_flush() -> Result<(), Error> {
     let mut g = GPU.lock();
     let gpu = g.as_mut().ok_or(Error::NoDevice)?;

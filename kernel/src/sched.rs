@@ -522,13 +522,19 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
                 crate::ptrace::PTRACE_EVENT_FORK,
             )
         };
-        let (parent_tracer, trace_fork_set) = match g.processes.get(&parent_pid) {
-            Some(p) => (p.tracer_pid, (p.trace_options & event_opt_bit) != 0),
-            None => (None, false),
-        };
+        let (parent_tracer, trace_fork_set, parent_trace_options) =
+            match g.processes.get(&parent_pid) {
+                Some(p) => (
+                    p.tracer_pid,
+                    (p.trace_options & event_opt_bit) != 0,
+                    p.trace_options,
+                ),
+                None => (None, false, 0),
+            };
         if let (Some(tracer), true) = (parent_tracer, trace_fork_set) {
             child_box.tracer_pid = Some(tracer);
             child_box.trace_in_syscall_stop_mode = true;
+            child_box.trace_options = parent_trace_options;
         }
         g.processes.insert(child_pid, child_box);
         if let Some(p) = g.processes.get_mut(&parent_pid) {
@@ -732,17 +738,20 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
 
     {
         let mut g = GLOBAL.lock();
-        let (parent_tracer, trace_clone_set) = match g.processes.get(&parent_pid) {
-            Some(p) => (
-                p.tracer_pid,
-                (p.trace_options & crate::ptrace::PTRACE_O_TRACECLONE) != 0,
-            ),
-            None => (None, false),
-        };
+        let (parent_tracer, trace_clone_set, parent_trace_options) =
+            match g.processes.get(&parent_pid) {
+                Some(p) => (
+                    p.tracer_pid,
+                    (p.trace_options & crate::ptrace::PTRACE_O_TRACECLONE) != 0,
+                    p.trace_options,
+                ),
+                None => (None, false, 0),
+            };
         let mut child_box = Box::new(child);
         if let (Some(tracer), true) = (parent_tracer, trace_clone_set) {
             child_box.tracer_pid = Some(tracer);
             child_box.trace_in_syscall_stop_mode = true;
+            child_box.trace_options = parent_trace_options;
         }
         g.processes.insert(child_pid, child_box);
         if trace_clone_set {

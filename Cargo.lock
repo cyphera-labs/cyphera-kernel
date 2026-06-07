@@ -46,7 +46,7 @@ checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "cyphera-kernel"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "frame",
  "kernel",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "frame"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bitflags 2.12.1",
  "buddy_system_allocator",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "frame_host"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "hash32"
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bitflags 2.12.1",
  "frame",
@@ -304,11 +304,11 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "verification"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "virtio"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "frame",
  "virtio-drivers",

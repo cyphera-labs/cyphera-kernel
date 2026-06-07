@@ -108,6 +108,62 @@ impl BlockDevice for InMemoryDevice {
     }
 }
 
+#[cfg(not(host_test))]
+pub struct VirtioBlockDevice {
+    cap: u64,
+}
+
+#[cfg(not(host_test))]
+impl VirtioBlockDevice {
+    pub fn new() -> Option<Arc<Self>> {
+        let sectors = ::virtio::block_capacity_sectors()?;
+        Some(Arc::new(Self {
+            cap: sectors.saturating_mul(512),
+        }))
+    }
+}
+
+#[cfg(not(host_test))]
+impl BlockDevice for VirtioBlockDevice {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Ext4Error> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        offset
+            .checked_add(buf.len() as u64)
+            .filter(|&end| end <= self.cap)
+            .ok_or(Ext4Error::Io)?;
+        let first = offset / 512;
+        let last = (offset + buf.len() as u64 - 1) / 512;
+        let nsec = (last - first + 1) as usize;
+        let mut tmp = alloc::vec![0u8; nsec * 512];
+        crate::io::block_read(first, &mut tmp).map_err(|_| Ext4Error::Io)?;
+        let start = (offset - first * 512) as usize;
+        buf.copy_from_slice(&tmp[start..start + buf.len()]);
+        Ok(())
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), Ext4Error> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        offset
+            .checked_add(buf.len() as u64)
+            .filter(|&end| end <= self.cap)
+            .ok_or(Ext4Error::Io)?;
+        let first = offset / 512;
+        let last = (offset + buf.len() as u64 - 1) / 512;
+        let nsec = (last - first + 1) as usize;
+        let mut tmp = alloc::vec![0u8; nsec * 512];
+        crate::io::block_read(first, &mut tmp).map_err(|_| Ext4Error::Io)?;
+        let start = (offset - first * 512) as usize;
+        tmp[start..start + buf.len()].copy_from_slice(buf);
+        crate::io::block_write(first, &tmp).map_err(|_| Ext4Error::Io)
+    }
+    fn capacity_bytes(&self) -> u64 {
+        self.cap
+    }
+}
+
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_ROOT_INO: u32 = 2;
 
@@ -130,6 +186,18 @@ const FEATURE_INCOMPAT_SUPPORTED: u32 = FEATURE_INCOMPAT_FILETYPE
     | FEATURE_INCOMPAT_64BIT
     | FEATURE_INCOMPAT_FLEX_BG
     | FEATURE_INCOMPAT_META_BG;
+
+const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+const FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+const FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+const FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+
+const FEATURE_RO_COMPAT_SUPPORTED: u32 = FEATURE_RO_COMPAT_SPARSE_SUPER
+    | FEATURE_RO_COMPAT_LARGE_FILE
+    | FEATURE_RO_COMPAT_HUGE_FILE
+    | FEATURE_RO_COMPAT_DIR_NLINK
+    | FEATURE_RO_COMPAT_EXTRA_ISIZE;
 
 const I_MODE_FIFO: u16 = 0x1000;
 const I_MODE_CHR: u16 = 0x2000;
@@ -207,6 +275,9 @@ impl Superblock {
         };
         let blocks_count = ((blocks_count_hi as u64) << 32) | blocks_count_lo as u64;
         if log_block_size > 6 {
+            return Err(Ext4Error::BadSuperblock);
+        }
+        if blocks_per_group == 0 || inodes_per_group == 0 {
             return Err(Ext4Error::BadSuperblock);
         }
         let block_size: u32 = 1024u32 << log_block_size;
@@ -650,6 +721,10 @@ impl Ext4Fs {
                 | FEATURE_INCOMPAT_JOURNAL_DEV)
             != 0
         {
+            return Err(Ext4Error::UnsupportedFeature);
+        }
+
+        if sb.feature_ro_compat & !FEATURE_RO_COMPAT_SUPPORTED != 0 {
             return Err(Ext4Error::UnsupportedFeature);
         }
 

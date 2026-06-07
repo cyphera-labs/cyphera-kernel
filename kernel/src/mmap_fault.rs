@@ -91,7 +91,14 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
             .map(|v| (v.start, v.end, v.prot, v.flags, v.backing.clone()))
     }) {
         Some(v) => v,
-        None => return false,
+        None => {
+            const USER_STACK_BASE: u64 = 0x7000_0000_0000;
+            const USER_STACK_MAX_GROWTH: u64 = 8 * 1024 * 1024;
+            if (USER_STACK_BASE - USER_STACK_MAX_GROWTH..USER_STACK_BASE).contains(&page_addr) {
+                return grow_stack(page_addr);
+            }
+            return false;
+        }
     };
     let (vma_start, _vma_end, prot, vma_flags, backing) = snap;
 
@@ -227,6 +234,42 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
     } else {
         sched::record_minor_fault();
     }
+    true
+}
+
+fn grow_stack(page_addr: u64) -> bool {
+    use frame::mm::vm::Perms;
+    let cg = sched::current_cgroup();
+    if let Some(cg) = &cg {
+        if cg.try_charge_memory(4096).is_err() {
+            cg.oom_kill_one();
+            return false;
+        }
+    }
+    let frame: PhysFrame<Size4KiB> = match frame_alloc::alloc_frame() {
+        Some(f) => f,
+        None => {
+            if let Some(cg) = &cg {
+                cg.uncharge_memory(4096);
+            }
+            return false;
+        }
+    };
+    sched::add_cgroup_charge(4096);
+    zero_frame(frame);
+    let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(page_addr)) {
+        Ok(p) => p,
+        Err(_) => {
+            frame_alloc::free_frame(frame);
+            return false;
+        }
+    };
+    let mut vmspace = VmSpace::current();
+    if vmspace.map_one_frame(page, frame, Perms::USER_RW).is_err() {
+        frame_alloc::free_frame(frame);
+        return false;
+    }
+    sched::record_minor_fault();
     true
 }
 

@@ -133,7 +133,11 @@ fn init_vfs() {
         dev.attach(&name, fs::devfs::tty()).expect("attach tty[n]");
     }
     dev.attach("fb0", fs::devfs::fb0()).expect("attach fb0");
+    console::install_screen_sink();
     dev.attach("dsp", fs::devfs::dsp()).expect("attach dsp");
+    if virtio::block_capacity_sectors().is_some() {
+        dev.attach("vda", fs::devfs::vda()).expect("attach vda");
+    }
     let input_dir = fs::tmpfs::TmpfsInode::new_dir();
     let input_count = virtio::input_count();
     for i in 0..input_count {

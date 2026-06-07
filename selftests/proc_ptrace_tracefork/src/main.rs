@@ -28,6 +28,7 @@ const PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
 
 const PTRACE_EVENT_FORK: i32 = 1;
 const SIGSTOP: u64 = 19;
+const SIGTRAP: i32 = 5;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -121,6 +122,13 @@ pub extern "C" fn _start() -> ! {
         sys_exit(10);
     }
     log("P: GC auto-attached + stopped OK\n");
+    let gc_wstopsig = (gst >> 8) & 0xff;
+    if gc_wstopsig != (SIGTRAP | 0x80) {
+        log("P: GC syscall-stop missing TRACESYSGOOD; wstopsig=");
+        log_num(gc_wstopsig as i64);
+        sys_exit(13);
+    }
+    log("P: GC syscall-stop is SIGTRAP|0x80 (inherited options) OK\n");
     let _ = sys_ptrace(PTRACE_DETACH, gc_pid as u64, 0, 0);
 
     let _ = sys_ptrace(PTRACE_DETACH, c_pid as u64, 0, 0);

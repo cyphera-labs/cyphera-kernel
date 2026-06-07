@@ -31,6 +31,7 @@ use event::{
     sys_eventfd2, sys_poll, sys_signalfd4, sys_timerfd_create, sys_timerfd_gettime,
     sys_timerfd_settime,
 };
+pub use fs::console_fg_pgrp;
 pub use fs::termios_get_pub;
 pub(crate) use fs::{DEFAULT_TERMIOS, resolve_user_path};
 use fs::{

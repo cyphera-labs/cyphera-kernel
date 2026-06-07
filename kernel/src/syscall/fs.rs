@@ -895,6 +895,12 @@ const TCSETSF: u64 = 0x5404;
 const TIOCGPGRP: u64 = 0x540F;
 const TIOCSPGRP: u64 = 0x5410;
 const TIOCSCTTY: u64 = 0x540E;
+
+static FG_PGRP: frame::sync::SpinIrq<(u32, u32)> = frame::sync::SpinIrq::new((0, 0));
+
+pub fn console_fg_pgrp() -> u32 {
+    FG_PGRP.lock().1
+}
 const TIOCGPTN: u64 = 0x80045430;
 const TIOCSPTLCK: u64 = 0x40045431;
 const FBIOGET_VSCREENINFO: u64 = 0x4600;
@@ -1003,7 +1009,15 @@ pub(super) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             if !is_tty {
                 return ENOTTY;
             }
-            let pgid = sched::current_pid().raw();
+            let my_sid = sched::current_sid().raw();
+            let my_pgid_host = sched::current_pgid();
+            let (sid, fg_host) = *FG_PGRP.lock();
+            let host_pgid = if fg_host != 0 && sid == my_sid {
+                crate::process::Pid(fg_host)
+            } else {
+                my_pgid_host
+            };
+            let pgid = sched::host_to_caller_local(host_pgid);
             if frame::user::copy_to_user(arg, &pgid.to_le_bytes()).is_err() {
                 return EFAULT;
             }
@@ -1013,6 +1027,16 @@ pub(super) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             if !is_tty {
                 return ENOTTY;
             }
+            let mut buf = [0u8; 4];
+            if frame::user::copy_from_user(arg, &mut buf).is_err() {
+                return EFAULT;
+            }
+            let pgrp_local = u32::from_le_bytes(buf);
+            let pgrp_host = sched::caller_local_to_host(pgrp_local)
+                .map(|p| p.0)
+                .unwrap_or(pgrp_local);
+            let my_sid = sched::current_sid().raw();
+            *FG_PGRP.lock() = (my_sid, pgrp_host);
             0
         }
         TIOCSCTTY => {
@@ -1539,6 +1563,9 @@ pub(super) fn sys_symlinkat(target: u64, newdirfd: u64, linkpath: u64) -> i64 {
 }
 
 pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _data: u64) -> i64 {
+    if !sched::with_current_creds(|c| c.capable_host(crate::process::CAP_SYS_ADMIN)) {
+        return EPERM;
+    }
     const MS_BIND: u64 = 0x1000;
     const MS_REC: u64 = 0x4000;
     const MS_REMOUNT: u64 = 0x0020;
@@ -1766,10 +1793,6 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
     if virtual_fs {
         return 0;
     }
-    if fst == "ext4" {
-        return -19;
-    }
-
     let mut path_buf = [0u8; PATH_MAX];
     let plen = match frame::user::copy_cstr_from_user(target, &mut path_buf) {
         Ok(n) => n,
@@ -1793,13 +1816,39 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         return -20;
     }
 
-    let new_root = crate::fs::tmpfs::TmpfsInode::new_dir();
+    let new_root: Arc<dyn vfs::Inode> = if fst == "ext4" {
+        let mut src_buf = [0u8; PATH_MAX];
+        let slen = match frame::user::copy_cstr_from_user(source, &mut src_buf) {
+            Ok(n) => n,
+            Err(_) => return ENAMETOOLONG,
+        };
+        let src = match core::str::from_utf8(&src_buf[..slen]) {
+            Ok(s) => s,
+            Err(_) => return EINVAL,
+        };
+        if src != "/dev/vda" {
+            return -19; // ENODEV — no such block device
+        }
+        let dev = match crate::fs::ext4::VirtioBlockDevice::new() {
+            Some(d) => d,
+            None => return -19, // ENODEV — no virtio-blk disk attached
+        };
+        match crate::fs::ext4::Ext4Fs::mount(dev) {
+            Ok(fs) => fs.root_inode(),
+            Err(_) => return -22, // EINVAL — not a mountable ext4 image
+        }
+    } else {
+        crate::fs::tmpfs::TmpfsInode::new_dir()
+    };
     let new_prop = new_mount_propagation(&ctx, flags);
     ctx.install_mount_propagating(&normalized, target_inode.inode_id(), new_root, new_prop);
     0
 }
 
 pub(super) fn sys_umount2(target: u64, flags: u64) -> i64 {
+    if !sched::with_current_creds(|c| c.capable_host(crate::process::CAP_SYS_ADMIN)) {
+        return EPERM;
+    }
     const MNT_FORCE: u64 = 1;
     const MNT_DETACH: u64 = 2;
     const MNT_EXPIRE: u64 = 4;

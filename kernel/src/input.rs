@@ -134,6 +134,7 @@ pub fn poll_from_tick() {
     }
     let mut affected = [false; MAX_DEVS];
     let mut kbd_event_arrived = false;
+    let mut kbd_xlate: Vec<(u16, bool)> = Vec::new();
     {
         let mut d = DEVS.lock();
         let mut k = KBD_RING.lock();
@@ -158,6 +159,7 @@ pub fn poll_from_tick() {
                     press,
                 });
                 kbd_event_arrived = true;
+                kbd_xlate.push((ev.code, press));
             }
         }
     }
@@ -173,6 +175,9 @@ pub fn poll_from_tick() {
         for pid in KBD_WAITERS.drain() {
             let _ = crate::sched::wake_pid(pid);
         }
+    }
+    for (keycode, press) in kbd_xlate {
+        crate::console::feed_keycode(keycode, press);
     }
 }
 

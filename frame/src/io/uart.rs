@@ -71,6 +71,9 @@ impl Uart {
         if let Some(sink) = klog_sink() {
             sink(bytes);
         }
+        if let Some(sink) = console_sink() {
+            sink(bytes);
+        }
     }
 }
 
@@ -91,6 +94,25 @@ fn klog_sink() -> Option<KlogSink> {
         // value produced by `f as *mut ()` in `set_klog_sink`. Transmuting that
         // exact provenance back to `KlogSink` (a plain `fn(&[u8])`, same size
         // and ABI as the pointer) reconstructs the original function pointer.
+        Some(unsafe { core::mem::transmute::<*mut (), KlogSink>(p) })
+    }
+}
+
+static CONSOLE_SINK: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub fn set_console_sink(f: KlogSink) {
+    CONSOLE_SINK.store(f as *mut (), core::sync::atomic::Ordering::SeqCst);
+}
+
+fn console_sink() -> Option<KlogSink> {
+    let p = CONSOLE_SINK.load(core::sync::atomic::Ordering::Relaxed);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: identical to klog_sink — CONSOLE_SINK only ever holds null
+        // or a function pointer stored by `set_console_sink`; the transmute
+        // reconstructs that exact `fn(&[u8])`.
         Some(unsafe { core::mem::transmute::<*mut (), KlogSink>(p) })
     }
 }
