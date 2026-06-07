@@ -1,0 +1,26 @@
+[package]
+name = "virtio"
+description = "virtio drivers for Cyphera Kernel — mmio + pci transports for blk, net, rng, gpu, input, sound."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+frame = { path = "../../frame" }
+# virtio-drivers — no_std VirtIO driver suite. We supply the Hal trait
+# (DMA + MMIO mapping) over our frame primitives, so we don't reimplement
+# virtqueue ring management. MIT/Apache — used under MIT for GPL-2.0
+# compatibility.
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }

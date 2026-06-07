@@ -1,0 +1,123 @@
+name: Release kernel ELF
+
+# Builds the kernel multiboot ELF on release tags + attests it +
+# signs it via Sigstore + attaches everything to the GitHub release.
+#
+# Companion to sbom.yml (which does the same for the SBOM files).
+# Together they give downstream consumers a full verification chain:
+# clone the source at the release tag, build, verify the resulting
+# binary's SHA256 matches the released artifact, and verify the
+# attestation + signature were issued by THIS workflow at THIS
+# commit. No "trust me" required. See docs/VERIFICATION.md.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Default-deny at the top level.
+permissions:
+  contents: read
+
+jobs:
+  release-kernel:
+    name: Build + attest + sign kernel ELF
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # attach the ELF + signatures to the release
+      id-token: write       # OIDC for cosign keyless + attestation
+      attestations: write   # write the attestation to the repo
+    env:
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # actions-rust-lang/setup-rust-toolchain respects rust-toolchain.toml,
+      # so the channel is whatever's pinned there (currently
+      # nightly-2026-03-01). That pin is load-bearing for build
+      # reproducibility — see docs/REPRODUCIBLE-BUILDS.md.
+      - name: Set up Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@11df97af8e8102fd60b60a77dfbf58d40cd843b8 # v1.10.1
+        with:
+          # Don't let the action inject RUSTFLAGS into the env — an env
+          # RUSTFLAGS overrides the kernel's .cargo/config.toml
+          # [target.x86_64-unknown-none] rustflags (relocation-model=static
+          # + --no-pie), which the bare-metal link requires.
+          rustflags: ''
+
+      - name: Build kernel ELF
+        run: |
+          set -eo pipefail
+          cargo build --release --target x86_64-unknown-none -p cyphera-kernel
+          # The bin section in runtime/boot/Cargo.toml names this binary
+          # `cyphera-kernel`.
+          mkdir -p dist
+          cp target/x86_64-unknown-none/release/cyphera-kernel \
+             "dist/cyphera-kernel-${REF_NAME}.elf"
+          # Capture the SHA256 for the release notes.
+          sha256sum "dist/cyphera-kernel-${REF_NAME}.elf" \
+            > "dist/cyphera-kernel-${REF_NAME}.elf.sha256"
+          ls -la dist/
+
+      # Attest the kernel binary's build provenance. Produces a signed
+      # statement that "this exact binary was built by this workflow at
+      # this commit SHA at this time." Anyone with the binary can verify
+      # with: `gh attestation verify <file> --owner cyphera-labs`.
+      - name: Attest kernel ELF build provenance
+        id: attest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v3.0.0
+        with:
+          subject-path: dist/cyphera-kernel-*.elf
+
+      - name: Stage attestation bundle as release asset
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -eo pipefail
+          cp "$BUNDLE_PATH" "dist/cyphera-kernel-${REF_NAME}-elf.provenance.intoto.jsonl"
+
+      # Sigstore keyless signing of the binary. Same pattern as sbom.yml.
+      # Verify with:
+      #   cosign verify-blob \
+      #     --certificate-identity-regexp "^https://github.com/cyphera-labs/cyphera-kernel/" \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     --signature <file>.sig --certificate <file>.pem <file>
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+
+      - name: Sign kernel ELF with cosign (keyless)
+        run: |
+          set -eo pipefail
+          cd dist
+          for f in cyphera-kernel-*.elf; do
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-elf
+          path: |
+            dist/cyphera-kernel-*.elf
+            dist/cyphera-kernel-*.elf.sha256
+            dist/cyphera-kernel-*.elf.sig
+            dist/cyphera-kernel-*.elf.pem
+            dist/cyphera-kernel-*.provenance.intoto.jsonl
+
+      - name: Attach kernel ELF + signatures + provenance to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          cd dist
+          gh release upload "$REF_NAME" \
+            cyphera-kernel-*.elf \
+            cyphera-kernel-*.elf.sha256 \
+            cyphera-kernel-*.elf.sig \
+            cyphera-kernel-*.elf.pem \
+            cyphera-kernel-*.provenance.intoto.jsonl \
+            --clobber

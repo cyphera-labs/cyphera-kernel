@@ -1,0 +1,109 @@
+name: SBOM
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Default-deny at the top level so the workflow can't accidentally use
+# a write-scoped token outside the one job that needs it. Scorecard's
+# Token-Permissions check requires this even when there's only one job.
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: Generate + attach SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # attach SBOM + signatures to the release
+      id-token: write       # OIDC token for cosign keyless + SLSA attestation
+      attestations: write   # write the attestation to the repo
+      actions: read         # sbom-action downloads its workflow artifact to attach it
+    env:
+      # Hoisted out of `run:` interpolation per semgrep's
+      # github-actions.security.run-shell-injection rule: github.* context
+      # data should land in env first, then be referenced as "$VAR" inside the
+      # script so it can't be parsed as shell.
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # syft natively understands Cargo.lock and emits CycloneDX + SPDX
+      # from a single binary; faster than `cargo cyclonedx` (no compile).
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          format: cyclonedx-json
+          artifact-name: cyphera-kernel-${{ github.ref_name }}-sbom.cdx.json
+          output-file: cyphera-kernel-${{ github.ref_name }}-sbom.cdx.json
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          format: spdx-json
+          artifact-name: cyphera-kernel-${{ github.ref_name }}-sbom.spdx.json
+          output-file: cyphera-kernel-${{ github.ref_name }}-sbom.spdx.json
+
+      # SLSA build provenance — a signed statement that "this SBOM file
+      # was produced by this workflow at this commit." Anyone consuming
+      # Cyphera Kernel's release artifacts can verify the attestation chain with
+      # `gh attestation verify <file> --owner cyphera-labs`.
+      - name: Attest SBOM build provenance
+        id: attest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v3.0.0
+        with:
+          subject-path: 'cyphera-kernel-*-sbom.*.json'
+
+      # Copy the attestation bundle (.intoto.jsonl) next to the SBOMs so
+      # we can ship it as a release asset. The default attestation path
+      # is `${{ steps.attest.outputs.bundle-path }}` (a GH-temp path).
+      - name: Stage attestation bundle as a release asset
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -eo pipefail
+          cp "$BUNDLE_PATH" "cyphera-kernel-${REF_NAME}-sbom.provenance.intoto.jsonl"
+          ls -la cyphera-kernel-*
+
+      # Sigstore keyless cosign signing. No private key — the signing
+      # identity IS this workflow's OIDC token. Fulcio mints a 10-min
+      # cert tied to that identity; Rekor logs the signing event to
+      # the public transparency log. Verify with:
+      #   cosign verify-blob \
+      #     --certificate-identity-regexp "^https://github.com/cyphera-labs/cyphera-kernel/" \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     --signature <file>.sig --certificate <file>.pem <file>
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+
+      - name: Sign SBOMs with cosign (keyless)
+        run: |
+          set -eo pipefail
+          for f in cyphera-kernel-*-sbom.*.json; do
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -la cyphera-kernel-*-sbom.*
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: |
+            cyphera-kernel-*-sbom.*.json
+            cyphera-kernel-*-sbom.*.json.sig
+            cyphera-kernel-*-sbom.*.json.pem
+            cyphera-kernel-*.provenance.intoto.jsonl
+
+      - name: Attach SBOMs + signatures + provenance to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$REF_NAME" \
+            cyphera-kernel-*-sbom.*.json \
+            cyphera-kernel-*-sbom.*.json.sig \
+            cyphera-kernel-*-sbom.*.json.pem \
+            cyphera-kernel-*.provenance.intoto.jsonl \
+            --clobber

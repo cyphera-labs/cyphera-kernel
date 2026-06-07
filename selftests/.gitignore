@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.lock
+!Cargo.lock
+target

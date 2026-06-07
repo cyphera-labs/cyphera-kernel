@@ -1,0 +1,65 @@
+cargo-features = ["trim-paths"]
+
+[workspace]
+resolver = "2"
+members = [
+    "frame",
+    "frame_host",
+    "kernel",
+    "drivers/virtio",
+    "runtime/boot",
+    "verification",
+]
+# `cargo build` / `test` / `run` with no `-p` operate on the kernel
+# binary only. `frame_host` and `verification` are host-target crates
+# (std / MIRI / Kani) that must not be built for the default bare-metal
+# target — reach them explicitly, e.g.
+#   cargo test --features host_test --target x86_64-unknown-linux-gnu -p kernel
+# or via tools/test.sh for the QEMU integration batteries.
+default-members = ["runtime/boot"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Horizon Digital Engineering LLC <security@horizondigital.dev>"]
+repository = "https://github.com/cyphera-labs/cyphera-kernel"
+homepage = "https://github.com/cyphera-labs/cyphera-kernel"
+readme = "README.md"
+keywords = ["kernel", "rust", "memory-safe", "no-std", "linux"]
+categories = ["os", "no-std"]
+publish = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = true
+lto = "thin"
+codegen-units = 1
+# Trim absolute source paths from debug info + panic messages.
+# Without this, two builds of the same source from different paths
+# produce different SHA256s (the only delta is the embedded source
+# path). `all` covers both user code and dependency paths. Stable
+# since Rust 1.81.
+trim-paths = "all"
+
+# Coverage profile. The `-Cinstrument-coverage` flag itself is passed via
+# `RUSTFLAGS` in tools/coverage-build.sh — that way a plain `cargo build`
+# stays cheap and never pulls the LLVM profiling intrinsics in. The
+# profile exists so coverage runs land in their own target subdir and
+# don't fight a release build for incremental cache slots.
+#
+# `opt-level = 1` (matching `dev`): coverage instrumentation roughly
+# doubles binary size and slows boot enough that we need at least the
+# basic inlining + frame-pointer-elision passes or the boot stack
+# overflows under the increased call depth. `opt-level = 0` was
+# observed to triple-fault before reaching `kernel_main`.
+[profile.coverage]
+inherits = "dev"
+debug = true
+opt-level = 1

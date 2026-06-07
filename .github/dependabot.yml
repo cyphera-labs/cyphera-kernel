@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      major:
+        update-types:
+          - "major"
+    labels:
+      - "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        update-types:
+          - "minor"
+          - "patch"
+          - "major"
+    labels:
+      - "ci"
+
+  - package-ecosystem: "docker"
+    directory: "/tools/dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "deps"

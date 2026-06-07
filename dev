@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Wrapper for invoking cargo / qemu inside the pinned dev container.
+set -euo pipefail
+
+IMAGE_TAG="cyphera-kernel-container:latest"
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+ensure_image() {
+    if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+        echo "==> Building dev image (${IMAGE_TAG})..."
+        docker build -t "$IMAGE_TAG" "$PROJECT_ROOT/tools/dev"
+    fi
+}
+
+run_in_container() {
+    ensure_image
+    local args=(--rm)
+    if [[ -t 0 && -t 1 ]]; then
+        args+=(-it)
+    fi
+    # Hardware-accelerate the QEMU integration tests when the host exposes
+    # KVM; without it QEMU falls back to software emulation, under which the
+    # heavier tests can exceed their timeout.
+    if [[ -e /dev/kvm ]]; then
+        args+=(--device /dev/kvm --group-add "$(stat -c '%g' /dev/kvm)")
+    fi
+    docker run "${args[@]}" \
+        -v "$PROJECT_ROOT:/workspace" \
+        -v cyphera-kernel-cargo-registry:/usr/local/cargo/registry \
+        -v cyphera-kernel-cargo-git:/usr/local/cargo/git \
+        -v cyphera-kernel-target:/workspace/target \
+        "$IMAGE_TAG" \
+        "$@"
+}
+
+usage() {
+    cat <<EOF
+Usage: ./dev <command> [args...]
+
+Commands:
+  build              cargo build (debug)
+  build-release      cargo build --release
+  run                cargo run; boots the kernel in QEMU (Ctrl-A x to exit)
+  run-release        cargo run --release
+  demo               boot the kernel running a hello-world userland (see demo/)
+  build-userland     build + stage the userland test-driver ELFs (bundles/userland/)
+  test [kind]        QEMU integration battery: smoke | subsystem | all (default all)
+  fmt                cargo fmt
+  clippy             cargo clippy -- -D warnings
+  shell              interactive bash inside the dev container
+  rebuild-image      force rebuild of the dev image
+  clean              cargo clean
+EOF
+}
+
+case "${1:-}" in
+    build)         run_in_container cargo build ;;
+    build-release) run_in_container cargo build --release ;;
+    run)           run_in_container cargo run ;;
+    run-release)   run_in_container cargo run --release ;;
+    demo)            run_in_container ./demo/run.sh ;;
+    build-userland)  run_in_container ./tools/build-userland.sh ;;
+    test)            run_in_container ./tools/test.sh "${2:-all}" ;;
+    fmt)           run_in_container cargo fmt --all ;;
+    clippy)        run_in_container cargo clippy -- -D warnings ;;
+    shell)         run_in_container bash ;;
+    clean)         run_in_container cargo clean ;;
+    rebuild-image)
+        docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
+        ensure_image
+        ;;
+    -h|--help|"") usage ;;
+    *)            usage; exit 1 ;;
+esac

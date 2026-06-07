@@ -1,0 +1,60 @@
+[package]
+name = "kernel"
+description = "Cyphera Kernel services layer (#![forbid(unsafe_code)]): syscall dispatcher, scheduler, VFS, networking, signals, futex, ptrace, cgroups, namespaces, ELF loader."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lib]
+# Default profile (no_std, x86_64-unknown-none) does not have a test
+# harness — the kernel isn't host-runnable. The `host_test` feature
+# swaps in `frame_host` for `frame`, drops `#![no_std]`, and lets a
+# host-buildable subset of kernel/ compile + run under `cargo test`
+# + MIRI.
+bench = false
+doctest = false
+
+[features]
+default = ["prod"]
+# When enabled, the kernel crate builds against the `frame_host`
+# shim instead of `frame`, exposes only the host-buildable
+# submodules, and lets `cargo test` / `cargo miri test` run unit
+# tests over kernel logic. See `frame_host/README.md`.
+host_test = ["dep:frame_host"]
+# Production target — pulls in the bare-metal `frame` crate (which
+# carries the kernel's panic_handler + alloc_error_handler lang
+# items) plus the bare-metal driver/network deps. Mutually exclusive
+# with `host_test`: under `host_test` we don't want frame linked
+# because std also supplies those lang items, and we don't need
+# virtio/smoltcp/object on the host path.
+prod = ["dep:frame", "dep:virtio", "dep:smoltcp", "dep:object"]
+
+[dependencies]
+frame = { path = "../frame", optional = true }
+frame_host = { path = "../frame_host", optional = true }
+virtio = { path = "../drivers/virtio", optional = true }
+# object — the ELF parser rustc itself uses for debug info. It returns
+# Result everywhere (no panics on malformed input) and is exercised by
+# every Rust compile.
+# read_core + elf only — no compression, no write, no archive.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf"], optional = true }
+bitflags = { version = "2.12", default-features = false }
+# smoltcp — TCP/IP stack. Wraps our virtio-net driver via a Device
+# adapter. MIT/Apache, used under MIT. The heapless "medium-ip"
+# deps are pruned; we only need ethernet + v4.
+smoltcp = { version = "0.11", default-features = false, optional = true, features = [
+    "alloc",
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+] }

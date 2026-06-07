@@ -1,0 +1,26 @@
+/target
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.lock
+!Cargo.lock
+
+# Build artifacts: the selftest ELF bundle (built by
+# tools/build-userland.sh) and generated test fixtures. Never
+# committed.
+/bundles/
+
+# Build / packaging output
+/dist/
+
+# Coverage artifacts (target/coverage/ is gitignored via /target, but
+# the merge-manifest + aggregate report can be regenerated, so do not
+# commit them).
+/coverage/
+
+# Fuzz crash reproducers are binary inputs; kept privately in the
+# operations repo, never tracked or shipped here.
+/fuzz/crashes-tracked/

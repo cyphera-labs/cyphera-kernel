@@ -1,0 +1,37 @@
+[package]
+name = "frame_host"
+description = "Host-side stubs of frame::* for MIRI and cargo-test runs on a developer host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+# Host-side stubs for the subset of `frame::` that `kernel/` consumes.
+# Built for `x86_64-unknown-linux-gnu` (std + alloc) so the kernel
+# services layer can compile + run unit tests on a developer host
+# AND under MIRI.
+#
+# This crate is NOT a faithful re-implementation of frame/. It is a
+# stub set whose only contract is: same item paths + signatures, same
+# observable semantics for the cases unit tests cover. Inline asm,
+# IDT setup, page tables, LAPIC — none of that. If a test path needs
+# a primitive that's only stubbed to `todo!()`, extend that primitive
+# here in the same audit-disciplined way: minimal, documented, and
+# explicit about what host semantics differ from real-hardware.
+#
+# Activated by the `host_test` feature, which swaps this shim in for
+# `frame` on the host build.
+
+[lib]
+bench = false
+doctest = false
+
+[dependencies]
+# Intentionally no x86_64, no inline-asm-bearing deps — everything
+# here is std + alloc only.

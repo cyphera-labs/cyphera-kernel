@@ -1,0 +1,9 @@
+# Pin rustfmt to the 2024 style edition so formatting output is
+# stable across rustfmt versions. Without this, every nightly bump
+# produces gratuitous cosmetic drift across the workspace.
+#
+# When we deliberately want to adopt a newer style (e.g. "2027"
+# when it stabilizes), bump this and run `./dev fmt` in one
+# focused commit. Until then, all rustfmt versions targeting
+# style_edition 2024 produce identical output.
+style_edition = "2024"

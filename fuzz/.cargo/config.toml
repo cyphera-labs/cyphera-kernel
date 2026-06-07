@@ -1,0 +1,10 @@
+# Override the parent workspace's target = "x86_64-unknown-none"
+# (set in ../.cargo/config.toml for kernel builds). cargo-fuzz needs
+# a host target. Cargo's config-file lookup walks upward across
+# workspace boundaries, so without this override the fuzz crate
+# tries to build for x86_64-unknown-none and fails with E0463
+# "can't find crate for `core`/`std`" because the kernel target
+# isn't installed on CI runners.
+
+[build]
+target = "x86_64-unknown-linux-gnu"

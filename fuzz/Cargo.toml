@@ -1,0 +1,212 @@
+[workspace]
+# Standalone — not part of the main Cyphera Kernel workspace because
+# cargo-fuzz wants host (x86_64-unknown-linux-gnu) and the parent
+# workspace defaults to x86_64-unknown-none.
+
+[package]
+name = "cyphera-kernel-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Fuzz harnesses for parser-shaped attack surfaces in Cyphera Kernel.
+# Lives outside the main workspace because cargo-fuzz wants a host
+# target (x86_64-unknown-linux-gnu) and our workspace defaults to
+# x86_64-unknown-none.
+#
+# Run with: cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=60
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# object — the ELF parser the kernel uses. Mirroring the kernel's
+# feature set keeps this fuzz target hitting the same code paths.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf"] }
+
+# smoltcp — same version + feature set as kernel/Cargo.toml. The
+# kernel funnels every inbound packet through the wire parsers
+# we exercise in `smoltcp_parse`.
+smoltcp = { version = "0.11", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+] }
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_dynamic"
+path = "fuzz_targets/elf_dynamic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_parse"
+path = "fuzz_targets/tar_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smoltcp_parse"
+path = "fuzz_targets/smoltcp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_relocation"
+path = "fuzz_targets/elf_relocation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_normalize"
+path = "fuzz_targets/path_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "octal_parse"
+path = "fuzz_targets/octal_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgroup_value_parse"
+path = "fuzz_targets/cgroup_value_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clone_args_parse"
+path = "fuzz_targets/clone_args_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_superblock"
+path = "fuzz_targets/ext4_superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_inode"
+path = "fuzz_targets/ext4_inode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_extent"
+path = "fuzz_targets/ext4_extent.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext4_dir_entry"
+path = "fuzz_targets/ext4_dir_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpf_verify"
+path = "fuzz_targets/bpf_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpf_interp"
+path = "fuzz_targets/bpf_interp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigaction_decode"
+path = "fuzz_targets/sigaction_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inode_kind_decode"
+path = "fuzz_targets/inode_kind_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sockaddr_in_parse"
+path = "fuzz_targets/sockaddr_in_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mmap_args_decode"
+path = "fuzz_targets/mmap_args_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mprotect_decode"
+path = "fuzz_targets/mprotect_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mremap_decode"
+path = "fuzz_targets/mremap_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arch_prctl_decode"
+path = "fuzz_targets/arch_prctl_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "futex_op_decode"
+path = "fuzz_targets/futex_op_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clone_flags_validate"
+path = "fuzz_targets/clone_flags_validate.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

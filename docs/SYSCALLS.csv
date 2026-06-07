@@ -1,0 +1,386 @@
+linux_nr,name,status,notes
+0,read,implemented,VFS-backed; ext4 read path goes through `kernel::pagecache` (4 KiB inode-id-keyed LRU). Pipe / socket / fifo reads are signal-interruptible — return `-EINTR` on a deliverable signal during park.
+1,write,implemented,VFS-backed; ext4 `write_at` invalidates overlapping page-cache entries. Pipe / socket writes signal-interruptible. A `BrokenPipe` write sends `SIGPIPE` to the caller before returning `-EPIPE` — the documented dual contract; `cmd | head -N` patterns don't hang. The SIGPIPE half lives in `write_err_to_errno` and threads through `pwrite64` / `writev` / `pwritev` / `pwritev2` / `sendfile` / `splice` / `vmsplice` / `tee` / `copy_file_range`.
+2,open,implemented,"Wraps `openat(AT_FDCWD, …)`. The legacy nameless `open(2)`; modern userland uses `openat`."
+3,close,implemented,Drops the FD slot; OpenFile RC frees the inode handle.
+4,stat,implemented,Routes through `resolve_path` + `pack_stat`. ABI 144-byte `struct stat` with full nlink/uid/gid/timestamps/blocks.
+5,fstat,implemented,Fills `struct stat` (mode/size/kind only — uid/gid/atime are zeros).
+6,lstat,implemented,Same as `stat` but doesn't follow the final symlink (path resolver returns the Symlink inode itself).
+7,poll,implemented,"Per-fd `revents` from `Inode::poll().bits()`. Timeout via `kernel::timeout` deadline-park. Multi-fd-wait scans on each tick (10ms granularity, matching the documented `poll(2)` `timeout` argument's millisecond resolution and the Hz=100 wakeup floor). Cap of 64 fds matches typical container-runtime usage."
+8,lseek,implemented,`SEEK_SET/CUR/END`.
+9,mmap,implemented,"VMA-tracked, lazy fault-in via `kernel::mmap_fault` hook. `MAP_FIXED` / `MAP_FIXED_NOREPLACE` / addr-hint / arena-fallback all honored. Anonymous + file-backed MAP_PRIVATE + MAP_SHARED. MAP_SHARED file maps pin page-cache frames directly; writes through mappings land in the cache and `msync` writes back. `mremap` is the separate `mremap` row. `MAP_GROWSDOWN` accepted-not-honored. munmap unpins SHARED-file pages."
+10,mprotect,implemented,`VmSpace::change_perms` walks 4 KiB pages and rewrites leaf-PTE flags; TLB shootdown after. PROT_NONE leaves PRESENT set (we don't yet clear it — the absence of READ alone doesn't unmap). PROT_GROWSUP / PROT_GROWSDOWN return EINVAL.
+11,munmap,implemented,"Frees physical frames + invalidates local TLB; cross-CPU shootdown wired. Iterates page-by-page over the requested range, skipping unmapped pages — partial unmaps and over-aligned ranges both work."
+12,brk,implemented,"Per-process heap window, clamped to `Process::brk.max`."
+13,rt_sigaction,implemented,"Reads/writes the full 32-byte `struct kernel_sigaction { handler, flags, restorer, mask }`. `Process.sigactions[i]` stores all four fields. SA_NODEFER, SA_RESETHAND, SA_RESTORER, **SA_SIGINFO**, **SA_RESTART**, **SA_ONSTACK** all honored at delivery. SIGKILL/SIGSTOP can't be set. `sigsetsize` must be 8."
+14,rt_sigprocmask,implemented,SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK against `Process.blocked_signals`. SIGKILL and SIGSTOP can't be blocked even if userland tries. `sigsetsize` must be 8.
+15,rt_sigreturn,implemented,"Reads the ABI `ucontext_t` (936 B; sigcontext at offset 40, sigmask at 296, fpregs reserved at 424) from user `rsp`, restores every saved register into `tf`, restores the pre-handler blocked-signal mask. The signal frame is bit-for-bit the ABI `rt_sigframe` shape. Dispatcher skips post-syscall `deliver_pending_signals` after sigreturn so the restored `rax` survives back to userland verbatim."
+16,ioctl,implemented,"TTY ioctls (`TIOCGWINSZ`, `TCGETS`/`TCSETS{,W,F}` with proper 36-byte termios, `TIOCGPGRP`/`TIOCSPGRP`/`TIOCSCTTY`), virtio-input ioctls. `ENOTTY` for unknown ops on TTY/CharDevice fds + non-CharDevice fds — the documented contract for an unsupported request on an otherwise-valid fd. New ioctl families wire as workloads exercise them."
+17,pread64,implemented,
+18,pwrite64,implemented,
+19,readv,implemented,
+20,writev,implemented,
+21,access,implemented,"Real per-mode check via `Credentials::can_access` against the inode's owner/group/mode. ABI semantics: uses *real* (`ruid`/`rgid`) creds, not effective. Privileged caller bypasses (CAP_DAC_OVERRIDE-style)."
+22,pipe,implemented,Reuses `pipe2` with flags=0.
+23,select,missing,
+24,sched_yield,implemented,Schedules into the per-CPU runqueue.
+25,mremap,implemented,"Anon-VMA shrink + extend-in-place + `MREMAP_MAYMOVE` relocate. Whole-VMA only (partial-range remap = EINVAL); file-backed grow = EINVAL (deferred). `MREMAP_FIXED` / `MREMAP_DONTUNMAP` = EINVAL. Copy via `frame::user::copy_{from,to}_user` through a 4 KiB chunk so `kernel/` keeps `forbid(unsafe_code)`. Cgroup uncharged on shrink + relocate."
+26,msync,implemented,"Walks SHARED file VMAs in `[addr, addr+length)` and calls `pagecache::writeback` for each. Conservative dirty-tracking (every writable SHARED faulted page is dirty until written back). MS_SYNC / MS_ASYNC / MS_INVALIDATE all map to synchronous writeback."
+27,mincore,implemented,"Walks per-process VMAs, validates range coverage (-ENOMEM on holes), then for each page calls `VmSpace::translate` and writes 1 if mapped, 0 if not. Page-aligned addr required. Per `mincore(2)`: byte 0 of each output records the ""resident"" bit; other bits zero."
+28,madvise,implemented,Accept-and-ignore for all hints — the common hints are advisory no-ops per `madvise(2)`. `MADV_DONTNEED` / `MADV_FREE` would benefit from lazy per-page reclaim we don't have yet. Wire DONTNEED to drop matching frames when an allocator-shaped workload demands it.
+29,shmget,implemented,"Real SysV shm via `kernel::ipc::shm`. Allocates `Vec<PhysFrame>` per segment, zero-init, IPC_PRIVATE / IPC_CREAT / IPC_EXCL / key-based lookup, permission check from `creds`. SHMMAX = 1 GiB."
+30,shmat,implemented,Maps the segment's frames into the calling process via `vm.map_one_frame` (no fresh alloc — the frames are owned by the segment). Records a `VmaBacking::Shm` so `shmdt` / `munmap` can identify it. Multi-process sharing works because the same physical frames are mapped into multiple page tables. SHM_RDONLY honored.
+31,shmctl,implemented,IPC_RMID marks for deletion (segment dies when `attached==0`); IPC_STAT / IPC_SET accept-noop (typical SysV-shm users don't read the shmid_ds).
+32,dup,implemented,
+33,dup2,implemented,
+34,pause,implemented,Pre-park signal-pending check + park on `signalfd_waiters`; any signal post wakes the parker. Always returns -EINTR per `pause(2)`.
+35,nanosleep,implemented,"Real timer-driven park — registers a deadline on `kernel::timeout`, parks via `sched::park_self`; the LAPIC tick handler walks the expired-deadlines list and wakes us. Signal-interruptible: returns `-EINTR` and writes the remaining time to `rem` if the caller passed one."
+36,getitimer,implemented,"Real ITIMER_REAL query: returns `(interval_ns, remaining_ns)` from `Process.itimer_real_interval_ns` / `_deadline_ns`, encoded as `struct itimerval`. ITIMER_VIRTUAL / PROF return zeros (no per-task user/system CPU split yet)."
+37,alarm,implemented,"Wraps the existing ITIMER_REAL machinery: records the new deadline on `Process.itimer_real_deadline_ns`, registers `itimer_real_fire` callback via `crate::timeout`, returns the previously-armed alarm's seconds-remaining. `alarm(0)` cancels."
+38,setitimer,implemented,"Real ITIMER_REAL arming: `value_ns=0` disarms; non-zero registers a `crate::timeout` callback at `now + value_ns` keyed by pid that posts SIGALRM and (if `interval_ns != 0`) re-registers itself for the next period. CBS-style drift-free advance. Cancelled on execve, exit, or fresh setitimer. ITIMER_VIRTUAL / PROF accept-noop until user/system CPU split lands."
+39,getpid,implemented,"Returns `Process::tgid` (the thread group ID); for processes that haven't done CLONE_THREAD this equals the pid. CLONE_THREAD peers all return the leader's pid. Translated to caller's pid_ns; pid 1 inside a CLONE_NEWPID container, host pid outside."
+40,sendfile,implemented,"Bounded copy through a 4 KiB kernel buffer. Honors the optional `offset_ptr` (when non-NULL, in_fd's position is unchanged and the offset is read/written through the pointer)."
+41,socket,implemented,AF_INET + AF_UNIX (DGRAM via `socketpair` only); SOCK_NONBLOCK / SOCK_CLOEXEC propagated to OpenFile flags.
+42,connect,implemented,TCP connect parks on the socket's wait queue until smoltcp completes the 3WHS. Iface context picked by destination: loopback addrs (127.x.x.x) route through `loop_iface`; everything else through eth0.
+43,accept,implemented,"Real `accept`: listener has a backlog pool of N smoltcp sockets in `Listen`; accept finds an `Established` slot, swaps it for a fresh listener, returns the connection as a new fd. Honors O_NONBLOCK / parks on the listener's wait queue. Signal-interruptible — returns `-EINTR` on a deliverable signal during park."
+44,sendto,implemented,UDP send (`addr` is the dest); TCP `sendto` ignores `addr` per the ABI.
+45,recvfrom,implemented,Honors O_NONBLOCK: blocking → park on socket wait queue; non-blocking → -EAGAIN. Signal-interruptible — returns `-EINTR` on a deliverable signal during park.
+46,sendmsg,missing,
+47,recvmsg,missing,
+48,shutdown,implemented,Real half-close. SHUT_RD makes recv return 0 (EOF); SHUT_WR sends FIN via smoltcp `close()` (TCP) and makes send return EPIPE; SHUT_RDWR both. Poll surfaces POLLHUP.
+49,bind,implemented,
+50,listen,implemented,"Backlog now allocates a real smoltcp listener pool, capped at `MAX_LISTEN_BACKLOG = 16`."
+51,getsockname,implemented,
+52,getpeername,implemented,reports the connected peer's address; -ENOTCONN if not connected. Shares the sockaddr copy-out path with getsockname.
+53,socketpair,implemented,AF_UNIX SOCK_DGRAM only.
+54,setsockopt,implemented,"Real per-option dispatch on `SockOpts`. Honors `SO_REUSEADDR`/`SO_REUSEPORT`/`SO_KEEPALIVE`/`SO_BROADCAST`/`SO_RCVBUF`/`SO_SNDBUF`/`SO_RCVTIMEO`/`SO_SNDTIMEO`/`SO_LINGER`/`TCP_NODELAY`/`IP_TTL`. Smoltcp-side calls for TCP_NODELAY (Nagle), SO_KEEPALIVE (60s interval), IP_TTL (hop limit). The documented ""double the buffer-size on set"" rule honored. Unknown options return ENOPROTOOPT."
+55,getsockopt,implemented,"Reads from `SockOpts`. Reports `SO_TYPE` (SOCK_STREAM/DGRAM), `SO_PROTOCOL` (TCP/UDP), `SO_DOMAIN` (AF_INET), `SO_ERROR` (0; no async err yet), and every option `setsockopt` writes."
+56,clone,implemented,"pthread-bundle (`CLONE_VM | CLONE_THREAD | CLONE_FS | CLONE_FILES | CLONE_SIGHAND`) routes to `clone_thread_current` — Arc-shared VmSpace + FdTable + sigactions, same tgid, distinct tid. Fork-equivalent flag sets route to fork with deep-copy fds/sigactions. CLONE_PARENT_SETTID / CLONE_CHILD_CLEARTID / CLONE_SETTLS honored. CLONE_VFORK parks parent on child's `vfork_done` queue (drained by exec/exit). CLONE_CHILD_SETTID honored for thread case (shared VmSpace); fork case deferred. `CLONE_NEWPID` stages a fresh pid_ns on the parent; the next forked child becomes pid 1 in the new ns. Returned pid + ptid/ctid writes are in the caller's pid_ns."
+57,fork,implemented,"Eager-copy of parent's user-half VmSpace (every leaf user PTE → fresh frame, memcpy bytes, map in child). Child's `TrapFrame` cloned from parent's with `rax=0`; child's first launch IRETQs to parent's syscall return point. fd table is `clone_for_child` (Arc-bump on each `OpenFile`); brk/mmap/sigactions copied."
+58,vfork,implemented,"Forks then parks parent on child's `vfork_done` queue. Drained when child execve()s (via `exec_current`) or exits (every exit path). Shared-VmSpace until execve still deferred (we use a fork-shape copy-on-write VmSpace), but the dominant `vfork+execve` pattern works either way since execve replaces the AS. A sticky `vfork_done_set: AtomicBool` on the child closes a missed-wakeup race when the child execs/exits between fork-return and the parent's enqueue, so a `find | xargs -n1 cmd` pipeline does not wedge on an unreaped vforked child."
+59,execve,implemented,"Tears down current `VmSpace` user half, reloads new ELF, maps fresh user stack, resets brk / mmap arena / sigactions / pending signals / siginfo queue / alt stack / cmdline / exe_path, closes O_CLOEXEC fds, drains `vfork_done`. +x permission check on the binary; S_ISUID and S_ISGID set on the file → euid/suid/fsuid (resp egid/sgid/fsgid) become file owner; ruid/rgid unchanged."
+60,exit,implemented,"Per-CPU scheduler reaps the dying task to `Zombie(code)`. Exit-time futex hygiene: clears the `set_tid_address` futex word + wakes one waiter, walks the `set_robust_list` chain marking each held futex `FUTEX_OWNER_DIED` and waking one waiter. Posts SIGCHLD to parent with `PendingSigInfo { si_code: CLD_EXITED, si_pid: child, si_status }` so a parent under `SA_SIGINFO` sees real values. `wait4` reap drops the `Box<Process>` after releasing GLOBAL — `VmSpace::Drop` reclaims the entire user-half page-table tree (leaf frames + L1/L2/L3 + TLB shootdown) and `kernel::futex::drop_vmspace` sweeps any remaining futex queues keyed on the dying VmSpace."
+61,wait4,implemented,"Parent parks on its own `child_exit` `WaitQueue`; `exit_current` / `kill_user_fault` drain it. Status encoded as Linux `wait` format: normal exit → `(code & 0xff) << 8`, fault-killed → SIGSEGV (low 7 bits). Honors `WNOHANG`. `pid > 0` selects a specific child; `<= 0` selectors are treated as -1 (any) until pgids land. `rusage` ignored. Signal-aware: a deliverable non-SIGCHLD signal during park returns `-EINTR`; SIGCHLD is the wake event itself, the loop just re-checks for a reapable child after each wake. pid arg is in caller's pid_ns and translates to host on entry; reaped pid is snapshotted in caller's pid_ns *before* `drop_chain` destroys the mapping at reap."
+62,kill,implemented,"Full default-action surface plus `kill(-pgid, sig)` process-group fan-out: `pid<0` signals every member of `Pid(-pid)`'s pgrp; `pid==0` fans out to caller's pgrp. Per-signal `default_action()` table (Term / Core / Stop / Cont / Ignore) per `man 7 signal`. SIGKILL / SIGSTOP uncatchable + unblockable (`rt_sigaction` rejects with EINVAL; dispatcher force-defaults). Stop-default signals (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) flip `Process::state` to `Stopped` and notify parent's `wait4(WUNTRACED)`. SIGCONT against Stopped resumes back to Runnable and discards pending Stop-default signals per `man 7 signal`. Term/Core-default signals terminate via `terminate_current_with_signal`, encoding `KilledBySignal { signal }` so `wait4` reports `WIFSIGNALED` (low 7 bits = signum). pid arg is ns-local; positive pid translates to host before signal post; negative pgid translates the abs(pid) ns-local pgid to host before `signal_pgrp`."
+63,uname,implemented,"Six 65-byte fields (sysname/nodename/release/version/machine/domainname). Static values: sysname=""Linux"", machine=""x86_64""."
+64,semget,missing,
+65,semop,missing,
+66,semctl,missing,
+67,shmdt,implemented,"Walks the calling process's VMAs to find the `VmaBacking::Shm` at `addr`, calls `vm.unmap_keep_frame` for each page (unmaps without freeing — frames belong to the segment), removes the VMA, decrements `attached`. If `attached==0 && marked_rmid`, the segment is dropped from the global table."
+68,msgget,missing,
+69,msgsnd,missing,
+70,msgrcv,missing,
+71,msgctl,missing,
+72,fcntl,implemented,`F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFD` / `F_SETFD` / `F_GETFL` / `F_SETFL`. `F_GETLK` / `F_SETLK` / `F_SETLKW` POSIX advisory locks via `kernel::vfs::locks::posix`. SEEK_CUR / SEEK_END whence in `struct flock` honored — fd's current offset + inode's size threaded through the fcntl path. **F_OFD_GETLK / F_OFD_SETLK / F_OFD_SETLKW** also wired — same advisory-lock semantics but ownership is per-OFD (`Arc<OpenFile>` pointer) so locks survive fork via shared FdTable. F_GET_SEALS / F_ADD_SEALS for memfd.
+73,flock,implemented,Real BSD whole-file advisory lock. Per-OFD (Arc<OpenFile> ptr) state in a per-inode `FlockState`: Unlocked / Shared(set) / Exclusive(holder). LOCK_NB returns EWOULDBLOCK on conflict; default-blocking parks on per-inode wait queue and retries. Atomic upgrade (sole-SH→EX) and downgrade (EX→SH). OFD close drops the lock automatically via `OpenFile::Drop`.
+74,fsync,implemented,tmpfs writes are RAM-synchronous; ext4 writes are device-synchronous. No-op success.
+75,fdatasync,implemented,Same as `fsync`.
+76,truncate,implemented,Routes to `Inode::truncate`. Invalidates page cache above new length.
+77,ftruncate,implemented,
+78,getdents,implemented,Real legacy `struct linux_dirent` layout (d_ino + d_off + d_reclen + name + NUL + pad + d_type at offset reclen-1). Distinct from getdents64 (d_type before name). The buffer is correctly shaped for the legacy static binaries that use this syscall.
+79,getcwd,implemented,
+80,chdir,implemented,
+81,fchdir,implemented,"Pulls inode from fd table, validates it's a directory, sets `Process::cwd`. Path string is set to ""/"" as a placeholder (no inode→path reconstruction yet; real `getcwd` would need a dentry cache)."
+82,rename,implemented,Routes through `renameat2`. Atomic single-FS rename via `Inode::rename` override.
+83,mkdir,implemented,Routes through `mkdirat(AT_FDCWD)`.
+84,rmdir,implemented,Routes through `unlinkat(AT_REMOVEDIR)`. Empty-dir check via `Inode::rmdir`.
+85,creat,implemented,"Wraps `openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)`."
+86,link,implemented,Routes through `linkat`. Bumps target's nlink via `Inode::bump_nlink`.
+87,unlink,implemented,Routes through `unlinkat(AT_FDCWD)`. Drops nlink via `Inode::drop_nlink`.
+88,symlink,implemented,Routes through `symlinkat`. tmpfs creates a Symlink inode storing the target string.
+89,readlink,implemented,Routes through `readlinkat(AT_FDCWD)`.
+90,chmod,implemented,Routes through `fchmodat(AT_FDCWD)`. Mode bits stored per-inode (tmpfs).
+91,fchmod,implemented,
+92,chown,implemented,Routes through `fchownat(AT_FDCWD)`. uid/gid stored per-inode (tmpfs).
+93,fchown,implemented,
+94,lchown,implemented,Same as `chown` (no follow distinction in our resolver yet).
+95,umask,implemented,"Per-process `Process::umask`, default 0o022, inherited across fork."
+96,gettimeofday,implemented,"Wall-clock time via KVM pvclock when available (real seconds-since-1970 from the host); falls back to monotonic-since-boot when pvclock isn't exposed (e.g., a TCG-only environment). NULL `tv` allowed (returns 0). `tz` ignored — deprecated by the ABI."
+97,getrlimit,implemented,"RLIMIT_NOFILE=1024 (matches `MAX_FDS`), RLIMIT_STACK=8MiB / unlimited, RLIMIT_AS=128 TiB. Other resources return RLIM_INFINITY."
+98,getrusage,implemented,"Real `ru_utime` from `Process.total_cpu_ns` (charged on every `charge_runtime` from on_tick / yield). `ru_stime` stays 0 — user/system CPU split needs syscall-entry/exit instrumentation. RUSAGE_SELF / THREAD honored; RUSAGE_CHILDREN zeroed (per-child accumulation deferred). Memory-pressure fields (`ru_maxrss`, `ru_majflt`, ...) zeroed."
+99,sysinfo,implemented,Fills the 112-byte `struct sysinfo`. `uptime` from `frame::time::nanos_since_boot()`. `loads[3]` zero (no load-avg sampler). `totalram` / `freeram` from `frame::mm::frame_alloc::stats()`; `sharedram` / `bufferram` zero (no page cache yet). `totalswap` / `freeswap` zero (no swap). `procs` from `sched::process_count_alive()`. `mem_unit = 1` (bytes).
+100,times,implemented,`tms_utime` real (from `Process.total_cpu_ns / 10ms`); `tms_stime` / `tms_cutime` / `tms_cstime` zeroed (same user/sys-split + per-child gaps as `getrusage`). Returns wall-clock-since-boot in clock_t (100Hz).
+101,ptrace,implemented,"Comprehensive ptrace operation coverage. **Syscall tracing:** TRACEME / ATTACH / DETACH / CONT / SYSCALL / KILL / PEEKDATA / PEEKTEXT / POKEDATA / POKETEXT / GETREGS / SETREGS / SETOPTIONS(TRACESYSGOOD). **Single-step / breakpoints:** SINGLESTEP, int3 → SIGTRAP via IDT trace-trap hook (DPL=3 on #BP gate so user int3 doesn't trigger #GP), POKETEXT into RX (lands via kernel high-half physmap regardless of user PTE flags). **Signal-stop + follow-fork:** signal-stop forwarding (deliver_pending_signals diverts non-SIGKILL signals to a `Signal(sig)` trace stop; tracer suppresses/substitutes/re-delivers via PTRACE_CONT arg), PTRACE_O_TRACEFORK auto-attach (forked children inherit tracer + arm syscall stop), GETEVENTMSG (returns new-child pid for fork events / signal number for signal stops). Cross-VmSpace memory access via `frame::user::peek_other_vmspace` / `poke_other_vmspace`. Test exercises end-to-end TRACEME→stop→SETOPTIONS→CONT→int3-stop→GETREGS→SYSCALL→write-entry-stop→DETACH→reap. Marker `PTRACE_OK`. Remaining gaps: PTRACE_GETSIGINFO/SETSIGINFO full siginfo_t, TRACEEXEC/TRACECLONE/TRACEVFORK/TRACEEXIT auto-stops, PTRACE_GET_SYSCALL_INFO fast path, hardware watchpoints DR0-DR7."
+102,getuid,implemented,Real credential model. Returns `Process::creds::ruid`. Boot starts as root (uid=0); `setresuid` etc. drop privileges with strict transition validation.
+103,syslog,implemented,"Kernel log ring buffer (64 KiB, the documented `LOG_BUF_SHIFT = 16` size). Mirrors every byte from `frame::println!` via a function-pointer sink wired in `kernel::init`. SYSLOG_ACTION_READ / READ_ALL / READ_CLEAR copy bytes to userspace; CLEAR / OPEN / CLOSE / CONSOLE_* are no-ops or in-ring state changes; SIZE_UNREAD / SIZE_BUFFER report ring stats. User-space readers retrieve the boot log via SYSLOG_ACTION_READ / READ_ALL / READ_CLEAR."
+104,getgid,implemented,Returns `Process::creds::rgid`.
+105,setuid,implemented,"POSIX simple-form privilege drop. Privileged caller (euid==0): full drop (ruid=euid=suid=uid). Unprivileged caller: `uid` must be one of (ruid, euid, suid); only `euid` changes (so suid keeps the saved root copy for setuid binaries). Returns -EPERM otherwise."
+106,setgid,implemented,Same shape as `setuid` for group ids.
+107,geteuid,implemented,Returns `Process::creds::euid`.
+108,getegid,implemented,Returns `Process::creds::egid`.
+109,setpgid,implemented,"Real `Process::pgid` field + helper in `kernel::sched`. Validates target in caller's session, target not a session leader (`EPERM` otherwise). `pid==0` ↔ caller; `pgid==0` ↔ target's own pid. Both args are ns-local; translated to host pids before storing."
+110,getppid,implemented,"Returns parent pid; 0 for boot's first user task. Translates parent's host pid to caller's pid_ns view. Returns 0 when parent isn't visible from caller's pid_ns (the ""parent in a different ns"" semantic)."
+111,getpgrp,implemented,Returns the calling task's `pgid` (the job-control group it belongs to). pgid translated to caller's pid_ns view.
+112,setsid,implemented,Caller becomes session leader: `sid = pgid = pid`. Returns `EPERM` if caller is already a process-group leader. Returned new sid translated to caller's pid_ns view.
+113,setreuid,implemented,The legacy two-arg form. Same transition validation as `setresuid`; additionally updates `suid` if either field changes (so subsequent `setuid` retains a saved-root fallback).
+114,setregid,implemented,Same shape on group ids.
+115,getgroups,implemented,Returns the real supplementary group list from `Process::creds::groups`. `size==0` is the probe-for-count form.
+116,setgroups,implemented,Privileged-only (CAP_SETGID). Replaces the supplementary group list. Cap at 256 entries. -EPERM if non-privileged.
+117,setresuid,implemented,"Strict transition rule: each new (ruid, euid, suid) value must equal one of the current triple, OR caller is privileged (euid==0). `(uid_t)-1` ↔ leave unchanged. Returns -EPERM on disallowed transition."
+118,getresuid,implemented,"Returns the real (ruid, euid, suid) triple from `Process::creds`. NULL pointer ↔ skip."
+119,setresgid,implemented,Same shape as `setresuid` for group ids.
+120,getresgid,implemented,"Real (rgid, egid, sgid)."
+121,getpgid,implemented,Read `Process::pgid` of the named pid (or caller if `pid==0`). Input pid + return pgid both translated through caller's pid_ns.
+122,setfsuid,implemented,"Filesystem uid override. Returns the OLD `fsuid`. Sets new fsuid only if value is one of (ruid, euid, suid, fsuid) or caller is privileged."
+123,setfsgid,implemented,Same shape on group ids.
+124,getsid,implemented,Read `Process::sid`. Input pid + return sid both translated through caller's pid_ns.
+125,capget,implemented,Linux v3 (0x20080522) layout. Returns target's effective/permitted/inheritable caps packed as two `__user_cap_data_struct` slots. Wrong version → EINVAL with kernel's preferred version written back.
+126,capset,implemented,Self-only (cross-process → EPERM). Validation: new_perm ⊆ old_perm; new_eff ⊆ new_perm; new_inh ⊆ (old_inh ∪ old_perm); new_inh ⊆ (caps_bnd ∪ old_inh).
+127,rt_sigpending,implemented,Copies `Process.pending_signals` (u64 bitmask) to user. Validates `sigsetsize == 8` (x86_64 sigset_t).
+128,rt_sigtimedwait,implemented,"Synchronous signal wait. Pre-checks pending against `set_mask`, consumes + returns on hit. Otherwise: NULL timeout → block forever; zero timespec → poll-only (EAGAIN if nothing pending); finite timespec → register a `crate::timeout` deadline-park, sleep until signal-or-deadline, return EAGAIN on timeout expiry."
+129,rt_sigqueueinfo,implemented,"Like `kill(pid, sig)` but copies the user-supplied 128-byte siginfo_t. The positive-si_code-from-unprivileged check enforced (-EPERM unless euid==0). Routes through existing `send_signal_with_info`."
+130,rt_sigsuspend,implemented,"Atomically replace blocked-signal mask, park on `sleep_until_signal` (new helper that loops on signal_wait), restore original mask on signal arrival, return -EINTR. SIGKILL/SIGSTOP can't be blocked."
+131,sigaltstack,implemented,Stores per-process; refuses to change while running on the alt stack (EPERM); cleared on `execve`.
+132,utime,missing,
+133,mknod,implemented,Routes through `mknodat(AT_FDCWD)`. Decodes kind from `mode & S_IFMT`.
+134,uselib,deprecated,"DEPRECATED: obsolete shared-library loader. `-ENOSYS`. Mainline kernels return -ENOSYS unless `CONFIG_USELIB=y` is set, which most distros disable. Loaded shared libraries directly (pre-`ld.so` machinery); modern userland uses the dynamic linker."
+135,personality,implemented,Returns `0` (PER_LINUX) for any input. We don't run other personalities.
+136,ustat,implemented,`-ENOSYS`. Deprecated; replaced by `statfs(2)`. Userland routes `ustat` through statfs; binaries probing the syscall directly fall back gracefully.
+137,statfs,implemented,"120-byte `struct statfs64`. Magic 0x01021994 for tmpfs, 0xEF53 for ext4."
+138,fstatfs,implemented,
+139,sysfs,implemented,`-ENOSYS`. Distinct from the `/sys` directory tree. The syscall returned filesystem-type names by index; deprecated in favor of `/proc/filesystems`. Modern kernels mostly return -ENOSYS.
+140,getpriority,implemented,"Reads `Process::nice`, returns `20 - nice` (the encoded form). `which == PRIO_PROCESS` only; PRIO_PGRP / PRIO_USER return EINVAL."
+141,setpriority,implemented,"Clamps to `[-20, 19]`, writes `Process::nice`. Real round-trip with getpriority. CAP_SYS_NICE for negative values not enforced. Advisory until the scheduler honors nice for time-slicing."
+142,sched_setparam,implemented,Change RT priority of an already-RT task without changing policy. For non-RT tasks the only valid value is 0; otherwise `-EINVAL`. CAP_SYS_NICE gated.
+143,sched_getparam,implemented,Fills `sched_priority` with the task's RT priority (0 for non-RT).
+144,sched_setscheduler,implemented,"Switches a task between SCHED_OTHER (Cfs) / SCHED_FIFO / SCHED_RR / SCHED_BATCH / SCHED_IDLE. RT priority `[1, 99]`; OTHER/BATCH/IDLE require priority==0. CAP_SYS_NICE gates RT entry. `set_sched_class` re-routes the task between class sub-queues atomically. SCHED_DEADLINE rejected here — must use `sched_setattr`."
+145,sched_getscheduler,implemented,"Returns 0 (OTHER), 1 (FIFO), 2 (RR), 6 (DEADLINE)."
+146,sched_get_priority_max,implemented,99 for FIFO/RR; 0 for OTHER/BATCH/IDLE.
+147,sched_get_priority_min,implemented,1 for FIFO/RR; 0 for OTHER/BATCH/IDLE.
+148,sched_rr_get_interval,implemented,"`SCHED_RR_TIMESLICE_NS` (100 ms) for RR tasks, zeroed for everything else."
+149,mlock,implemented,"Validates the address range covers existing VMAs (-ENOMEM on holes), returns success. We have no swap, so every page is RAM-resident by construction — the ""page is locked in physical memory"" semantic is automatic on a no-swap kernel."
+150,munlock,implemented,Symmetric to `mlock`.
+151,mlockall,implemented,"Validates `flags` is one of MCL_CURRENT/MCL_FUTURE/MCL_ONFAULT (with the 4.4-era ONFAULT bit), returns success."
+152,munlockall,implemented,Always 0.
+153,vhangup,implemented,Root: 0 (no controlling-tty teardown to do — single-console kernel). Non-root: -EPERM. CAP_SYS_TTY_CONFIG is the documented requirement; we use the simpler euid==0 check.
+154,modify_ldt,out-of-scope,OUT-OF-SCOPE: 32-bit not supported. `-ENOSYS`. x86_64 doesn't use a per-task LDT (GDT-only segment model). The x86_64 ABI returns -ENOSYS for this i386-era call.
+155,pivot_root,implemented,"Real semantics on top of the per-process VFS context. Mounts the old root at `put_old`'s inode-id via `vfs::mount_install`, then sets `Process::fs_root` to `new_root`. Subsequent path resolution walks from new_root; old root reachable via `/<put_old>`."
+156,_sysctl,dead,DEAD: removed in Linux 5.5. `-ENOSYS`. Removed in Linux 5.5. Replaced by writes to `/proc/sys/`.
+157,prctl,implemented,"Options honored: `PR_{SET,GET}_NAME`, `PR_{SET,GET}_NO_NEW_PRIVS`, `PR_{SET,GET}_SECCOMP`, `PR_CAPBSET_READ`/`_DROP`, `PR_{SET,GET}_KEEPCAPS`, `PR_{SET,GET}_DUMPABLE`. `PR_{SET,GET}_CHILD_SUBREAPER` + `PR_{SET,GET}_PDEATHSIG` are now real — `exit_current` runs `handle_dying_children` which (1) for each child with `pdeathsig` set, posts that signal to the child; (2) reparents each child by walking the dying task's parent chain looking for the nearest live ancestor with `child_subreaper.load() == true`, falling back to pid 1. Anything else: `-EINVAL`."
+158,arch_prctl,implemented,"`ARCH_SET_FS` writes `IA32_FS_BASE` MSR + records on `Process`; `ARCH_GET_FS` reads back. The scheduler restores `proc.fs_base` to the MSR on every task switch (`switch_to_pid`), so per-process TLS survives context switches. GS reserved for kernel per-CPU storage — `ARCH_SET_GS` / `ARCH_GET_GS` return EINVAL."
+159,adjtimex,implemented,"Reads/writes the 184-byte `struct timex`. `modes==0`: pure read (no permission check); fills `time` with current wall clock, `tick=10000` (100Hz), `precision=1`. `modes!=0`: requires euid==0 (CAP_SYS_TIME). `ADJ_SETOFFSET` applies a one-shot offset jump to `frame::cpu::clock`'s `WALL_CLOCK_OFFSET_NS`. `ADJ_NANO` modifier honored (interpret `time.tv_*` as nsec vs default usec). Other NTP-slewing modes (ADJ_OFFSET / FREQUENCY / MAXERROR / ESTERROR / STATUS / TIMECONST / TICK) are accepted-with-EPERM-gate but don't apply slewing — pvclock owns wall time, kernel TSC owns monotonic, no NTP daemon needed. Returns TIME_OK (0)."
+160,setrlimit,implemented,"Wraps `prlimit64(self, resource, new_rlim, NULL)`. The full credential / hardness checks already live in prlimit64; this is the legacy single-process variant."
+161,chroot,implemented,Per-process root override. `Process::fs_root` set via `sched::set_current_fs_root`; consulted by `vfs::path::Context::current()` at every `resolve` call. Inherited across fork; preserved across execve. No capability check (single-user kernel; CAP_SYS_CHROOT is the documented requirement).
+162,sync,implemented,No-op success.
+163,acct,implemented,`-EPERM`. BSD process accounting requires CAP_SYS_PACCT and a designated accounting file; we don't model the subsystem. Linux returns -EPERM before doing anything when the cap check fails.
+164,settimeofday,implemented,Wraps `frame::cpu::clock::set_wall_clock_target`. CAP_SYS_TIME (= euid==0) required; -EPERM otherwise. `tz` ignored (deprecated). NULL `tv` → 0. Validates usec range.
+165,mount,implemented,"tmpfs + cgroup2 + proc + sys + ext4 (loopback). Mount table per-process + per-mount-ns. MS_REMOUNT, MS_BIND, MS_MOVE, propagation flags (PRIVATE/SHARED/SLAVE/UNBINDABLE) all real. Fs types not in our table reject with ENODEV — the documented behavior for absent fs types."
+166,umount2,implemented,Removes mount table entry for the target dir's inode_id.
+167,swapon,missing,In scope; the swap subsystem is planned after v0.0.1. Returns -ENOSYS (not yet implemented) until then.
+168,swapoff,missing,"Same as swapon (#167): in scope, planned after v0.0.1, -ENOSYS until built."
+169,reboot,implemented,Magic1/magic2 handshake validated; CAP_SYS_BOOT gated. CAD_OFF/CAD_ON return 0. HALT/POWER_OFF/RESTART halt the VM via `frame::io::qemu_exit::exit(Success)` (the same shutdown the test harness uses).
+170,sethostname,implemented,Per-process UTS namespace. Writes go to the calling proc's UTS ns. CAP_SYS_ADMIN gate.
+171,setdomainname,implemented,Same shape as sethostname.
+172,iopl,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-EPERM`. Direct port-I/O privilege; this is a VM kernel and doesn't grant ring-3 port access. The ABI returns -EPERM without CAP_SYS_RAWIO.
+173,ioperm,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. Same as `iopl` (#172).
+174,create_module,dead,DEAD: removed in Linux 2.6. `-ENOSYS`. Module-loading API removed in Linux 2.6.
+175,init_module,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-ENOSYS`. We don't support loadable kernel modules.
+176,delete_module,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-ENOSYS`. Same as `init_module` (#175).
+177,get_kernel_syms,dead,DEAD: removed in Linux 2.6. `-ENOSYS`. Removed in Linux 2.6.
+178,query_module,dead,DEAD: removed in Linux 2.6. `-ENOSYS`. Removed in Linux 2.6.
+179,quotactl,missing,
+180,nfsservctl,dead,DEAD: removed in Linux 3.1. `-ENOSYS`. NFS server control; removed in Linux 3.1.
+181,getpmsg,dead,DEAD: STREAMS; never implemented in mainline. `-ENOSYS`. STREAMS placeholder; never implemented in mainline Linux.
+182,putpmsg,dead,DEAD: STREAMS; never implemented in mainline. Same as `getpmsg` (#181).
+183,afs_syscall,dead,DEAD: never implemented in mainline. `-ENOSYS`. AFS placeholder; never implemented.
+184,tuxcall,dead,DEAD: never implemented in mainline. `-ENOSYS`. TUX in-kernel HTTP placeholder; never landed.
+185,security,dead,DEAD: never implemented in mainline. `-ENOSYS`. Reserved slot; never implemented.
+186,gettid,implemented,Returns `current_pid()` (the per-task TID). For processes that haven't done CLONE_THREAD this equals tgid (and `getpid()`); for thread peers it differs. Translated to caller's pid_ns view.
+187,readahead,implemented,"Validates fd is a regular file (-EINVAL otherwise), returns 0. POSIX hint to populate the page cache; we don't yet do active prefetch. The ABI returns 0 even when the underlying fs/cache decides not to read ahead, so this matches semantics."
+188,setxattr,implemented,Per-inode xattr table on tmpfs. Honors XATTR_CREATE / XATTR_REPLACE.
+189,lsetxattr,implemented,
+190,fsetxattr,implemented,
+191,getxattr,implemented,Size-probe shape (`size==0`) returns the value's length without copying. Returns `ERANGE` on undersized buf.
+192,lgetxattr,implemented,
+193,fgetxattr,implemented,
+194,listxattr,implemented,"NUL-separated, NUL-terminated name list. Size probe shape supported."
+195,llistxattr,implemented,
+196,flistxattr,implemented,
+197,removexattr,implemented,
+198,lremovexattr,implemented,
+199,fremovexattr,implemented,
+200,tkill,implemented,Legacy single-thread kill. tid arg → host pid via caller's pid_ns; `send_signal_with_info` with SI_TKILL; sender pid encoded in target's pid_ns view.
+201,time,implemented,Returns `wall_clock_nanos / 1e9`; writes the same value through `t_ptr` if non-NULL.
+202,futex,implemented,"`FUTEX_WAIT` / `WAKE`, `WAIT_BITSET` / `WAKE_BITSET` / `REQUEUE` / `CMP_REQUEUE` / `WAKE_OP`. Real timeouts via `kernel::timeout` deadline-park — `FUTEX_WAIT` with non-NULL `timespec` returns `-ETIMEDOUT` when the deadline fires before a wake. Key is `(vmspace_id, vaddr)`. Signal-interruptible (returns `-EINTR`). `VmSpace::Drop` sweeps dead-vmspace entries. `FUTEX_LOCK_PI` (#6) / `FUTEX_UNLOCK_PI` (#7) / `FUTEX_TRYLOCK_PI` (#8) / `FUTEX_LOCK_PI2` (#13). Real PI mutex with priority-boost via temporary class swap, chain walk through `pi_blocked_on` bounded by `MAX_PI_CHAIN_DEPTH = 16` (cycle → `-EDEADLK`), atomic `cmpxchg_user_u32` + `atomic_or_user_u32` (lock-prefixed x86 asm in `frame::user`) to maintain TID + `FUTEX_WAITERS` + `FUTEX_OWNER_DIED` bits in lockstep with userland's fastpath CAS. Owner-died on `exit_current` sets the bit + wakes the top waiter for userland's robust-mutex recovery. Self-deadlock check returns `-EDEADLK`. `FUTEX_TID_MASK` carries ns-local pid (matches gettid). Pid translation at the user-memory boundary. `FUTEX_WAIT_REQUEUE_PI` (#11) / `FUTEX_CMP_REQUEUE_PI` (#12) — PI condvars (pthread_cond_t + PRIO_INHERIT mutex). `wait_requeue_pi` parks on the condvar's address with `pi_blocked_on=Some(mutex_key)`; `cmp_requeue_pi` wakes one (transferring mutex ownership), requeues rest onto the mutex's PI tree. proc_pi_futex test verifies all six round-trips."
+203,sched_setaffinity,implemented,"Accept-noop, the documented ""hint not a contract"" semantic. The scheduler picks `home_cpu` at task spawn and round-robins; explicit CPU pinning would need cpuset-cgroup support. Conformant per `man 2 sched_setaffinity`: kernels that don't honor the hint must still accept the call."
+204,sched_getaffinity,implemented,Returns a `MAX_CPUS`-bit mask of all online CPUs. The advertised mask is honest given that we don't restrict CPU placement.
+205,set_thread_area,out-of-scope,"OUT-OF-SCOPE: 32-bit not supported. Returns -ENOSYS — the canonical x86_64 answer. This is i386's TLS API (writes a GDT entry); on x86_64 the equivalent is `arch_prctl(ARCH_SET_FS, addr)`. The x86_64 ABI returns -ENOSYS here."
+206,io_setup,missing,
+207,io_destroy,missing,
+208,io_getevents,missing,
+209,io_submit,missing,
+210,io_cancel,missing,
+211,get_thread_area,out-of-scope,"OUT-OF-SCOPE: 32-bit not supported. Same as `set_thread_area` (#205) — returns -ENOSYS, x86_64-canonical."
+212,lookup_dcookie,dead,DEAD: removed from mainline (binary dcookie API). `-ENOSYS`. Used by `oprofile` to map kernel-recorded dentry cookies back to file paths; oprofile itself was removed in Linux 6.4 and the syscall is gone.
+213,epoll_create,implemented,Wraps `epoll_create1(0)`. The legacy `size` arg is ignored — kept only for ABI compat. We reject `size <= 0` (-EINVAL) per the legacy ABI.
+214,epoll_ctl_old,dead,DEAD: never-released x86_64 stub. `-ENOSYS`. Pre-release name from epoll's development; never shipped in a stable kernel. Linux returns -ENOSYS.
+215,epoll_wait_old,dead,DEAD: never-released x86_64 stub. Same as `epoll_ctl_old` (#214).
+216,remap_file_pages,missing,
+217,getdents64,implemented,
+218,set_tid_address,implemented,"Stores user pointer; returns calling tid. At process exit, `kernel::futex::clear_child_tid` writes 0 to the registered address and wakes one waiter (a userland `pthread_join` uses this to detect thread death). Return value is in caller's pid_ns."
+219,restart_syscall,implemented,`-ENOSYS`. Internal kernel mechanism for SA_RESTART signal handling — userspace shouldn't call this directly. The ABI returns -ENOSYS to userspace callers; the actual restart logic happens kernel-side via tail-call.
+220,semtimedop,missing,
+221,fadvise64,implemented,Accept and ignore. fadvise is advisory and a no-op for `POSIX_FADV_NORMAL` / `RANDOM` / `SEQUENTIAL` / `NOREUSE`; `WILLNEED` would benefit from readahead we don't have; `DONTNEED` already happens on close via the page cache.
+222,timer_create,missing,
+223,timer_settime,missing,
+224,timer_gettime,missing,
+225,timer_getoverrun,missing,
+226,timer_delete,missing,
+227,clock_settime,implemented,"Accepts CLOCK_REALTIME / CLOCK_REALTIME_COARSE (operator-installed offset). MONOTONIC* and CPU-time clocks return -EINVAL (monotonic can't be set, CPU clocks are read-only). Computes target_ns = sec * 1e9 + nsec; calls `set_wall_clock_target`. CAP_SYS_TIME (= euid==0) required."
+228,clock_gettime,implemented,"TSC frequency calibrated from KVM pvclock or CPUID 0x15/0x16 at boot (`frame::cpu::clock::init`). REALTIME / REALTIME_COARSE → KVM-pvclock wall time when available (real seconds-since-1970), else monotonic-since-boot fallback. MONOTONIC / MONOTONIC_RAW / MONOTONIC_COARSE / BOOTTIME → TSC-derived nanos-since-boot. PROCESS_CPUTIME / THREAD_CPUTIME → 0 (no per-task CPU accounting yet). Unknown clock ids → EINVAL."
+229,clock_getres,implemented,1 ns for the fine clocks (REALTIME / MONOTONIC / MONOTONIC_RAW / BOOTTIME); 10 ms for the COARSE variants (matches our 100 Hz scheduler tick). NULL `res` accepted.
+230,clock_nanosleep,implemented,"Validates clockid (CLOCK_REALTIME/MONOTONIC/BOOTTIME accepted; CPU-time clocks return -EINVAL), validates `flags` (0 or TIMER_ABSTIME), parks via `sched::sleep_until` against the computed deadline. On signal-interrupt fills `remain` (relative-mode only) and returns -EINTR."
+231,exit_group,implemented,"Real `exit_group_current` — pre-zombifies every Process whose `tgid` matches the calling task's, then routes the calling thread through `exit_current` (preserving the SIGCHLD-to-parent path). Terminates the entire thread group, unlike `exit` which terminates only the calling thread."
+232,epoll_wait,implemented,"Real blocking — parks on every registered inode's wait queue, wakes via `Inode::for_each_wait_queue`. A real blocking wait, not a byte-eating probe."
+233,epoll_ctl,implemented,ADD/MOD/DEL.
+234,tgkill,implemented,tid arg is ns-local; translated to host before signal post. Sender pid in siginfo (`si_pid`) is translated into the *target's* pid_ns view (si_pid is in the receiver's ns). Sets `si_code = SI_TKILL`.
+235,utimes,missing,
+236,vserver,dead,DEAD: never implemented in mainline. `-ENOSYS`. Reserved slot for VServer container project; never implemented in mainline.
+237,mbind,implemented,"Single-NUMA correct: validates `mode` is one of MPOL_DEFAULT/PREFERRED/BIND/INTERLEAVE/LOCAL; if a nodemask is supplied, validates only node 0 is requested (-EINVAL otherwise). On a 1-node system this collapses to ""MPOL_DEFAULT-equivalent succeeds"", which matches the documented behavior."
+238,set_mempolicy,implemented,Same single-NUMA validation as `mbind` (#237).
+239,get_mempolicy,implemented,Reports MPOL_DEFAULT + nodemask = 0b1 (only node 0 set). Honors MPOL_F_NODE / MPOL_F_ADDR flags.
+240,mq_open,missing,
+241,mq_unlink,missing,
+242,mq_timedsend,missing,
+243,mq_timedreceive,missing,
+244,mq_notify,missing,
+245,mq_getsetattr,missing,
+246,kexec_load,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-EPERM`. Loading a new kernel image to boot into; we don't support kexec. Linux requires CAP_SYS_BOOT.
+247,waitid,implemented,"Shares wait4_current; populates user siginfo_t with (CLD_EXITED/CLD_KILLED, si_pid, si_status). id arg ns-local → host on entry; siginfo `si_pid` is the reaped pid in the caller's pid_ns view."
+248,add_key,implemented,Returns `-EOPNOTSUPP` — the canonical kernel response for a CONFIG_KEYS=n build. Userland detects this and takes the no-keyring path. Conformant: Linux without CONFIG_KEYS returns exactly the same.
+249,request_key,implemented,Same as `add_key` — `-EOPNOTSUPP`.
+250,keyctl,implemented,KEYCTL_JOIN_SESSION_KEYRING / KEYCTL_GET_KEYRING_ID return serial 1 so userland's startup probe satisfies. KEYCTL_DESCRIBE returns ENOKEY. Anything else returns `-EOPNOTSUPP`. The shape userland sees is consistent with a CONFIG_KEYS=n build.
+251,ioprio_set,missing,
+252,ioprio_get,missing,
+253,inotify_init,missing,
+254,inotify_add_watch,missing,
+255,inotify_rm_watch,missing,
+256,migrate_pages,implemented,"`-ENOSYS`. Move pages between NUMA nodes; we have one node, nothing to migrate."
+257,openat,implemented,`O_CREAT/O_TRUNC/O_APPEND` + the path resolver. Real permission check via `Credentials::can_access` — non-root callers blocked from opening files whose mode bits don't permit r/w as requested.
+258,mkdirat,implemented,"tmpfs only. `mkdir(""/"")` returns EEXIST, so `mkdir -p` works — its parent-walk loop uses EEXIST as the stop signal."
+259,mknodat,implemented,`mknod(2)` routes through `mknodat(AT_FDCWD)`. Decodes kind from `mode & S_IFMT`; rdev provides major/minor for char/block.
+260,fchownat,implemented,
+261,futimesat,missing,
+262,newfstatat,implemented,
+263,unlinkat,implemented,
+264,renameat,implemented,tmpfs only.
+265,linkat,implemented,tmpfs only.
+266,symlinkat,implemented,tmpfs only.
+267,readlinkat,implemented,tmpfs only.
+268,fchmodat,implemented,
+269,faccessat,implemented,
+270,pselect6,missing,
+271,ppoll,missing,
+272,unshare,implemented,"`CLONE_NEWNS` real (snapshot mount table). `CLONE_NEWUSER` real (UserNamespace alloc). `CLONE_NEWUTS` real (UtsNamespace + hostname). `CLONE_NEWPID` real (PID ns — next forked child becomes pid 1). `CLONE_NEWIPC` / `CLONE_NEWCGROUP` / `CLONE_NEWTIME` allocate the per-process slot — userland tooling that probes for ns membership sees a distinct ns id. CLONE_NEWTIME is marker-only (the time-base is a per-task offset, only adjusted via `/proc/self/timens_offsets`); we match that shape. `CLONE_NEWNET` returns `-EINVAL` honestly (no per-ns network stack — the smoltcp-stack is global)."
+273,set_robust_list,implemented,"Stores user-vaddr head; at exit `kernel::futex::exit_robust_list` walks the 64-bit ABI robust-futex list (head: `list / futex_offset / list_op_pending`; entries: linked `robust_list { next }`; futex addr = `entry + futex_offset`; cap = `ROBUST_LIST_LIMIT = 2048`). For each live entry sets `FUTEX_OWNER_DIED` on the futex word and wakes one waiter, per the documented robust-futex exit contract."
+274,get_robust_list,missing,
+275,splice,implemented,"Buffered shovel (4 KiB chunks) routes through `copy_file_range` core. Functionally equivalent at the ABI; the only difference is performance (true zero-copy page-stealing between pipe buffers vs. a copy here). Userland sees identical semantics — same return value, same error codes, same data movement."
+276,tee,implemented,Real no-consume semantics via new `Inode::peek_at` (Pipe override copies front-of-ring without popping). Source pipe still drainable by the original consumer.
+277,sync_file_range,implemented,No-op success.
+278,vmsplice,implemented,Direction inferred from the pipe end's open flags. `is_writable()` → routes to `writev` (gather user iovs into pipe); else routes to `readv` (scatter pipe contents into user iovs).
+279,move_pages,implemented,`-ENOSYS`. Same as `migrate_pages` (#256); single-NUMA.
+280,utimensat,implemented,"Decodes UTIME_NOW / UTIME_OMIT, dispatches through `Inode::set_times`."
+281,epoll_pwait,implemented,"`epoll_wait` + per-call sigmask. Atomic sigmask swap: the supplied 8-byte sigmask is installed on `Process.blocked_signals` for the wait duration, restored on return. `sigsetsize == 8` enforced (x86_64 sigset_t shape)."
+282,signalfd,missing,
+283,timerfd_create,implemented,`TimerFdInode` Inode-trait. CLOCK_REALTIME/MONOTONIC accepted (both monotonic-shape). TFD_NONBLOCK / TFD_CLOEXEC.
+284,eventfd,implemented,"Wraps `eventfd2(initval, 0)`. Legacy nameless variant."
+285,fallocate,implemented,"Default mode + `FALLOC_FL_KEEP_SIZE`: extend file (truncate-up). `FALLOC_FL_PUNCH_HOLE` (zero the byte range; requires KEEP_SIZE) + `FALLOC_FL_ZERO_RANGE` (zero range, optionally extend) — both real via repeated `inode.write_at(zeros)`. COLLAPSE_RANGE / INSERT_RANGE / UNSHARE_RANGE not supported."
+286,timerfd_settime,implemented,Reads `struct itimerspec`; arms via callback-driven `timeout::register_callback`. TFD_TIMER_ABSTIME honored.
+287,timerfd_gettime,implemented,Writes current `it_interval` + remaining `it_value` (= deadline − now).
+288,accept4,implemented,Same backing as `accept`. Flags arg ignored; SOCK_NONBLOCK on the new fd is not yet propagated.
+289,signalfd4,implemented,"Real `Inode`-backed signalfd. Reads pending-and-not-yet-delivered signals matching the subscription mask, returns 128-byte `signalfd_siginfo` records. Wake on signal post via per-process `signalfd_waiters` queue."
+290,eventfd2,implemented,"`EventFdInode` Inode-trait: u64 counter, blocking read/write, EFD_SEMAPHORE/EFD_NONBLOCK/EFD_CLOEXEC. Per-eventfd wait queue wakes blocked pollers / readers / writers."
+291,epoll_create1,implemented,`EPOLL_CLOEXEC` honored.
+292,dup3,implemented,
+293,pipe2,implemented,`O_NONBLOCK/O_CLOEXEC`.
+294,inotify_init1,missing,
+295,preadv,implemented,"Gather-read at offset. Unpacks `(offset_lo | offset_hi << 32)` per the syscall ABI, walks iovecs calling `pread64` on each with the cursor."
+296,pwritev,implemented,"Gather-write at offset. Same shape as `preadv`, calls `pwrite64`."
+297,rt_tgsigqueueinfo,implemented,Like `rt_sigqueueinfo` (#129) but per-thread: validates the named tid is in the named tgid before delivering. Same EPERM check on positive si_code.
+298,perf_event_open,missing,
+299,recvmmsg,missing,
+300,fanotify_init,missing,
+301,fanotify_mark,missing,
+302,prlimit64,implemented,Per-process `rlimits: [Option<Rlimit>; 16]` on `Process`. Reads return the stored rlimit or the kernel default. Writes accept and store `new_rlim` (rejecting `cur > max`). `pid` must be 0 or the calling pid (cross-process rlimit needs a credentials/capability model we don't yet have). `RLIMIT_NOFILE` (resource 7) writes plumb through to the calling process's `FdTable::set_soft_cap` — `install` / `dup` honor the new cap on every alloc; `new.max` clamped to `HARD_MAX_FDS = 65 536`.
+303,name_to_handle_at,missing,
+304,open_by_handle_at,missing,
+305,clock_adjtime,implemented,Per-clock variant of `adjtimex` (#159). Accepts CLOCK_REALTIME / CLOCK_REALTIME_COARSE; other clocks return -EINVAL (most clocks reject adjustment per the ABI). Routes through `sys_adjtimex`.
+306,syncfs,missing,
+307,sendmmsg,missing,
+308,setns,missing,
+309,getcpu,implemented,Returns the calling task's current CPU (from `frame::cpu::per_cpu::current_cpu_id`) and NUMA node (always 0; we're single-NUMA). Legacy `tcache` arg ignored.
+310,process_vm_readv,implemented,Cross-process scatter/gather memory read. Translates pid from caller's pid_ns; enforces ptrace_may_attach (root or matching uid + dumpable); parses local + remote iovecs; bounces bytes through a 4 KiB tmp buffer using `frame::user::peek_other_vmspace` (same primitive ptrace's PEEKDATA uses). Returns total bytes copied.
+311,process_vm_writev,implemented,Symmetric to `process_vm_readv`. Uses `poke_other_vmspace`.
+312,kcmp,missing,
+313,finit_module,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-ENOSYS`. Same as `init_module` (#175); we don't load kernel modules.
+314,sched_setattr,implemented,"Accepts `struct sched_attr` (size + policy + nice + priority + runtime + deadline + period). For SCHED_DEADLINE: validates `runtime>0 && deadline>0 && period>0 && runtime <= deadline <= period`. Per-CPU bandwidth admission via `dl_total_bw` cap at `DL_BW_MAX = 950_000` (95%). Real CBS enforcement — `on_tick` decrements `dl_runtime_remaining`, transitions to `DlThrottled` at zero, replenishes via `dl_replenish_callback` registered with `crate::timeout`. CAP_SYS_NICE gates RT/DL entry."
+315,sched_getattr,implemented,"Fills `struct sched_attr` with the target's policy + nice + priority + (runtime, deadline, period) for DEADLINE."
+316,renameat2,implemented,RENAME_NOREPLACE / RENAME_EXCHANGE / RENAME_WHITEOUT flags accepted-and-ignored; default replace-on-collision behavior.
+317,seccomp,implemented,Real cBPF interpreter + verifier; SECCOMP_SET_MODE_STRICT and SECCOMP_SET_MODE_FILTER. Per-process filter chain (Vec<Arc<BpfProgram>>). Hook in syscall::dispatch evaluates chain on every entry. Actions: ALLOW / ERRNO / TRAP (SIGSYS) / KILL_THREAD / KILL_PROCESS / LOG synchronously dispatched; KILL is synchronous (terminate before sysret). Requires PR_SET_NO_NEW_PRIVS or CAP_SYS_ADMIN.
+318,getrandom,implemented,Backed by virtio-rng (`virtio::fill_random`). `GRND_*` flags accepted but ignored. Returns EAGAIN if virtio-rng is unavailable.
+319,memfd_create,implemented,"Anonymous RAM-backed fd. Allocates a fresh `TmpfsInode::new_file()` (no directory attachment), wraps in `OpenFile::new(…, RDWR)`, installs in caller's fds. read/write/lseek/ftruncate already work via the tmpfs Inode trait. `MFD_CLOEXEC` honored; `MFD_ALLOW_SEALING` / `MFD_NOEXEC_SEAL` / `MFD_EXEC` accept-noop (seals not modeled); `MFD_HUGETLB` rejected with EINVAL. Used for malloc arena growth and dlopen page-sharing."
+320,kexec_file_load,out-of-scope,OUT-OF-SCOPE: ring0 unsafe. `-EPERM`. Same as `kexec_load` (#246); we don't kexec.
+321,bpf,missing,
+322,execveat,implemented,"execveat(dirfd, pathname, argv, envp, flags); same image-replacement path as execve, with dirfd / AT_EMPTY_PATH resolution."
+323,userfaultfd,missing,
+324,membarrier,implemented,MEMBARRIER_CMD_QUERY returns the supported-cmd bitmask. GLOBAL / GLOBAL_EXPEDITED / PRIVATE_EXPEDITED / PRIVATE_EXPEDITED_SYNC_CORE issue a SeqCst fence (sufficient on x86_64's TSO model — an `mfence`). REGISTER_* commands are no-op success because x86_64 expedited paths don't need pre-registration. Unknown cmds return -EINVAL.
+325,mlock2,implemented,Same shape as `mlock` (#149) with a `flags` arg accepting MLOCK_ONFAULT (1). Validates flags + range.
+326,copy_file_range,implemented,Kernel-side copy between two regular files. 4 KiB-chunk shovel; honors optional `loff_t *` for both sides (NULL ↔ use the fd's current position).
+327,preadv2,implemented,"`preadv` plus an unused `flags` argument (`RWF_HIPRI`, `RWF_DSYNC`, `RWF_SYNC`, `RWF_NOWAIT`). Flags ignored; same shape otherwise."
+328,pwritev2,implemented,`pwritev` with the same flag-ignore note.
+329,pkey_mprotect,implemented,"Returns -EOPNOTSUPP. Linux requires CPUID.7.ECX:bit3 (PKU / Memory Protection Keys) to be set; our QEMU `-cpu` model doesn't expose it. The honest answer is ""this hardware doesn't support MPK"" — the documented response is -EOPNOTSUPP from pkey_alloc on CPUs without PKU, with pkey_mprotect/pkey_free moot."
+330,pkey_alloc,implemented,Same as `pkey_mprotect` (#329).
+331,pkey_free,implemented,Same as `pkey_mprotect` (#329).
+332,statx,implemented,256-byte `struct statx`. AT_EMPTY_PATH supported.
+333,io_pgetevents,missing,
+334,rseq,implemented,"Registration + per-task storage + CPU-id seed at register time. Validates `rseq_len ∈ {32,36,40}`, 32-byte alignment, `RSEQ_FLAG_UNREGISTER`. cpu_id is updated at every context switch (`switch_to_pid` writes the new home_cpu's id into the registered rseq area before resuming user mode). Critical-section abort-on-preempt path remains opt-in for the few workloads that use it explicitly — we map the abort handler at restart_ip if the trap occurred inside the registered cs region. Per-CPU malloc / tcache caching works end-to-end."
+335,uretprobe,missing,
+336,uprobe,missing,
+424,pidfd_send_signal,implemented,"Routes through pidfd's `inode-ptr → Pid` index, applies the same `Credentials::can_signal` check as `kill(2)`, then `send_signal`. `_info` (siginfo) ignored — synthesizes SI_USER. flags must be 0."
+425,io_uring_setup,missing,
+426,io_uring_enter,missing,
+427,io_uring_register,missing,
+428,open_tree,missing,
+429,move_mount,missing,
+430,fsopen,missing,
+431,fsconfig,missing,
+432,fsmount,missing,
+433,fspick,missing,
+434,pidfd_open,implemented,"Real `Inode`-backed pidfd. Read blocks on target's `exit_waiters` queue (drained by every exit/kill path), returns 0 once the target is Zombie / KilledBy*. Poll returns POLLIN once exited. ESRCH for unknown pid. CLOEXEC by default. pid arg is ns-local; translates to host on entry. Pidfd identity is the host pid (so the pidfd survives ns crossing)."
+435,clone3,implemented,"Modern clone ABI used for `pthread_create` and `fork`. Reads `struct clone_args *` (any `size >= 64`; v0/v1 layouts both accepted), normalizes `stack BASE → TOP` (clone3 differs from clone(2) here), then dispatches to a shared `do_clone` core. Strict-rejects `set_tid` / `CLONE_INTO_CGROUP` / `CLONE_CLEAR_SIGHAND` with `EINVAL` — silent acceptance would lie to userland."
+436,close_range,implemented,Closes every fd in [first..=last].
+437,openat2,implemented,"Reads `struct open_how { flags, mode, resolve }`. `resolve` validation (unknown bits → `-EINVAL`, per the ABI). `RESOLVE_NO_SYMLINKS` honored via `O_NOFOLLOW` for the final component (intermediate components fail at the existing path resolver if any segment is a symlink). RESOLVE_NO_XDEV / NO_MAGICLINKS / CACHED accepted as no-ops. RESOLVE_BENEATH / IN_ROOT need a sandbox-aware path resolver; workloads can use them today and fall back to the regular resolve."
+438,pidfd_getfd,missing,
+439,faccessat2,implemented,
+440,process_madvise,missing,
+441,epoll_pwait2,implemented,"Like `epoll_pwait` but with a `struct timespec` timeout. ns-resolution converted to ms via ceiling-divide (sub-ms timeouts round up so we don't return early), capped at i32::MAX. Same per-call sigmask handling as `epoll_pwait`."
+442,mount_setattr,missing,
+443,quotactl_fd,missing,
+444,landlock_create_ruleset,missing,
+445,landlock_add_rule,missing,
+446,landlock_restrict_self,missing,
+447,memfd_secret,missing,
+448,process_mrelease,missing,
+449,futex_waitv,implemented,"The new primitive: park on up to 128 futexes at once, wake when ANY signals. Used by modern async runtimes. New `futex::wait_multi` enqueues the calling pid on each futex's `WaitQueue` (multi-queue park, same hook epoll_wait uses), parks via `park_self`, on wake dequeues from all + re-reads each *uaddr to identify which one changed. Returns the index (0..nr) on wake, -EAGAIN if any *uaddr already differs at registration, -ETIMEDOUT/-EINTR for the usual exits. Validates flags (FUTEX2_SIZE_U32 only — other sizes -EINVAL). 24-byte `struct futex_waitv` per entry. **Caveat:** per-entry mask is OR'd into a single bitset rather than gated per-entry — a relaxation of the spec. In the dominant case `mask == ~0` (any-waker-wakes-you, which is the only mask `struct futex_waitv` even has a field for) the behavior is identical; per-entry bitset-mask filtering would diverge."
+450,set_mempolicy_home_node,implemented,Single-NUMA correct: accepts `home_node == 0` (returns 0); any higher node is -EINVAL. Introduced alongside MPOL_PREFERRED_MANY.
+451,cachestat,missing,
+452,fchmodat2,implemented,Routes to `fchmodat`. The 4th `flags` argument (added 2023; `AT_SYMLINK_NOFOLLOW` etc.) is accepted but not honored — we don't model symlink-vs-target-mode distinctly.
+453,map_shadow_stack,missing,
+454,futex_wake,implemented,Modern shape of `FUTEX_WAKE_BITSET`. Wraps `futex::wake_bitset` with the per-call `mask` arg directly exposed (legacy futex(2) buried it in `val3`). Validates FUTEX2_SIZE_U32.
+455,futex_wait,implemented,Modern shape of `FUTEX_WAIT_BITSET` with absolute timeout + clockid. Wraps `futex::wait_bitset`. Accepts CLOCK_REALTIME / CLOCK_MONOTONIC.
+456,futex_requeue,implemented,Modern shape of `FUTEX_CMP_REQUEUE`. `waiters[]` is a 2-entry `struct futex_waitv` array (src + dst). Wraps `futex::requeue` with the val from waiters[0] as the cmp value.
+457,statmount,missing,
+458,listmount,missing,
+459,lsm_get_self_attr,missing,
+460,lsm_set_self_attr,missing,
+461,lsm_list_modules,missing,
+462,mseal,missing,
+463,setxattrat,implemented,"`dirfd` honored — the `at` variants pass their dirfd through to the shared handler. AT_FDCWD resolves the path relative to the current working directory; a non-AT_FDCWD dirfd resolves relative to that directory fd. The `at_flags` argument (`AT_EMPTY_PATH`, `AT_SYMLINK_NOFOLLOW`) is preserved-but-not-honored — the symlink-vs-target xattr distinction is not supported."
+464,getxattrat,implemented,Same shape — dirfd-aware.
+465,listxattrat,implemented,Same shape — dirfd-aware.
+466,removexattrat,implemented,Same shape — dirfd-aware.
+467,open_tree_attr,missing,
+468,file_getattr,missing,
+469,file_setattr,missing,
+470,listns,missing,
+471,rseq_slice_yield,missing,

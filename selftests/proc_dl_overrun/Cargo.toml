@@ -1,0 +1,11 @@
+[package]
+name = "proc_dl_overrun"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "proc_dl_overrun"
+path = "src/main.rs"
+test = false

@@ -1,0 +1,38 @@
+[package]
+name = "verification"
+description = "Kani formal-proof harnesses for properties Cyphera Kernel's frame and kernel layers implement."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+# Kani proof harnesses for properties that frame/ (and eventually kernel/)
+# implement. Lives in a separate crate so Kani can use its own pinned
+# nightly toolchain without conflicting with Cyphera Kernel's
+# rust-toolchain.toml (nightly-2026-03-01, ahead of Kani's bundled
+# nightly).
+#
+# This crate intentionally has NO dependencies on frame/ or x86_64. The
+# logic-to-be-verified is re-stated here, mirroring the production code
+# verbatim where possible. Proofs cover the algorithm; the production
+# code is reviewed for byte-for-byte correspondence to what's verified
+# (a manual audit step).
+#
+# Run with: cargo kani --package verification
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+# `cfg(kani)` is set by `cargo kani` (which builds this crate via its
+# own pinned toolchain) but not by regular `cargo` runs. Tell rustc to
+# expect it so `cargo check`/`cargo clippy` don't warn `unexpected_cfgs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

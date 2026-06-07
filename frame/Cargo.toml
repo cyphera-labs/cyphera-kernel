@@ -1,0 +1,37 @@
+[package]
+name = "frame"
+description = "Privileged hardware abstraction layer for Cyphera Kernel — the only crate in the workspace where unsafe code is permitted."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["lazy", "once"] }
+
+# x86_64: typed wrappers for descriptor tables, page-table entries, control
+# registers, MSRs. `abi_x86_interrupt` enables `set_handler_fn` impls that
+# require nightly's x86-interrupt ABI.
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+
+# Heap: we use the raw `Heap` (linked-list, first-fit, coalescing) and wrap
+# it ourselves in SpinIrq for IRQ-safe locking. Avoid `use_spin` (their
+# Mutex doesn't disable IRQs).
+linked_list_allocator = { version = "0.10", default-features = false }
+
+# Buddy allocator for physical frames. The `FrameAllocator` type sits
+# behind the `alloc` feature.
+buddy_system_allocator = { version = "0.10", default-features = false, features = ["alloc"] }
+
+bitflags = { version = "2.12", default-features = false }

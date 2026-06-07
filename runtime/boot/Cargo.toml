@@ -1,0 +1,424 @@
+[package]
+name = "cyphera-kernel"
+description = "Cyphera Kernel boot binary — PVH ELF entry, multiboot2, long-mode bring-up, kernel_main."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cyphera-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[test]]
+name = "boot_smoke"
+path = "tests/smoke/boot_smoke.rs"
+harness = false
+
+[[test]]
+name = "frame_api"
+path = "tests/smoke/frame_api.rs"
+harness = false
+
+[[test]]
+name = "ex_table"
+path = "tests/smoke/ex_table.rs"
+harness = false
+
+[[test]]
+name = "user_exit"
+path = "tests/smoke/user_exit.rs"
+harness = false
+
+[[test]]
+name = "user_hello"
+path = "tests/smoke/user_hello.rs"
+harness = false
+
+[[test]]
+name = "user_elf"
+path = "tests/smoke/user_elf.rs"
+harness = false
+
+[[test]]
+name = "multi_proc"
+path = "tests/smoke/multi_proc.rs"
+harness = false
+
+[[test]]
+name = "page_fault"
+path = "tests/smoke/page_fault.rs"
+harness = false
+
+[[test]]
+name = "syscalls"
+path = "tests/smoke/syscalls.rs"
+harness = false
+
+[[test]]
+name = "virtio_rng"
+path = "tests/smoke/virtio_rng.rs"
+harness = false
+
+[[test]]
+name = "virtio_blk"
+path = "tests/smoke/virtio_blk.rs"
+harness = false
+
+[[test]]
+name = "virtio_net"
+path = "tests/smoke/virtio_net.rs"
+harness = false
+
+[[test]]
+name = "virtio_sound"
+path = "tests/smoke/virtio_sound.rs"
+harness = false
+
+[[test]]
+name = "virtio_sound_play"
+path = "tests/smoke/virtio_sound_play.rs"
+harness = false
+
+[[test]]
+name = "sound_demo"
+path = "tests/smoke/sound_demo.rs"
+harness = false
+
+[[test]]
+name = "dev_dsp"
+path = "tests/smoke/dev_dsp.rs"
+harness = false
+
+[[test]]
+name = "ioctl_sign_ext"
+path = "tests/smoke/ioctl_sign_ext.rs"
+harness = false
+
+[[test]]
+name = "mremap"
+path = "tests/smoke/mremap.rs"
+harness = false
+
+[[test]]
+name = "files"
+path = "tests/subsystem/files.rs"
+harness = false
+
+[[test]]
+name = "dirs"
+path = "tests/subsystem/dirs.rs"
+harness = false
+
+[[test]]
+name = "procfs"
+path = "tests/subsystem/procfs.rs"
+harness = false
+
+[[test]]
+name = "ext4"
+path = "tests/subsystem/ext4.rs"
+harness = false
+
+[[test]]
+name = "abi"
+path = "tests/subsystem/abi.rs"
+harness = false
+
+[[test]]
+name = "net"
+path = "tests/subsystem/net.rs"
+harness = false
+
+[[test]]
+name = "fork"
+path = "tests/subsystem/fork.rs"
+harness = false
+
+[[test]]
+name = "fork_shared"
+path = "tests/subsystem/fork_shared.rs"
+harness = false
+
+[[test]]
+name = "exec"
+path = "tests/subsystem/exec.rs"
+harness = false
+
+[[test]]
+name = "exec_interp"
+path = "tests/subsystem/exec_interp.rs"
+harness = false
+
+[[test]]
+name = "exec_threaded"
+path = "tests/subsystem/exec_threaded.rs"
+harness = false
+
+[[test]]
+name = "wait4"
+path = "tests/subsystem/wait4.rs"
+harness = false
+
+[[test]]
+name = "clock"
+path = "tests/subsystem/clock.rs"
+harness = false
+
+[[test]]
+name = "misc"
+path = "tests/subsystem/misc.rs"
+harness = false
+
+[[test]]
+name = "futex"
+path = "tests/subsystem/futex.rs"
+harness = false
+
+[[test]]
+name = "signal"
+path = "tests/subsystem/signal.rs"
+harness = false
+
+[[test]]
+name = "argv"
+path = "tests/subsystem/argv.rs"
+harness = false
+
+[[test]]
+name = "pty"
+path = "tests/subsystem/pty.rs"
+harness = false
+
+[[test]]
+name = "chroot"
+path = "tests/subsystem/chroot.rs"
+harness = false
+
+[[test]]
+name = "timeouts"
+path = "tests/subsystem/timeouts.rs"
+harness = false
+
+[[test]]
+name = "fs_extras"
+path = "tests/subsystem/fs_extras.rs"
+harness = false
+
+[[test]]
+name = "signals_default"
+path = "tests/subsystem/signals_default.rs"
+harness = false
+
+[[test]]
+name = "mmap_extras"
+path = "tests/subsystem/mmap_extras.rs"
+harness = false
+
+[[test]]
+name = "threads"
+path = "tests/subsystem/threads.rs"
+harness = false
+
+[[test]]
+name = "threads_shm"
+path = "tests/subsystem/threads_shm.rs"
+harness = false
+
+[[test]]
+name = "threads_coherence"
+path = "tests/subsystem/threads_coherence.rs"
+harness = false
+
+[[test]]
+name = "loadtick"
+path = "tests/subsystem/loadtick.rs"
+harness = false
+
+[[test]]
+name = "sigsuspend_race"
+path = "tests/subsystem/sigsuspend_race.rs"
+harness = false
+
+[[test]]
+name = "jobctl"
+path = "tests/subsystem/jobctl.rs"
+harness = false
+
+[[test]]
+name = "creds"
+path = "tests/subsystem/creds.rs"
+harness = false
+
+[[test]]
+name = "pidfd"
+path = "tests/subsystem/pidfd.rs"
+harness = false
+
+[[test]]
+name = "sockopt"
+path = "tests/subsystem/sockopt.rs"
+harness = false
+
+[[test]]
+name = "fifo"
+path = "tests/subsystem/fifo.rs"
+harness = false
+
+[[test]]
+name = "flock"
+path = "tests/subsystem/flock.rs"
+harness = false
+
+[[test]]
+name = "mmap_shared"
+path = "tests/subsystem/mmap_shared.rs"
+harness = false
+
+[[test]]
+name = "mprotect"
+path = "tests/subsystem/mprotect.rs"
+harness = false
+
+[[test]]
+name = "clone"
+path = "tests/subsystem/clone.rs"
+harness = false
+
+[[test]]
+name = "perms"
+path = "tests/subsystem/perms.rs"
+harness = false
+
+[[test]]
+name = "caps"
+path = "tests/subsystem/caps.rs"
+harness = false
+
+[[test]]
+name = "userns"
+path = "tests/subsystem/userns.rs"
+harness = false
+
+[[test]]
+name = "namespaces"
+path = "tests/subsystem/namespaces.rs"
+harness = false
+
+[[test]]
+name = "pidns"
+path = "tests/subsystem/pidns.rs"
+harness = false
+
+[[test]]
+name = "clone3"
+path = "tests/subsystem/clone3.rs"
+harness = false
+
+[[test]]
+name = "memfd"
+path = "tests/subsystem/memfd.rs"
+harness = false
+
+[[test]]
+name = "rseq"
+path = "tests/subsystem/rseq.rs"
+harness = false
+
+[[test]]
+name = "compat_intro"
+path = "tests/subsystem/compat_intro.rs"
+harness = false
+
+[[test]]
+name = "cgroups"
+path = "tests/subsystem/cgroups.rs"
+harness = false
+
+[[test]]
+name = "seccomp"
+path = "tests/subsystem/seccomp.rs"
+harness = false
+
+[[test]]
+name = "rt"
+path = "tests/subsystem/rt.rs"
+harness = false
+
+[[test]]
+name = "pi_futex"
+path = "tests/subsystem/pi_futex.rs"
+harness = false
+
+[[test]]
+name = "dl"
+path = "tests/subsystem/dl.rs"
+harness = false
+
+[[test]]
+name = "io_sched"
+path = "tests/subsystem/io_sched.rs"
+harness = false
+
+[[test]]
+name = "dl_overrun"
+path = "tests/subsystem/dl_overrun.rs"
+harness = false
+
+[[test]]
+name = "cpu_throttle"
+path = "tests/subsystem/cpu_throttle.rs"
+harness = false
+
+[[test]]
+name = "io_throttle"
+path = "tests/subsystem/io_throttle.rs"
+harness = false
+
+[[test]]
+name = "ptrace"
+path = "tests/subsystem/ptrace.rs"
+harness = false
+
+[[test]]
+name = "clock_settime"
+path = "tests/subsystem/clock_settime.rs"
+harness = false
+
+[[test]]
+name = "futex_waitv"
+path = "tests/subsystem/futex_waitv.rs"
+harness = false
+
+[[test]]
+name = "ptrace_tracefork"
+path = "tests/subsystem/ptrace_tracefork.rs"
+harness = false
+
+[[test]]
+name = "process_vm"
+path = "tests/subsystem/process_vm.rs"
+harness = false
+
+[[test]]
+name = "ptrace_signal"
+path = "tests/subsystem/ptrace_signal.rs"
+harness = false
+
+[[test]]
+name = "misc_quickwins"
+path = "tests/subsystem/misc_quickwins.rs"
+harness = false
+
+[dependencies]
+frame = { path = "../../frame" }
+kernel = { path = "../../kernel" }
+virtio = { path = "../../drivers/virtio" }
