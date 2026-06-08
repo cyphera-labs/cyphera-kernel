@@ -37,7 +37,7 @@ jobs:
       # nightly-2026-03-01). That pin is load-bearing for build
       # reproducibility — see docs/REPRODUCIBLE-BUILDS.md.
       - name: Set up Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@11df97af8e8102fd60b60a77dfbf58d40cd843b8 # v1.10.1
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           # Don't let the action inject RUSTFLAGS into the env — an env
           # RUSTFLAGS overrides the kernel's .cargo/config.toml
@@ -83,7 +83,7 @@ jobs:
       #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       #     --signature <file>.sig --certificate <file>.pem <file>
       - name: Install cosign
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign kernel ELF with cosign (keyless)
         run: |
