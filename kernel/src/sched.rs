@@ -22,7 +22,27 @@ pub use crate::sched_runqueue::{
     CfsPlace, DL_BW_MAX, DL_BW_SCALE, EnqueueData, RT_PRIO_COUNT, RT_PRIO_MAX, RT_PRIO_MIN,
     RunQueues, SCHED_LATENCY_NS, SCHED_MIN_GRANULARITY_NS, SCHED_WAKEUP_VRUNTIME_THRESH_NS,
 };
-use crate::vfs::Inode;
+mod accounting;
+mod credentials;
+mod file;
+mod identity;
+mod lifecycle;
+mod limits;
+mod memory;
+mod namespace;
+pub mod scheduling;
+mod signal_context;
+mod trace;
+pub use accounting::*;
+pub use credentials::*;
+pub use file::*;
+pub use identity::*;
+pub use lifecycle::*;
+pub use limits::*;
+pub use memory::*;
+pub use namespace::*;
+pub use signal_context::*;
+pub use trace::*;
 
 pub const SCHED_WAKEUP_GRANULARITY_NS: u64 = 1_000_000;
 
@@ -55,7 +75,7 @@ fn cgroup_scaled_weight(proc: &Process) -> u64 {
 
 fn bank_cpu_time(proc: &mut Process, delta_ns: u64) {
     proc.total_cpu_ns = proc.total_cpu_ns.saturating_add(delta_ns);
-    if proc.in_syscall {
+    if proc.lifecycle.in_syscall() {
         proc.total_stime_ns = proc.total_stime_ns.saturating_add(delta_ns);
     } else {
         proc.total_utime_ns = proc.total_utime_ns.saturating_add(delta_ns);
@@ -99,6 +119,7 @@ struct CpuQueue {
     current: Option<Pid>,
     idle_ctx: Context,
     active_vmspace: Option<alloc::sync::Arc<frame::sync::SpinIrq<frame::mm::vm::VmSpace>>>,
+    pending_corpse: Option<Pid>,
 }
 
 impl CpuQueue {
@@ -108,6 +129,7 @@ impl CpuQueue {
             current: None,
             idle_ctx: Context::bootstrap(),
             active_vmspace: None,
+            pending_corpse: None,
         }
     }
 }
@@ -132,16 +154,37 @@ fn next_pid() -> Pid {
     Pid(NEXT_PID.fetch_add(1, Ordering::SeqCst))
 }
 
-fn pick_home_cpu() -> u32 {
-    let mask = frame::arch::x86_64::smp::online_mask();
-    let online_count = mask.count_ones();
-    let idx = NEXT_HOME_CPU.fetch_add(1, Ordering::Relaxed) % online_count;
+fn affinity_allows(affinity: u64, cpu: u32) -> bool {
+    cpu < 64 && (affinity & (1u64 << cpu)) != 0
+}
 
-    let mut m = mask;
+fn pick_home_cpu_in(affinity: u64) -> u32 {
+    let online = frame::arch::x86_64::smp::online_mask();
+    let mut eff = online & affinity;
+    if eff == 0 {
+        eff = online;
+    }
+    let count = eff.count_ones();
+    let idx = NEXT_HOME_CPU.fetch_add(1, Ordering::Relaxed) % count;
+    let mut m = eff;
     for _ in 0..idx {
         m &= m.wrapping_sub(1);
     }
     m.trailing_zeros()
+}
+
+fn pick_home_cpu() -> u32 {
+    pick_home_cpu_in(u64::MAX)
+}
+
+fn effective_home_cpu(proc: &mut Process) -> u32 {
+    if affinity_allows(proc.cpu_affinity, proc.home_cpu) {
+        proc.home_cpu
+    } else {
+        let h = pick_home_cpu_in(proc.cpu_affinity);
+        proc.home_cpu = h;
+        h
+    }
 }
 
 fn this_cpu() -> u32 {
@@ -153,7 +196,7 @@ pub fn spawn_kthread(name: &str, entry: extern "C" fn() -> !) -> Pid {
     let home_cpu = pick_home_cpu();
     let mut proc = Process::new_kthread(pid, entry);
     proc.home_cpu = home_cpu;
-    proc.cmdline = name.as_bytes().to_vec();
+    proc.identity.set_cmdline(name.as_bytes().to_vec());
     proc.cgroup = Some(crate::cgroup::root());
 
     let home_q = &CPU_QUEUES[home_cpu as usize];
@@ -204,7 +247,7 @@ pub fn register_with_vmspace(
     proc.addr_space = vmspace.map(|v| crate::process::AddressSpace::new(v, pid, brk_start));
 
     if let Some(root) = crate::vfs::try_root_inode() {
-        proc.cwd = Some(CwdState {
+        proc.files.set_cwd(CwdState {
             inode: root.clone(),
             path: String::from("/"),
         });
@@ -222,7 +265,7 @@ pub fn register_with_vmspace(
     }
 
     proc.cgroup = Some(crate::cgroup::root());
-    proc.pid_ns = Some(host_pid_ns());
+    proc.namespaces.set_pid(Some(host_pid_ns()));
     GLOBAL.lock().processes.insert(pid, Box::new(proc));
     crate::process::PidNamespace::assign_chain(&host_pid_ns(), pid);
     let _ = crate::cgroup::root().attach_pid(pid);
@@ -275,7 +318,13 @@ pub fn register_with_argv(
 pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, ForkError> {
     let parent_pid = current_pid();
     let child_pid = next_pid();
-    let home_cpu = pick_home_cpu();
+    let parent_affinity = GLOBAL
+        .lock()
+        .processes
+        .get(&parent_pid)
+        .map(|p| p.cpu_affinity)
+        .unwrap_or(u64::MAX);
+    let home_cpu = pick_home_cpu_in(parent_affinity);
 
     enum ShareKind {
         File {
@@ -336,10 +385,33 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
             };
             let shared_ranges: Vec<(u64, u64)> =
                 shareable.iter().map(|(lo, hi, _)| (*lo, *hi)).collect();
-            let mut parent_vm = parent_vm_arc.lock();
-            let (new_vm, shared_vaddrs) = parent_vm
-                .clone_user_half_with_shared(&shared_ranges)
-                .map_err(|_| ForkError::OutOfMemory)?;
+            let clone = {
+                let mut parent_vm = parent_vm_arc.lock();
+                let r = parent_vm.clone_user_half_phase1(&shared_ranges);
+                drop(parent_vm);
+                match r {
+                    Ok(c) => c,
+                    Err(_) => {
+                        frame::cpu::tlb::shootdown_all();
+                        return Err(ForkError::OutOfMemory);
+                    }
+                }
+            };
+            if clone.needs_shootdown() {
+                frame::cpu::tlb::shootdown_all();
+            }
+            let (new_vm, shared_vaddrs) = {
+                let mut parent_vm = parent_vm_arc.lock();
+                let r = parent_vm.finish_cow_clone(clone);
+                drop(parent_vm);
+                match r {
+                    Ok(v) => v,
+                    Err(_) => {
+                        frame::cpu::tlb::shootdown_all();
+                        return Err(ForkError::OutOfMemory);
+                    }
+                }
+            };
             for (_, _, kind) in &shareable {
                 if let ShareKind::Shm { segment } = kind {
                     segment
@@ -361,7 +433,6 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
                     }
                 }
             }
-            drop(parent_vm);
             Arc::new(frame::sync::SpinIrq::new(new_vm))
         };
         let child_pml4_root = child_vm.lock().root_frame();
@@ -374,7 +445,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
     let child = {
         let g = GLOBAL.lock();
         let parent = g.processes.get(&parent_pid).ok_or(ForkError::NoCurrent)?;
-        let task = frame::cpu::task::Task::spawn(first_launch_trampoline);
+        let task = SchedCell::new(frame::cpu::task::Task::spawn(first_launch_trampoline));
         let creds_snapshot = parent.creds.lock().clone();
         let sigactions_snapshot = *parent.sigactions.lock();
         let child_addr_space = if share_vmspace {
@@ -397,64 +468,38 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
         Process {
             pid: child_pid,
             tgid: child_pid,
-            pgid: parent.pgid,
-            sid: parent.sid,
+            identity: crate::process::IdentityContext::inherit(&parent.identity),
             creds: alloc::sync::Arc::new(frame::sync::SpinIrq::new(creds_snapshot)),
             parent: Some(parent_pid),
-            state: ProcessState::Runnable,
+            state: SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::User,
             saved: parent.saved,
-            maps_layout: parent.maps_layout.clone(),
+            memory: crate::process::MemoryContext::inherit(&parent.memory),
             fds: Arc::new(parent.fds.clone_for_child()),
-            cwd: parent.cwd.as_ref().map(|c| CwdState {
-                inode: c.inode.clone(),
-                path: c.path.clone(),
-            }),
-            fs_root: parent.fs_root.clone(),
-            mount_table: parent.mount_table.clone(),
-            cmdline: parent.cmdline.clone(),
-            exe_path: parent.exe_path.clone(),
-            uts_ns: parent.uts_ns.clone(),
-            ipc_ns: parent.ipc_ns.clone(),
-            pid_ns: parent.pid_ns.clone(),
-            pending_pid_ns: None,
-            pending_ipc_ns: None,
-            cgroup_ns: parent.cgroup_ns.clone(),
-            time_ns: parent.time_ns.clone(),
+            files: crate::process::FileContext::inherit(&parent.files),
+            namespaces: crate::process::NamespaceContext::inherit(&parent.namespaces),
             cgroup: parent.cgroup.clone(),
             cgroup_charged_bytes: 0,
-            seccomp_filters: parent.seccomp_filters.clone(),
-            no_new_privs: parent.no_new_privs,
-            pending_signals: 0,
-            blocked_signals: parent.blocked_signals,
+            security: crate::process::SecurityContext::inherit(&parent.security),
+            signals: crate::process::SignalContext::inherit(&parent.signals),
             sigactions: Arc::new(frame::sync::SpinIrq::new(sigactions_snapshot)),
             task,
             first_launch: Some(FirstLaunch::Fork { tf: child_tf }),
             home_cpu,
+            cpu_affinity: parent.cpu_affinity,
             addr_space: Some(child_addr_space),
             pml4_root: Some(child_pml4_root),
-            sched_owner: crate::process::SchedOwner::None,
+            sched_owner: SchedCell::new(crate::process::SchedOwner::None),
+            parking_unsaved: false,
             children: Vec::new(),
             child_exit: crate::wait::WaitQueue::new(),
             exit_waiters: crate::wait::WaitQueue::new(),
             signalfd_waiters: crate::wait::WaitQueue::new(),
             vfork_done: crate::wait::WaitQueue::new(),
-            vfork_done_set: core::sync::atomic::AtomicBool::new(false),
-            vfork_shared_vm: core::sync::atomic::AtomicBool::new(share_vmspace),
-            did_memfd_exec: core::sync::atomic::AtomicBool::new(false),
-            child_subreaper: core::sync::atomic::AtomicBool::new(false),
+            lifecycle: crate::process::LifecycleContext::with_vfork_shared(share_vmspace),
             pdeathsig: core::sync::atomic::AtomicU32::new(0),
-            dumpable: core::sync::atomic::AtomicU32::new(1),
-            keep_caps: core::sync::atomic::AtomicBool::new(false),
-            fs_base: parent.fs_base,
-            clear_child_tid: 0,
-            robust_list_head: 0,
             name: [0u8; 16],
             rlimits: [None; 16],
-            umask: parent.umask,
-            rseq_addr: 0,
-            rseq_len: 0,
-            rseq_sig: 0,
             nice: parent.nice,
             sched_class: parent.sched_class,
             vruntime: parent.vruntime,
@@ -470,45 +515,32 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
             total_cpu_ns: 0,
             total_stime_ns: 0,
             total_utime_ns: 0,
-            in_syscall: false,
-            minflt: 0,
-            majflt: 0,
             cutime_ns: 0,
             cstime_ns: 0,
-            itimer_real_interval_ns: parent.itimer_real_interval_ns,
-            itimer_real_deadline_ns: parent.itimer_real_deadline_ns,
-            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
-            altstack: parent.altstack,
-            tracer_pid: None,
-            tracees: alloc::vec::Vec::new(),
-            trace_stop: None,
-            trace_options: 0,
-            trace_in_syscall_stop_mode: false,
-            pending_event_stop: None,
-            trace_pending_inject: 0,
-            trace_wait_consumed: false,
-            trace_saved_regs: None,
-            trace_event_msg: 0,
+            trace: crate::process::TraceContext::default(),
         }
     };
 
     let child_pid_ns: Arc<crate::process::PidNamespace> = {
         let mut g = GLOBAL.lock();
         let parent_proc = g.processes.get_mut(&parent_pid).unwrap();
-        if let Some(staged) = parent_proc.pending_pid_ns.take() {
+        if let Some(staged) = parent_proc.namespaces.take_pending_pid() {
             staged
         } else {
-            parent_proc.pid_ns.clone().unwrap_or_else(host_pid_ns)
+            parent_proc.namespaces.pid().unwrap_or_else(host_pid_ns)
         }
     };
 
     {
         let mut g = GLOBAL.lock();
         let mut child_box = Box::new(child);
-        child_box.pid_ns = Some(child_pid_ns.clone());
+        child_box.namespaces.set_pid(Some(child_pid_ns.clone()));
         if let Some(p) = g.processes.get_mut(&parent_pid) {
-            if let Some(staged) = p.pending_ipc_ns.take() {
-                child_box.ipc_ns = Some(staged);
+            if let Some(staged) = p.namespaces.take_pending_ipc() {
+                child_box.namespaces.set_ipc(Some(staged));
+            }
+            if let Some(staged) = p.namespaces.take_pending_net() {
+                child_box.namespaces.set_net(Some(staged));
             }
         }
         let (event_opt_bit, fork_event) = if share_vmspace {
@@ -525,30 +557,28 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
         let (parent_tracer, trace_fork_set, parent_trace_options) =
             match g.processes.get(&parent_pid) {
                 Some(p) => (
-                    p.tracer_pid,
-                    (p.trace_options & event_opt_bit) != 0,
-                    p.trace_options,
+                    p.trace.tracer_pid(),
+                    (p.trace.options() & event_opt_bit) != 0,
+                    p.trace.options(),
                 ),
                 None => (None, false, 0),
             };
         if let (Some(tracer), true) = (parent_tracer, trace_fork_set) {
-            child_box.tracer_pid = Some(tracer);
-            child_box.trace_in_syscall_stop_mode = true;
-            child_box.trace_options = parent_trace_options;
+            child_box.trace.inherit_trace(tracer, parent_trace_options);
         }
         g.processes.insert(child_pid, child_box);
         if let Some(p) = g.processes.get_mut(&parent_pid) {
             p.children.push(child_pid);
             if trace_fork_set {
-                p.trace_event_msg = child_pid.0 as u64;
-                p.pending_event_stop = Some(crate::process::TraceStop::EventStop(fork_event));
+                p.trace.post_event_stop(
+                    crate::process::TraceStop::EventStop(fork_event),
+                    child_pid.0 as u64,
+                );
             }
         }
         if let (Some(tracer), true) = (parent_tracer, trace_fork_set) {
             if let Some(tr) = g.processes.get_mut(&tracer) {
-                if !tr.tracees.contains(&child_pid) {
-                    tr.tracees.push(child_pid);
-                }
+                tr.trace.add_tracee(child_pid);
             }
         }
     }
@@ -560,7 +590,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
             if share_vmspace {
                 if let Some(p) = g.processes.get(&child_pid) {
                     let was_live = !matches!(
-                        p.state,
+                        p.state.0,
                         ProcessState::Zombie(_)
                             | ProcessState::KilledByFault { .. }
                             | ProcessState::KilledBySignal { .. }
@@ -574,6 +604,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> Result<Pid, F
                 }
             }
             g.processes.remove(&child_pid);
+            crate::process::PidNamespace::drop_chain(&child_pid_ns, child_pid);
             if let Some(p) = g.processes.get_mut(&parent_pid) {
                 p.children.retain(|&c| c != child_pid);
             }
@@ -622,7 +653,13 @@ impl ForkError {
 pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<Pid, ForkError> {
     let parent_pid = current_pid();
     let child_pid = next_pid();
-    let home_cpu = pick_home_cpu();
+    let parent_affinity = GLOBAL
+        .lock()
+        .processes
+        .get(&parent_pid)
+        .map(|p| p.cpu_affinity)
+        .unwrap_or(u64::MAX);
+    let home_cpu = pick_home_cpu_in(parent_affinity);
 
     let mut child_tf = parent_tf.clone();
     child_tf.rax = 0;
@@ -633,7 +670,7 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
     let child = {
         let g = GLOBAL.lock();
         let parent = g.processes.get(&parent_pid).ok_or(ForkError::NoCurrent)?;
-        let task = frame::cpu::task::Task::spawn(first_launch_trampoline);
+        let task = SchedCell::new(frame::cpu::task::Task::spawn(first_launch_trampoline));
         if let Some(a) = parent.addr_space.as_ref() {
             a.live_users
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -641,64 +678,38 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
         Process {
             pid: child_pid,
             tgid: parent.tgid,
-            pgid: parent.pgid,
-            sid: parent.sid,
+            identity: crate::process::IdentityContext::inherit(&parent.identity),
             creds: parent.creds.clone(),
             parent: parent.parent,
-            state: ProcessState::Runnable,
+            state: SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::User,
             saved: parent.saved,
-            maps_layout: parent.maps_layout.clone(),
+            memory: crate::process::MemoryContext::inherit(&parent.memory),
             fds: parent.fds.clone(),
-            cwd: parent.cwd.as_ref().map(|c| CwdState {
-                inode: c.inode.clone(),
-                path: c.path.clone(),
-            }),
-            fs_root: parent.fs_root.clone(),
-            mount_table: parent.mount_table.clone(),
-            cmdline: parent.cmdline.clone(),
-            exe_path: parent.exe_path.clone(),
-            uts_ns: parent.uts_ns.clone(),
-            ipc_ns: parent.ipc_ns.clone(),
-            pid_ns: parent.pid_ns.clone(),
-            pending_pid_ns: None,
-            pending_ipc_ns: None,
-            cgroup_ns: parent.cgroup_ns.clone(),
-            time_ns: parent.time_ns.clone(),
+            files: crate::process::FileContext::inherit(&parent.files),
+            namespaces: crate::process::NamespaceContext::inherit(&parent.namespaces),
             cgroup: parent.cgroup.clone(),
             cgroup_charged_bytes: 0,
-            seccomp_filters: parent.seccomp_filters.clone(),
-            no_new_privs: parent.no_new_privs,
-            pending_signals: 0,
-            blocked_signals: parent.blocked_signals,
+            security: crate::process::SecurityContext::inherit(&parent.security),
+            signals: crate::process::SignalContext::inherit(&parent.signals),
             sigactions: parent.sigactions.clone(),
             task,
             first_launch: Some(FirstLaunch::Fork { tf: child_tf }),
             home_cpu,
+            cpu_affinity: parent.cpu_affinity,
             addr_space: parent.addr_space.clone(),
             pml4_root: parent.pml4_root,
-            sched_owner: crate::process::SchedOwner::None,
+            sched_owner: SchedCell::new(crate::process::SchedOwner::None),
+            parking_unsaved: false,
             children: Vec::new(),
             child_exit: crate::wait::WaitQueue::new(),
             exit_waiters: crate::wait::WaitQueue::new(),
             signalfd_waiters: crate::wait::WaitQueue::new(),
             vfork_done: crate::wait::WaitQueue::new(),
-            vfork_done_set: core::sync::atomic::AtomicBool::new(false),
-            vfork_shared_vm: core::sync::atomic::AtomicBool::new(false),
-            did_memfd_exec: core::sync::atomic::AtomicBool::new(false),
-            child_subreaper: core::sync::atomic::AtomicBool::new(false),
+            lifecycle: crate::process::LifecycleContext::default(),
             pdeathsig: core::sync::atomic::AtomicU32::new(0),
-            dumpable: core::sync::atomic::AtomicU32::new(1),
-            keep_caps: core::sync::atomic::AtomicBool::new(false),
-            fs_base: parent.fs_base,
-            clear_child_tid: 0,
-            robust_list_head: 0,
             name: [0u8; 16],
             rlimits: [None; 16],
-            umask: parent.umask,
-            rseq_addr: 0,
-            rseq_len: 0,
-            rseq_sig: 0,
             nice: parent.nice,
             sched_class: parent.sched_class,
             vruntime: parent.vruntime,
@@ -714,25 +725,9 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
             total_cpu_ns: 0,
             total_stime_ns: 0,
             total_utime_ns: 0,
-            in_syscall: false,
-            minflt: 0,
-            majflt: 0,
             cutime_ns: 0,
             cstime_ns: 0,
-            itimer_real_interval_ns: parent.itimer_real_interval_ns,
-            itimer_real_deadline_ns: parent.itimer_real_deadline_ns,
-            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
-            altstack: parent.altstack,
-            tracer_pid: None,
-            tracees: alloc::vec::Vec::new(),
-            trace_stop: None,
-            trace_options: 0,
-            trace_in_syscall_stop_mode: false,
-            pending_event_stop: None,
-            trace_pending_inject: 0,
-            trace_wait_consumed: false,
-            trace_saved_regs: None,
-            trace_event_msg: 0,
+            trace: crate::process::TraceContext::default(),
         }
     };
 
@@ -741,31 +736,27 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
         let (parent_tracer, trace_clone_set, parent_trace_options) =
             match g.processes.get(&parent_pid) {
                 Some(p) => (
-                    p.tracer_pid,
-                    (p.trace_options & crate::ptrace::PTRACE_O_TRACECLONE) != 0,
-                    p.trace_options,
+                    p.trace.tracer_pid(),
+                    (p.trace.options() & crate::ptrace::PTRACE_O_TRACECLONE) != 0,
+                    p.trace.options(),
                 ),
                 None => (None, false, 0),
             };
         let mut child_box = Box::new(child);
         if let (Some(tracer), true) = (parent_tracer, trace_clone_set) {
-            child_box.tracer_pid = Some(tracer);
-            child_box.trace_in_syscall_stop_mode = true;
-            child_box.trace_options = parent_trace_options;
+            child_box.trace.inherit_trace(tracer, parent_trace_options);
         }
         g.processes.insert(child_pid, child_box);
         if trace_clone_set {
             if let Some(p) = g.processes.get_mut(&parent_pid) {
-                p.trace_event_msg = child_pid.0 as u64;
-                p.pending_event_stop = Some(crate::process::TraceStop::EventStop(
-                    crate::ptrace::PTRACE_EVENT_CLONE,
-                ));
+                p.trace.post_event_stop(
+                    crate::process::TraceStop::EventStop(crate::ptrace::PTRACE_EVENT_CLONE),
+                    child_pid.0 as u64,
+                );
             }
             if let (Some(tracer), true) = (parent_tracer, trace_clone_set) {
                 if let Some(tr) = g.processes.get_mut(&tracer) {
-                    if !tr.tracees.contains(&child_pid) {
-                        tr.tracees.push(child_pid);
-                    }
+                    tr.trace.add_tracee(child_pid);
                 }
             }
         }
@@ -778,7 +769,7 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get(&child_pid) {
                 let was_live = !matches!(
-                    p.state,
+                    p.state.0,
                     ProcessState::Zombie(_)
                         | ProcessState::KilledByFault { .. }
                         | ProcessState::KilledBySignal { .. }
@@ -791,6 +782,7 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> Result<P
                 }
             }
             g.processes.remove(&child_pid);
+            crate::process::PidNamespace::drop_chain(&thread_ns, child_pid);
             return Err(ForkError::OutOfMemory);
         }
     }
@@ -832,30 +824,63 @@ pub fn exit_group_current(tf: &mut TrapFrame, code: i32) -> ! {
             .map(|(pid, _)| *pid)
             .collect()
     };
+    let mut dying_sibling_fds: alloc::vec::Vec<Arc<crate::vfs::fd::FdTable>> =
+        alloc::vec::Vec::new();
     for sib in siblings {
-        let mut g = GLOBAL.lock();
-        if let Some(p) = g.processes.get_mut(&sib) {
+        let mut info = None;
+        loop {
+            let home = {
+                let g = GLOBAL.lock();
+                match g.processes.get(&sib) {
+                    Some(p) => p.home_cpu,
+                    None => break,
+                }
+            };
+            let mut q = CPU_QUEUES[home as usize].lock();
+            let mut g = GLOBAL.lock();
+            let Some(p) = g.processes.get_mut(&sib) else {
+                break;
+            };
+            if p.home_cpu != home {
+                continue;
+            }
             let was_live = !matches!(
-                p.state,
+                p.state.0,
                 ProcessState::Zombie(_)
                     | ProcessState::KilledByFault { .. }
                     | ProcessState::KilledBySignal { .. }
             );
             let sib_as = if was_live { p.addr_space.clone() } else { None };
-            let sib_ipc = if was_live { p.ipc_ns.clone() } else { None };
-            p.state = ProcessState::Zombie(code);
-            let home = p.home_cpu;
-            drop(g);
-            let (rt, dl, cfs) = CPU_QUEUES[home as usize].lock().runnable.remove_pid(sib);
+            let sib_ipc = if was_live { p.namespaces.ipc() } else { None };
+            if matches!(p.state.0, ProcessState::Running) {
+                if p.lifecycle.pending_exit().is_none() {
+                    p.lifecycle.set_pending_exit(ProcessState::Zombie(code));
+                }
+            } else {
+                p.state.0 = ProcessState::Zombie(code);
+                dying_sibling_fds.push(core::mem::replace(
+                    &mut p.fds,
+                    Arc::new(crate::vfs::fd::FdTable::new()),
+                ));
+            }
+            let (rt, dl, cfs) = q.runnable.remove_pid(sib);
             if rt + dl + cfs > 0 {
                 record_dequeue(sib);
             }
+            info = Some((was_live, sib_as, sib_ipc));
+            break;
+        }
+        if let Some((was_live, sib_as, sib_ipc)) = info {
             if let Some(sib_as) = sib_as {
                 release_addr_space_user(&sib_as, sib_ipc.as_ref());
+            }
+            if was_live {
+                wake_tracer_on_exit(sib);
             }
             drain_vfork_done(sib);
         }
     }
+    drop(dying_sibling_fds);
     exit_current(tf, code)
 }
 
@@ -900,11 +925,7 @@ pub fn exec_current(
 
     let pid = current_pid();
 
-    let vfork_shared = with_current_process(|p| {
-        p.vfork_shared_vm
-            .load(core::sync::atomic::Ordering::Acquire)
-    })
-    .unwrap_or(false);
+    let vfork_shared = with_current_lifecycle(|l| l.vfork_shared_vm()).unwrap_or(false);
 
     let live_peers: Vec<Pid> = if vfork_shared {
         Vec::new()
@@ -917,7 +938,7 @@ pub fn exec_current(
                 **p != pid
                     && pr.tgid == my_tgid
                     && !matches!(
-                        pr.state,
+                        pr.state.0,
                         ProcessState::Zombie(_)
                             | ProcessState::KilledByFault { .. }
                             | ProcessState::KilledBySignal { .. }
@@ -942,7 +963,6 @@ pub fn exec_current(
         (proc.vmspace().ok_or(ExecError::NoVmSpace)?, None)
     };
 
-
     if let Some(interp) = crate::elf::interp_path(elf_bytes) {
         let ctx = crate::vfs::path::Context::global();
         if crate::vfs::path::resolve(&ctx, &ctx.root, &interp).is_err() {
@@ -962,7 +982,7 @@ pub fn exec_current(
             let mut g = GLOBAL.lock();
             if let Some(proc) = g.processes.get_mut(&pid) {
                 if let Some(old) = proc.addr_space.clone() {
-                    leaving_as = Some((old, proc.ipc_ns.clone()));
+                    leaving_as = Some((old, proc.namespaces.ipc()));
                 }
                 proc.addr_space = Some(alloc::sync::Arc::new(crate::process::AddressSpace {
                     vmspace: vm_arc.clone(),
@@ -971,8 +991,7 @@ pub fn exec_current(
                     live_users: core::sync::atomic::AtomicUsize::new(1),
                 }));
                 proc.pml4_root = Some(root);
-                proc.vfork_shared_vm
-                    .store(false, core::sync::atomic::Ordering::Release);
+                proc.lifecycle.set_vfork_shared_vm(false);
             }
         }
         frame::mm::vm::VmSpace::activate_root(root);
@@ -1056,34 +1075,36 @@ pub fn exec_current(
                 prot: Perms::READ | Perms::WRITE | Perms::USER,
                 label: MapSegLabel::Stack,
             });
-            proc.maps_layout = layout;
+            proc.memory.set_maps_layout(layout);
         }
         proc.sigactions = Arc::new(frame::sync::SpinIrq::new(
             [crate::process::SigAction::default(); NSIG],
         ));
-        proc.pending_signals = 0;
-        proc.pending_event_stop = if proc.tracer_pid.is_some() {
-            if proc.trace_options & crate::ptrace::PTRACE_O_TRACEEXEC != 0 {
-                proc.trace_event_msg = proc.pid.raw() as u64;
-                Some(crate::process::TraceStop::EventStop(
-                    crate::ptrace::PTRACE_EVENT_EXEC,
-                ))
+        proc.signals.set_pending(0);
+        if proc.trace.is_traced() {
+            if proc.trace.options() & crate::ptrace::PTRACE_O_TRACEEXEC != 0 {
+                let msg = proc.pid.raw() as u64;
+                proc.trace.post_event_stop(
+                    crate::process::TraceStop::EventStop(crate::ptrace::PTRACE_EVENT_EXEC),
+                    msg,
+                );
             } else {
-                Some(crate::process::TraceStop::Signal(crate::process::SIGTRAP))
+                proc.trace.arm_post_exec_trap();
             }
         } else {
-            None
-        };
-        proc.siginfo = [crate::signal::PendingSigInfo::default(); NSIG];
-        proc.altstack = crate::signal::AltStack::disabled();
-        proc.fs_base = 0;
+            proc.trace.clear_pending_event_stop();
+        }
+        proc.signals.reset_siginfo();
+        proc.signals
+            .set_altstack(crate::signal::AltStack::disabled());
+        proc.memory.set_fs_base(0);
         proc.sched_class = crate::process::SchedClass::default_cfs();
-        proc.itimer_real_interval_ns = 0;
-        proc.itimer_real_deadline_ns = 0;
+        proc.signals.set_itimer_interval(0);
+        proc.signals.set_itimer_deadline(0);
         let key = (proc.pid.raw() as u64) | (1u64 << 63);
         crate::timeout::cancel_callback(key);
-        proc.cmdline = cmdline;
-        proc.exe_path = exe_path.to_vec();
+        proc.identity.set_cmdline(cmdline);
+        proc.identity.set_exe_path(exe_path.to_vec());
         proc.fds.close_cloexec();
 
         *tf = TrapFrame {
@@ -1126,141 +1147,6 @@ fn send_resched_ipi(target_cpu: u32) {
     }
 }
 
-pub fn with_current_fds<R>(f: impl FnOnce(&crate::vfs::fd::FdTable) -> R) -> R {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    match g.processes.get(&pid) {
-        Some(p) => f(&p.fds),
-        None => {
-            let empty = crate::vfs::fd::FdTable::new();
-            f(&empty)
-        }
-    }
-}
-
-pub fn with_current_cwd<R>(f: impl FnOnce(&CwdState) -> R) -> Option<R> {
-    let pid = CPU_QUEUES[this_cpu() as usize].lock().current?;
-    let g = GLOBAL.lock();
-    g.processes.get(&pid)?.cwd.as_ref().map(f)
-}
-
-pub fn set_current_cwd(inode: Arc<dyn Inode>, path: String) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let proc = g.processes.get_mut(&pid).unwrap();
-    proc.cwd = Some(CwdState { inode, path });
-}
-
-pub fn with_current_fs_root<R>(f: impl FnOnce(&Arc<dyn Inode>) -> R) -> Option<R> {
-    let pid = CPU_QUEUES[this_cpu() as usize].lock().current?;
-    let g = GLOBAL.lock();
-    g.processes.get(&pid)?.fs_root.as_ref().map(f)
-}
-
-pub fn set_current_fs_root(inode: Arc<dyn Inode>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.fs_root = Some(inode);
-    }
-}
-
-pub fn with_current_mount_table<R>(
-    f: impl FnOnce(&Option<Arc<crate::vfs::MountTable>>) -> R,
-) -> Option<R> {
-    let pid = CPU_QUEUES[this_cpu() as usize].lock().current?;
-    let g = GLOBAL.lock();
-    Some(f(&g.processes.get(&pid)?.mount_table))
-}
-
-pub fn set_current_mount_table(table: Option<Arc<crate::vfs::MountTable>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.mount_table = table;
-    }
-}
-
-pub fn set_current_name(name: [u8; 16]) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.name = name;
-    }
-}
-
-pub fn set_name(pid: Pid, name: [u8; 16]) {
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.name = name;
-    }
-}
-
-pub fn current_name() -> [u8; 16] {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    g.processes.get(&pid).map(|p| p.name).unwrap_or([0u8; 16])
-}
-
-pub fn set_current_fs_base(addr: u64) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.fs_base = addr;
-    }
-}
-
-pub fn set_current_clear_child_tid(addr: u64) {
-    let pid = current_pid();
-    set_clear_child_tid(pid, addr);
-}
-
-pub fn set_clear_child_tid(pid: Pid, addr: u64) {
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.clear_child_tid = addr;
-    }
-}
-
-pub fn set_fs_base(pid: Pid, addr: u64) {
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.fs_base = addr;
-    }
-}
-
-pub fn set_current_robust_list(head: u64) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.robust_list_head = head;
-    }
-}
-
-pub fn current_rlimit(resource: u64) -> crate::process::Rlimit {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    if let Some(p) = g.processes.get(&pid) {
-        if (resource as usize) < 16 {
-            if let Some(r) = p.rlimits[resource as usize] {
-                return r;
-            }
-        }
-    }
-    crate::syscall::default_rlimit(resource)
-}
-
-pub fn set_current_rlimit(resource: u64, r: crate::process::Rlimit) {
-    if (resource as usize) >= 16 {
-        return;
-    }
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.rlimits[resource as usize] = Some(r);
-    }
-}
-
 pub fn current_pid() -> Pid {
     CPU_QUEUES[this_cpu() as usize]
         .lock()
@@ -1272,244 +1158,8 @@ pub fn current_pid_opt() -> Option<Pid> {
     CPU_QUEUES[this_cpu() as usize].lock().current
 }
 
-pub fn current_tgid() -> Pid {
-    let pid = current_pid();
-    GLOBAL
-        .lock()
-        .processes
-        .get(&pid)
-        .map(|p| p.tgid)
-        .unwrap_or(pid)
-}
-
-pub fn current_pgid() -> Pid {
-    let pid = current_pid();
-    GLOBAL
-        .lock()
-        .processes
-        .get(&pid)
-        .map(|p| p.pgid)
-        .unwrap_or(pid)
-}
-
-pub fn current_sid() -> Pid {
-    let pid = current_pid();
-    GLOBAL
-        .lock()
-        .processes
-        .get(&pid)
-        .map(|p| p.sid)
-        .unwrap_or(pid)
-}
-
-pub fn setpgid(target_pid: Pid, new_pgid: Pid) -> Result<(), i64> {
-    let actual_target = if target_pid.0 == 0 {
-        current_pid()
-    } else {
-        target_pid
-    };
-    let actual_pgid = if new_pgid.0 == 0 {
-        actual_target
-    } else {
-        new_pgid
-    };
-    let caller_sid = current_sid();
-    let mut g = GLOBAL.lock();
-    let target = g
-        .processes
-        .get_mut(&actual_target)
-        .ok_or(-3i64)?;
-    if target.sid != caller_sid {
-        return Err(-1);
-    }
-    if target.sid == actual_target {
-        return Err(-1);
-    }
-    target.pgid = actual_pgid;
-    Ok(())
-}
-
-pub fn getpgid(target_pid: Pid) -> Result<Pid, i64> {
-    let actual = if target_pid.0 == 0 {
-        current_pid()
-    } else {
-        target_pid
-    };
-    GLOBAL
-        .lock()
-        .processes
-        .get(&actual)
-        .map(|p| p.pgid)
-        .ok_or(-3)
-}
-
-pub fn getsid(target_pid: Pid) -> Result<Pid, i64> {
-    let actual = if target_pid.0 == 0 {
-        current_pid()
-    } else {
-        target_pid
-    };
-    GLOBAL
-        .lock()
-        .processes
-        .get(&actual)
-        .map(|p| p.sid)
-        .ok_or(-3)
-}
-
-pub fn setsid() -> Result<Pid, i64> {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let proc = g.processes.get_mut(&pid).ok_or(-3i64)?;
-    if proc.pgid == pid {
-        return Err(-1);
-    }
-    proc.pgid = pid;
-    proc.sid = pid;
-    Ok(pid)
-}
-
-pub fn with_current_uts<R>(f: impl FnOnce(&crate::process::UtsNamespace) -> R) -> R {
-    let pid = current_pid();
-    let ns = {
-        let g = GLOBAL.lock();
-        let proc = g.processes.get(&pid).expect("with_current_uts: no current");
-        proc.uts_ns.clone()
-    };
-    match ns {
-        Some(n) => f(&n),
-        None => f(&host_uts()),
-    }
-}
-
-pub fn set_current_uts(ns: Option<Arc<crate::process::UtsNamespace>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.uts_ns = ns;
-    }
-}
-
-pub fn set_current_ipc(ns: Option<Arc<crate::process::IpcNamespace>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.ipc_ns = ns;
-    }
-}
-
-pub fn with_current_ipc<R>(f: impl FnOnce(&crate::process::IpcNamespace) -> R) -> R {
-    let pid = current_pid();
-    let ns = {
-        let g = GLOBAL.lock();
-        let proc = g.processes.get(&pid).expect("with_current_ipc: no current");
-        proc.ipc_ns.clone()
-    };
-    match ns {
-        Some(n) => f(&n),
-        None => f(&host_ipc()),
-    }
-}
-
-pub fn with_current_pid_ns<R>(f: impl FnOnce(&Arc<crate::process::PidNamespace>) -> R) -> R {
-    let pid = current_pid();
-    let ns = {
-        let g = GLOBAL.lock();
-        let proc = g
-            .processes
-            .get(&pid)
-            .expect("with_current_pid_ns: no current");
-        proc.pid_ns.clone()
-    };
-    match ns {
-        Some(n) => f(&n),
-        None => f(&host_pid_ns()),
-    }
-}
-
-pub fn set_current_pid_ns(ns: Option<Arc<crate::process::PidNamespace>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.pid_ns = ns;
-    }
-}
-
-pub fn set_current_cgroup_ns(ns: Option<Arc<crate::process::CgroupNamespace>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.cgroup_ns = ns;
-    }
-}
-
-pub fn set_current_time_ns(ns: Option<Arc<crate::process::TimeNamespace>>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.time_ns = ns;
-    }
-}
-
-fn host_uts() -> Arc<crate::process::UtsNamespace> {
-    static HOST: frame::sync::SpinIrq<Option<Arc<crate::process::UtsNamespace>>> =
-        frame::sync::SpinIrq::new(None);
-    let mut g = HOST.lock();
-    if g.is_none() {
-        *g = Some(crate::process::UtsNamespace::host());
-    }
-    g.as_ref().unwrap().clone()
-}
-
-fn host_pid_ns() -> Arc<crate::process::PidNamespace> {
-    static HOST: frame::sync::SpinIrq<Option<Arc<crate::process::PidNamespace>>> =
-        frame::sync::SpinIrq::new(None);
-    let mut g = HOST.lock();
-    if g.is_none() {
-        *g = Some(crate::process::PidNamespace::host());
-    }
-    g.as_ref().unwrap().clone()
-}
-
-fn host_ipc() -> Arc<crate::process::IpcNamespace> {
-    static HOST: frame::sync::SpinIrq<Option<Arc<crate::process::IpcNamespace>>> =
-        frame::sync::SpinIrq::new(None);
-    let mut g = HOST.lock();
-    if g.is_none() {
-        *g = Some(crate::process::IpcNamespace::host());
-    }
-    g.as_ref().unwrap().clone()
-}
-
-pub fn with_current_creds<R>(f: impl FnOnce(&crate::process::Credentials) -> R) -> R {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    let proc = g
-        .processes
-        .get(&pid)
-        .expect("with_current_creds: no current");
-    let creds = proc.creds.lock();
-    f(&creds)
-}
-
-pub fn with_current_process<R>(f: impl FnOnce(&crate::process::Process) -> R) -> Option<R> {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    g.processes.get(&pid).map(|p| f(p))
-}
-
-pub fn with_current_process_mut<R>(f: impl FnOnce(&mut crate::process::Process) -> R) -> Option<R> {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    g.processes.get_mut(&pid).map(|p| f(p))
-}
-
 pub fn current_is_vfork_borrower() -> bool {
-    with_current_process(|p| {
-        p.vfork_shared_vm
-            .load(core::sync::atomic::Ordering::Acquire)
-    })
-    .unwrap_or(false)
+    with_current_lifecycle(|l| l.vfork_shared_vm()).unwrap_or(false)
 }
 
 fn root_has_live_user(root_phys: u64) -> bool {
@@ -1517,7 +1167,7 @@ fn root_has_live_user(root_phys: u64) -> bool {
     g.processes.values().any(|p| {
         p.pml4_root.map(|r| r.start_address().as_u64()) == Some(root_phys)
             && !matches!(
-                p.state,
+                p.state.0,
                 ProcessState::Zombie(_)
                     | ProcessState::KilledByFault { .. }
                     | ProcessState::KilledBySignal { .. }
@@ -1525,33 +1175,12 @@ fn root_has_live_user(root_phys: u64) -> bool {
     })
 }
 
-pub fn with_current_creds_mut<R>(f: impl FnOnce(&mut crate::process::Credentials) -> R) -> R {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    let proc = g
-        .processes
-        .get(&pid)
-        .expect("with_current_creds_mut: no current");
-    let mut creds = proc.creds.lock();
-    f(&mut creds)
-}
-
-pub fn with_target_creds<R>(
-    target: Pid,
-    f: impl FnOnce(&crate::process::Credentials) -> R,
-) -> Option<R> {
-    let g = GLOBAL.lock();
-    let proc = g.processes.get(&target)?;
-    let creds = proc.creds.lock();
-    Some(f(&creds))
-}
-
 pub fn signal_pgrp(pgid: Pid, signal: u32) -> usize {
     let targets: alloc::vec::Vec<Pid> = {
         let g = GLOBAL.lock();
         g.processes
             .iter()
-            .filter(|(_, p)| p.pgid == pgid)
+            .filter(|(_, p)| p.identity.pgid() == pgid)
             .map(|(pid, _)| *pid)
             .collect()
     };
@@ -1562,15 +1191,6 @@ pub fn signal_pgrp(pgid: Pid, signal: u32) -> usize {
         }
     }
     count
-}
-
-pub fn current_vmspace_id() -> u64 {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .and_then(|p| p.pml4_root.map(|f| f.start_address().as_u64()))
-        .unwrap_or(0)
 }
 
 pub fn current_parent_pid() -> u32 {
@@ -1622,7 +1242,7 @@ pub fn process_name(pid: Pid) -> [u8; 16] {
 pub fn process_summary(pid: Pid) -> Option<ProcessSummary> {
     let g = GLOBAL.lock();
     let proc = g.processes.get(&pid)?;
-    let state_char = match proc.state {
+    let state_char = match proc.state.0 {
         ProcessState::Running | ProcessState::Runnable => 'R',
         ProcessState::Parked => 'S',
         ProcessState::Zombie(_) => 'Z',
@@ -1659,12 +1279,12 @@ pub fn process_summary(pid: Pid) -> Option<ProcessSummary> {
         state_char,
         parent_pid: proc.parent.map(|p| p.0).unwrap_or(0),
         brk_bytes: brk_cur.saturating_sub(brk_start),
-        pgrp: proc.pgid.0,
-        session: proc.sid.0,
+        pgrp: proc.identity.pgid().0,
+        session: proc.identity.sid().0,
         utime_clk: proc.total_utime_ns / 10_000_000,
         stime_clk: proc.total_stime_ns / 10_000_000,
-        minflt: proc.minflt,
-        majflt: proc.majflt,
+        minflt: proc.memory.minflt(),
+        majflt: proc.memory.majflt(),
         cutime_clk: proc.cutime_ns / 10_000_000,
         cstime_clk: proc.cstime_ns / 10_000_000,
         priority,
@@ -1679,204 +1299,38 @@ pub fn process_summary(pid: Pid) -> Option<ProcessSummary> {
 }
 
 pub fn process_cmdline(pid: Pid) -> Option<Vec<u8>> {
-    Some(GLOBAL.lock().processes.get(&pid)?.cmdline.clone())
+    Some(
+        GLOBAL
+            .lock()
+            .processes
+            .get(&pid)?
+            .identity
+            .cmdline()
+            .to_vec(),
+    )
 }
 
 pub fn set_cmdline(pid: Pid, cmdline: Vec<u8>) {
     if let Some(proc) = GLOBAL.lock().processes.get_mut(&pid) {
-        proc.cmdline = cmdline;
+        proc.identity.set_cmdline(cmdline);
     }
 }
 
 pub fn process_exe(pid: Pid) -> Option<Vec<u8>> {
-    let v = GLOBAL.lock().processes.get(&pid)?.exe_path.clone();
+    let v = GLOBAL
+        .lock()
+        .processes
+        .get(&pid)?
+        .identity
+        .exe_path()
+        .to_vec();
     if v.is_empty() { None } else { Some(v) }
 }
 
 pub fn set_exe_path(pid: Pid, path: Vec<u8>) {
     if let Some(proc) = GLOBAL.lock().processes.get_mut(&pid) {
-        proc.exe_path = path;
+        proc.identity.set_exe_path(path);
     }
-}
-
-pub fn current_umask() -> u16 {
-    let pid = current_pid();
-    GLOBAL
-        .lock()
-        .processes
-        .get(&pid)
-        .map(|p| p.umask)
-        .unwrap_or(0o022)
-}
-
-pub fn set_current_umask(new: u16) -> u16 {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let p = match g.processes.get_mut(&pid) {
-        Some(p) => p,
-        None => return 0,
-    };
-    let prev = p.umask;
-    p.umask = new & 0o777;
-    prev
-}
-
-pub fn current_altstack() -> crate::signal::AltStack {
-    let pid = current_pid();
-    GLOBAL
-        .lock()
-        .processes
-        .get(&pid)
-        .map(|p| p.altstack)
-        .unwrap_or_else(crate::signal::AltStack::disabled)
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct NoCurrentProcess;
-
-pub fn set_current_altstack(
-    new: crate::signal::AltStack,
-) -> Result<crate::signal::AltStack, NoCurrentProcess> {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let proc = g.processes.get_mut(&pid).ok_or(NoCurrentProcess)?;
-    Ok(core::mem::replace(&mut proc.altstack, new))
-}
-
-pub fn current_on_altstack(rsp: u64) -> bool {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .map(|p| {
-            let alt = p.altstack;
-            alt.is_enabled() && rsp >= alt.sp && rsp < alt.sp + alt.size
-        })
-        .unwrap_or(false)
-}
-
-pub enum MapVmaLabel {
-    Heap,
-    Stack,
-    Anon,
-    File,
-}
-
-pub struct MapsSnapshot {
-    pub brk_start: u64,
-    pub brk_cur: u64,
-    pub vmas: alloc::vec::Vec<(u64, u64, frame::mm::vm::Perms, bool, MapVmaLabel)>,
-    pub segments: alloc::vec::Vec<(u64, u64, frame::mm::vm::Perms, crate::process::MapSegLabel)>,
-}
-
-pub fn process_maps(pid: Pid) -> Option<MapsSnapshot> {
-    let g = GLOBAL.lock();
-    let proc = g.processes.get(&pid)?;
-    let addr_space = proc.addr_space.as_ref()?;
-    let m = addr_space.mmap.lock();
-    let brk = *addr_space.brk.lock();
-    let mut vmas = alloc::vec::Vec::with_capacity(m.vmas.len());
-    for v in &m.vmas {
-        let label = match &v.backing {
-            crate::process::VmaBacking::File { .. } => MapVmaLabel::File,
-            crate::process::VmaBacking::Shm { .. } | crate::process::VmaBacking::Anonymous => {
-                MapVmaLabel::Anon
-            }
-        };
-        vmas.push((
-            v.start,
-            v.end,
-            v.prot,
-            v.flags.contains(crate::process::VmaFlags::SHARED),
-            label,
-        ));
-    }
-    let segments = proc
-        .maps_layout
-        .segments
-        .iter()
-        .map(|s| (s.start, s.end, s.prot, s.label))
-        .collect();
-    Some(MapsSnapshot {
-        brk_start: brk.start,
-        brk_cur: brk.current,
-        vmas,
-        segments,
-    })
-}
-
-pub fn set_maps_layout(pid: Pid, layout: crate::process::MapsLayout) {
-    if let Some(proc) = GLOBAL.lock().processes.get_mut(&pid) {
-        proc.maps_layout = layout;
-    }
-}
-
-pub fn process_open_fds(pid: Pid) -> Option<Vec<i32>> {
-    let g = GLOBAL.lock();
-    let proc = g.processes.get(&pid)?;
-    let mut out = Vec::new();
-    for i in 0..1024 {
-        if proc.fds.get(i).is_some() {
-            out.push(i);
-        }
-    }
-    Some(out)
-}
-
-fn current_addr_space() -> alloc::sync::Arc<crate::process::AddressSpace> {
-    let pid = current_pid();
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .unwrap()
-        .addr_space
-        .clone()
-        .expect("current task has no address space")
-}
-
-pub fn current_brk() -> BrkState {
-    *current_addr_space().brk.lock()
-}
-
-pub fn set_current_brk(addr: u64) -> u64 {
-    let addr_space = current_addr_space();
-    let mut brk = addr_space.brk.lock();
-    let new = addr.clamp(brk.start, brk.max);
-    brk.current = new;
-    new
-}
-
-pub fn alloc_current_mmap(len: u64) -> Option<u64> {
-    let len = (len + 0xfff) & !0xfff;
-    current_addr_space().mmap.lock().find_gap(len)
-}
-
-pub fn with_current_mmap_mut<R>(f: impl FnOnce(&mut MmapState) -> R) -> R {
-    let pid = current_pid();
-    let (addr_space, is_vfork_borrower) = {
-        let g = GLOBAL.lock();
-        let proc = g.processes.get(&pid).unwrap();
-        (
-            proc.addr_space
-                .clone()
-                .expect("with_current_mmap_mut: no address space"),
-            proc.vfork_shared_vm
-                .load(core::sync::atomic::Ordering::Acquire),
-        )
-    };
-    assert!(
-        !is_vfork_borrower,
-        "[VFORK_LEASE] VMA-topology mutation reached with_current_mmap_mut under a live vfork lease (pid {})",
-        pid.0,
-    );
-    let mut mmap = addr_space.mmap.lock();
-    f(&mut mmap)
-}
-
-pub fn with_current_mmap<R>(f: impl FnOnce(&MmapState) -> R) -> R {
-    let addr_space = current_addr_space();
-    let mmap = addr_space.mmap.lock();
-    f(&mmap)
 }
 
 pub extern "C" fn first_launch_trampoline() -> ! {
@@ -1908,7 +1362,7 @@ pub extern "C" fn dump_all_processes() {
     let g = GLOBAL.lock();
     frame::println!("count: {}", g.processes.len());
     for (pid, proc) in g.processes.iter() {
-        let state = match proc.state {
+        let state = match proc.state.0 {
             ProcessState::Runnable => "Runnable",
             ProcessState::Running => "Running",
             ProcessState::Parked => "Parked",
@@ -1920,7 +1374,7 @@ pub extern "C" fn dump_all_processes() {
             ProcessState::DlThrottled => "DlThrottled",
             ProcessState::CgroupThrottled => "CgroupThrottled",
         };
-        let owner = match proc.sched_owner {
+        let owner = match proc.sched_owner.0 {
             SchedOwner::None => String::from("None"),
             SchedOwner::Running { cpu } => alloc::format!("Running({cpu})"),
             SchedOwner::Runnable { cpu } => alloc::format!("Runnable({cpu})"),
@@ -1931,7 +1385,7 @@ pub extern "C" fn dump_all_processes() {
             SchedOwner::Reaping => String::from("Reaping"),
         };
         let ppid = proc.parent.map(|p| p.0).unwrap_or(0);
-        let on_queue = match proc.sched_owner {
+        let on_queue = match proc.sched_owner.0 {
             SchedOwner::Runnable { cpu } => {
                 Some(CPU_QUEUES[cpu as usize].lock().runnable.contains_pid(*pid))
             }
@@ -1948,8 +1402,8 @@ pub extern "C" fn dump_all_processes() {
             ppid,
             state,
             owner,
-            proc.pending_signals,
-            proc.blocked_signals,
+            proc.signals.pending(),
+            proc.signals.blocked(),
             on_queue_str,
         );
     }
@@ -1964,13 +1418,17 @@ fn scheduler_loop() -> ! {
     frame::cpu::enable_interrupts();
 
     loop {
-        let pick = {
+        let corpse = CPU_QUEUES[this_cpu() as usize].lock().pending_corpse.take();
+        if let Some(dead) = corpse {
+            publish_corpse(dead);
+        }
+        let (pick, src_min_vr) = {
             let mut q = CPU_QUEUES[this_cpu() as usize].lock();
             let p = q.runnable.pick_next(!rt_throttled());
             if let Some(pid) = p {
                 record_dequeue(pid);
             }
-            p
+            (p, q.runnable.cfs_min_vruntime())
         };
         let pid = match pick {
             Some(p) => {
@@ -1986,7 +1444,109 @@ fn scheduler_loop() -> ! {
             }
         };
 
+        let (allowed, affinity) = {
+            let g = GLOBAL.lock();
+            match g.processes.get(&pid) {
+                Some(p) => (affinity_allows(p.cpu_affinity, this_cpu()), p.cpu_affinity),
+                None => (true, u64::MAX),
+            }
+        };
+        if !allowed {
+            let target = pick_home_cpu_in(affinity);
+            if target != this_cpu() {
+                migrate_dispatched_to(pid, target, src_min_vr);
+                continue;
+            }
+        }
+
         switch_to_pid(pid);
+    }
+}
+
+fn migrate_dispatched_to(pid: Pid, target: u32, src_min_vr: u64) {
+    let mut q = CPU_QUEUES[target as usize].lock();
+    let dst_min_vr = q.runnable.cfs_min_vruntime();
+    let mut g = GLOBAL.lock();
+    let proc = match g.processes.get_mut(&pid) {
+        Some(p) => p,
+        None => return,
+    };
+    if matches!(
+        proc.state.0,
+        ProcessState::Zombie(_)
+            | ProcessState::KilledByFault { .. }
+            | ProcessState::KilledBySignal { .. }
+    ) {
+        return;
+    }
+    proc.home_cpu = target;
+    set_sched_owner(
+        proc,
+        SchedOwner::Runnable { cpu: target },
+        "affinity_migrate",
+    );
+    if matches!(proc.sched_class, SchedClass::Cfs) {
+        proc.vruntime = proc
+            .vruntime
+            .saturating_sub(src_min_vr)
+            .saturating_add(dst_min_vr);
+    }
+    let placed = q
+        .runnable
+        .enqueue(pid, enqueue_data_from_proc(proc), CfsPlace::Continuing);
+    proc.vruntime = placed;
+    record_enqueue(pid, "affinity_migrate", proc);
+    drop(g);
+    drop(q);
+    send_resched_ipi(target);
+}
+
+fn publish_corpse(dead: Pid) {
+    let (final_state, parent, exit_waiters) = {
+        let mut g = GLOBAL.lock();
+        let Some(p) = g.processes.get_mut(&dead) else {
+            return;
+        };
+        let Some(st) = p.lifecycle.take_pending_exit() else {
+            return;
+        };
+        p.state.0 = st.clone();
+        let exit_waiters = p.exit_waiters.drain();
+        (st, p.parent, exit_waiters)
+    };
+    if let Some(ppid) = parent {
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        let info = match final_state {
+            ProcessState::Zombie(code) => {
+                crate::signal::SigInfo::for_child(dead.0, code, CLD_EXITED)
+            }
+            ProcessState::KilledBySignal { signal } => {
+                crate::signal::SigInfo::for_child(dead.0, signal as i32, CLD_KILLED)
+            }
+            ProcessState::KilledByFault { vector, .. } => {
+                crate::signal::SigInfo::for_child(dead.0, 128 + vector as i32, CLD_KILLED)
+            }
+            _ => return,
+        };
+        let waiters = {
+            let mut g = GLOBAL.lock();
+            if let Some(p) = g.processes.get_mut(&ppid) {
+                p.signals.raise(1u64 << SIGCHLD);
+                p.signals.set_siginfo(SIGCHLD as usize, info);
+                p.child_exit.drain()
+            } else {
+                Vec::new()
+            }
+        };
+        for w in waiters {
+            let _ = wake_pid(w);
+        }
+        let _ = wake_pid(ppid);
+    }
+    wake_tracer_on_exit(dead);
+    for w in exit_waiters {
+        let _ = wake_pid(w);
     }
 }
 
@@ -2003,8 +1563,20 @@ fn fmt_owner(o: SchedOwner) -> &'static str {
     }
 }
 
+pub struct SchedCell<T>(T);
+
+impl<T> SchedCell<T> {
+    pub const fn new(v: T) -> Self {
+        SchedCell(v)
+    }
+
+    pub fn get(&self) -> &T {
+        &self.0
+    }
+}
+
 fn set_sched_owner(proc: &mut Process, new: SchedOwner, site: &'static str) {
-    let cur = proc.sched_owner;
+    let cur = proc.sched_owner.0;
     let pid = proc.pid;
     let ok = match (cur, new) {
         (SchedOwner::None, SchedOwner::Runnable { .. }) => true,
@@ -2048,7 +1620,16 @@ fn set_sched_owner(proc: &mut Process, new: SchedOwner, site: &'static str) {
             new,
         );
     }
-    proc.sched_owner = new;
+    match new {
+        SchedOwner::Stopped | SchedOwner::Traced | SchedOwner::Parked { .. } => {
+            proc.parking_unsaved = true;
+        }
+        SchedOwner::Running { .. } => {
+            proc.parking_unsaved = false;
+        }
+        _ => {}
+    }
+    proc.sched_owner.0 = new;
 }
 
 #[derive(Clone, Copy)]
@@ -2091,7 +1672,6 @@ fn fmt_state_kind(k: u8) -> &'static str {
     }
 }
 
-
 static ENQ_SEQ: AtomicU64 = AtomicU64::new(0);
 static ENQ_LOG: SpinIrq<BTreeMap<Pid, EnqProv>> = SpinIrq::new(BTreeMap::new());
 
@@ -2100,8 +1680,8 @@ fn record_enqueue(pid: Pid, site: &'static str, proc: &Process) {
         seq: ENQ_SEQ.fetch_add(1, Ordering::SeqCst),
         site,
         enq_cpu: this_cpu(),
-        owner_at_enq: proc.sched_owner,
-        state_kind: state_kind(&proc.state),
+        owner_at_enq: proc.sched_owner.0,
+        state_kind: state_kind(&proc.state.0),
     };
     ENQ_LOG.lock().insert(pid, prov);
 }
@@ -2171,37 +1751,76 @@ fn try_steal_one_to_local() -> Option<Pid> {
         let peer = (me + off) % MAX_CPUS;
         let (stolen, peer_min_vr) = {
             let mut peer_q = CPU_QUEUES[peer].lock();
+            let mut g = GLOBAL.lock();
             let peer_min = peer_q.runnable.cfs_min_vruntime();
-            let stolen = peer_q.runnable.pick_next(!rt_throttled());
-            if let Some(pid) = stolen {
-                record_dequeue(pid);
-            }
+            let cand = peer_q.runnable.pick_next(!rt_throttled());
+            let stolen = match cand {
+                Some(pid) => {
+                    record_dequeue(pid);
+                    let skip = g
+                        .processes
+                        .get(&pid)
+                        .map(|p| {
+                            p.parking_unsaved
+                                || !affinity_allows(p.cpu_affinity, me as u32)
+                                || matches!(
+                                    p.state.0,
+                                    ProcessState::Zombie(_)
+                                        | ProcessState::KilledByFault { .. }
+                                        | ProcessState::KilledBySignal { .. }
+                                )
+                        })
+                        .unwrap_or(false);
+                    if skip {
+                        if let Some(proc) = g.processes.get_mut(&pid) {
+                            let placed = peer_q.runnable.enqueue(
+                                pid,
+                                enqueue_data_from_proc(proc),
+                                CfsPlace::Continuing,
+                            );
+                            proc.vruntime = placed;
+                            record_enqueue(pid, "try_steal/skip", proc);
+                        }
+                        None
+                    } else {
+                        Some(pid)
+                    }
+                }
+                None => None,
+            };
             (stolen, peer_min)
         };
         if let Some(pid) = stolen {
             let mut q = CPU_QUEUES[me].lock();
             let me_min_vr = q.runnable.cfs_min_vruntime();
             let mut g = GLOBAL.lock();
-            if let Some(proc) = g.processes.get_mut(&pid) {
-                proc.home_cpu = me as u32;
-                set_sched_owner(
-                    proc,
-                    SchedOwner::Runnable { cpu: me as u32 },
-                    "try_steal_one_to_local",
-                );
-                if matches!(proc.sched_class, SchedClass::Cfs) {
-                    let adjusted = proc
-                        .vruntime
-                        .saturating_sub(peer_min_vr)
-                        .saturating_add(me_min_vr);
-                    proc.vruntime = adjusted;
-                }
-                let placed =
-                    q.runnable
-                        .enqueue(pid, enqueue_data_from_proc(proc), CfsPlace::Continuing);
-                proc.vruntime = placed;
-                record_enqueue(pid, "try_steal_one_to_local", proc);
+            let proc = g.processes.get_mut(&pid)?;
+            if matches!(
+                proc.state.0,
+                ProcessState::Zombie(_)
+                    | ProcessState::KilledByFault { .. }
+                    | ProcessState::KilledBySignal { .. }
+            ) {
+                return None;
             }
+            proc.home_cpu = me as u32;
+            set_sched_owner(
+                proc,
+                SchedOwner::Runnable { cpu: me as u32 },
+                "try_steal_one_to_local",
+            );
+            if matches!(proc.sched_class, SchedClass::Cfs) {
+                let adjusted = proc
+                    .vruntime
+                    .saturating_sub(peer_min_vr)
+                    .saturating_add(me_min_vr);
+                proc.vruntime = adjusted;
+            }
+            let placed =
+                q.runnable
+                    .enqueue(pid, enqueue_data_from_proc(proc), CfsPlace::Continuing);
+            proc.vruntime = placed;
+            record_enqueue(pid, "try_steal_one_to_local", proc);
             return Some(pid);
         }
     }
@@ -2226,19 +1845,27 @@ fn switch_to_pid(pid: Pid) {
                 );
             }
         };
-        proc.state = ProcessState::Running;
+        if matches!(
+            proc.state.0,
+            ProcessState::Zombie(_)
+                | ProcessState::KilledByFault { .. }
+                | ProcessState::KilledBySignal { .. }
+        ) {
+            return;
+        }
+        proc.state.0 = ProcessState::Running;
         let cpu = this_cpu();
         set_sched_owner(proc, SchedOwner::Running { cpu }, "switch_to_pid");
         proc.last_run_ns = frame::cpu::clock::nanos_since_boot();
-        frame::cpu::set_user_fs_base(proc.fs_base);
+        frame::cpu::set_user_fs_base(proc.memory.fs_base());
         (
-            proc.task.context_ptr(),
-            proc.task.xsave_ptr(),
-            proc.task.kstack_top(),
+            proc.task.0.context_ptr(),
+            proc.task.0.xsave_ptr(),
+            proc.task.0.kstack_top(),
             proc.vmspace(),
             proc.pml4_root,
-            proc.rseq_addr,
-            proc.rseq_len,
+            proc.memory.rseq_addr(),
+            proc.memory.rseq_len(),
             this_cpu(),
         )
     };
@@ -2249,7 +1876,7 @@ fn switch_to_pid(pid: Pid) {
             let (kbot, ktop) = {
                 let g = GLOBAL.lock();
                 match g.processes.get(&pid) {
-                    Some(p) => (p.task.kstack_bottom(), p.task.kstack_top()),
+                    Some(p) => (p.task.0.kstack_bottom(), p.task.0.kstack_top()),
                     None => (0, 0),
                 }
             };
@@ -2325,7 +1952,7 @@ fn all_processes_done() -> bool {
         }
         saw_user = true;
         if !matches!(
-            p.state,
+            p.state.0,
             ProcessState::Zombie(_)
                 | ProcessState::KilledByFault { .. }
                 | ProcessState::KilledBySignal { .. }
@@ -2341,7 +1968,7 @@ fn qemu_exit_for_state() -> ! {
         let g = GLOBAL.lock();
         g.processes
             .values()
-            .any(|p| matches!(p.state, ProcessState::Zombie(c) if c != 0))
+            .any(|p| matches!(p.state.0, ProcessState::Zombie(c) if c != 0))
     };
     frame::println!("[sched] all processes exited");
     if any_real_failure {
@@ -2368,12 +1995,13 @@ pub fn yield_current(_tf: &mut TrapFrame) {
         let now_ns = frame::cpu::clock::nanos_since_boot();
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
-        proc.state = ProcessState::Runnable;
+        proc.state.0 = ProcessState::Runnable;
         set_sched_owner(
             proc,
             SchedOwner::Runnable { cpu: this_cpu() },
             "yield_current",
         );
+        proc.parking_unsaved = true;
         let delta = now_ns.saturating_sub(proc.last_run_ns);
         charge_runtime(proc, delta);
         proc.last_run_ns = now_ns;
@@ -2384,9 +2012,9 @@ pub fn yield_current(_tf: &mut TrapFrame) {
         record_enqueue(cur, "yield_current", proc);
         (
             cur,
-            proc.task.context_ptr(),
-            proc.task.xsave_ptr(),
-            proc.task.kstack_bounds(),
+            proc.task.0.context_ptr(),
+            proc.task.0.xsave_ptr(),
+            proc.task.0.kstack_bounds(),
         )
     };
 
@@ -2428,20 +2056,46 @@ fn snapshot_addr_space_release_if_live(
     Option<alloc::sync::Arc<crate::process::IpcNamespace>>,
 )> {
     let live = !matches!(
-        proc.state,
+        proc.state.0,
         ProcessState::Zombie(_)
             | ProcessState::KilledByFault { .. }
             | ProcessState::KilledBySignal { .. }
     );
     if live {
-        proc.addr_space.clone().map(|a| (a, proc.ipc_ns.clone()))
+        proc.addr_space.clone().map(|a| (a, proc.namespaces.ipc()))
     } else {
         None
     }
 }
 
-pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
+fn wake_tracer_on_exit(cur: Pid) {
+    let (tracer, parent) = {
+        let g = GLOBAL.lock();
+        match g.processes.get(&cur) {
+            Some(p) => (p.trace.tracer_pid(), p.parent),
+            None => (None, None),
+        }
+    };
+    let Some(tpid) = tracer else {
+        return;
+    };
+    if Some(tpid) == parent {
+        return;
+    }
+    let waiters = {
+        let mut g = GLOBAL.lock();
+        match g.processes.get_mut(&tpid) {
+            Some(p) => p.child_exit.drain(),
+            None => alloc::vec::Vec::new(),
+        }
+    };
+    for w in waiters {
+        let _ = wake_pid(w);
+    }
+    let _ = wake_pid(tpid);
+}
 
+pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
     let cur = {
         let cpu = this_cpu() as usize;
         let mut q = CPU_QUEUES[cpu].lock();
@@ -2452,8 +2106,8 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
         let g = GLOBAL.lock();
         let proc = g.processes.get(&cur).unwrap();
         (
-            proc.clear_child_tid,
-            proc.robust_list_head,
+            proc.memory.clear_child_tid(),
+            proc.memory.robust_list_head(),
             proc.pml4_root
                 .map(|f| f.start_address().as_u64())
                 .unwrap_or(0),
@@ -2507,41 +2161,20 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
         drop(fds);
     }
 
-    let (parent, as_release) = {
+    let as_release = {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         let as_release = snapshot_addr_space_release_if_live(proc);
-        proc.state = ProcessState::Zombie(code);
+        if proc.lifecycle.pending_exit().is_none() {
+            proc.lifecycle.set_pending_exit(ProcessState::Zombie(code));
+        }
         set_sched_owner(proc, SchedOwner::Zombie, "exit_current");
-        let parent = proc.parent;
-        (parent, as_release)
+        as_release
     };
     if let Some((a, ipc)) = as_release {
         release_addr_space_user(&a, ipc.as_ref());
     }
     handle_dying_children(cur);
-    if let Some(ppid) = parent {
-        const CLD_EXITED: i32 = 1;
-        let info = crate::signal::SigInfo::for_child(cur.0, code, CLD_EXITED);
-        let (waiters, sigchld_deliverable) = {
-            let mut g = GLOBAL.lock();
-            if let Some(p) = g.processes.get_mut(&ppid) {
-                p.pending_signals |= 1u64 << SIGCHLD;
-                p.siginfo[SIGCHLD as usize] = info;
-                let deliverable = (p.blocked_signals & (1u64 << SIGCHLD)) == 0;
-                (p.child_exit.drain(), deliverable)
-            } else {
-                (Vec::new(), false)
-            }
-        };
-        for w in waiters {
-            let _ = wake_pid(w);
-        }
-        if sigchld_deliverable {
-            let _ = wake_pid(ppid);
-        }
-    }
-    drain_exit_waiters(cur);
     if let Some(cg) = process_cgroup(cur) {
         let charged = process_charged_bytes(cur);
         if charged > 0 {
@@ -2555,6 +2188,7 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
     let cpu = this_cpu() as usize;
     let idle_ctx_ptr: *mut Context = {
         let mut q = CPU_QUEUES[cpu].lock();
+        q.pending_corpse = Some(cur);
         &mut q.idle_ctx as *mut Context
     };
     let idle_xsave = task::bootstrap_xsave_ptr(cpu as u32);
@@ -2568,7 +2202,7 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
     unreachable!("exit_current resumed dying task");
 }
 
-pub fn terminate_current_with_signal(_tf: &mut TrapFrame, signal: u32) -> ! {
+pub fn terminate_current_with_signal(signal: u32) -> ! {
     let cur = {
         let cpu = this_cpu() as usize;
         let mut q = CPU_QUEUES[cpu].lock();
@@ -2581,8 +2215,8 @@ pub fn terminate_current_with_signal(_tf: &mut TrapFrame, signal: u32) -> ! {
         let g = GLOBAL.lock();
         let proc = g.processes.get(&cur).unwrap();
         (
-            proc.clear_child_tid,
-            proc.robust_list_head,
+            proc.memory.clear_child_tid(),
+            proc.memory.robust_list_head(),
             proc.pml4_root
                 .map(|f| f.start_address().as_u64())
                 .unwrap_or(0),
@@ -2596,45 +2230,25 @@ pub fn terminate_current_with_signal(_tf: &mut TrapFrame, signal: u32) -> ! {
     crate::timeout::drop_pid(cur);
     crate::vfs::locks::posix::drop_owner(cur);
 
-    let (parent, as_release) = {
+    let as_release = {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         let as_release = snapshot_addr_space_release_if_live(proc);
-        proc.state = ProcessState::KilledBySignal { signal };
-        let parent = proc.parent;
+        if proc.lifecycle.pending_exit().is_none() {
+            proc.lifecycle
+                .set_pending_exit(ProcessState::KilledBySignal { signal });
+        }
         frame::println!(
             "[sched] pid {} killed by signal {} on cpu {}",
             cur.0,
             signal,
             this_cpu()
         );
-        (parent, as_release)
+        as_release
     };
     if let Some((a, ipc)) = as_release {
         release_addr_space_user(&a, ipc.as_ref());
     }
-    if let Some(ppid) = parent {
-        const CLD_KILLED: i32 = 2;
-        let info = crate::signal::SigInfo::for_child(cur.0, signal as i32, CLD_KILLED);
-        let (waiters, sigchld_deliverable) = {
-            let mut g = GLOBAL.lock();
-            if let Some(p) = g.processes.get_mut(&ppid) {
-                p.pending_signals |= 1u64 << SIGCHLD;
-                p.siginfo[SIGCHLD as usize] = info;
-                let deliverable = (p.blocked_signals & (1u64 << SIGCHLD)) == 0;
-                (p.child_exit.drain(), deliverable)
-            } else {
-                (Vec::new(), false)
-            }
-        };
-        for w in waiters {
-            let _ = wake_pid(w);
-        }
-        if sigchld_deliverable {
-            let _ = wake_pid(ppid);
-        }
-    }
-    drain_exit_waiters(cur);
     if let Some(cg) = process_cgroup(cur) {
         let charged = process_charged_bytes(cur);
         if charged > 0 {
@@ -2648,6 +2262,7 @@ pub fn terminate_current_with_signal(_tf: &mut TrapFrame, signal: u32) -> ! {
     let cpu = this_cpu() as usize;
     let idle_ctx_ptr: *mut Context = {
         let mut q = CPU_QUEUES[cpu].lock();
+        q.pending_corpse = Some(cur);
         &mut q.idle_ctx as *mut Context
     };
     let idle_xsave = task::bootstrap_xsave_ptr(cpu as u32);
@@ -2672,8 +2287,8 @@ pub fn kill_user_fault(addr: u64, vector: u8, error: u64) -> ! {
         let g = GLOBAL.lock();
         let proc = g.processes.get(&cur).unwrap();
         (
-            proc.clear_child_tid,
-            proc.robust_list_head,
+            proc.memory.clear_child_tid(),
+            proc.memory.robust_list_head(),
             proc.pml4_root
                 .map(|f| f.start_address().as_u64())
                 .unwrap_or(0),
@@ -2685,15 +2300,18 @@ pub fn kill_user_fault(addr: u64, vector: u8, error: u64) -> ! {
         crate::futex::pi_owner_died(vmspace_id, cur);
     }
 
-    let (parent_pid, as_release) = {
+    let as_release = {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         let as_release = snapshot_addr_space_release_if_live(proc);
-        proc.state = ProcessState::KilledByFault {
-            vector,
-            addr,
-            error,
-        };
+        if proc.lifecycle.pending_exit().is_none() {
+            proc.lifecycle
+                .set_pending_exit(ProcessState::KilledByFault {
+                    vector,
+                    addr,
+                    error,
+                });
+        }
         frame::println!(
             "[sched] pid {} killed by fault on cpu {}: vector={} addr={:#x} err={:#x}",
             cur.0,
@@ -2702,33 +2320,11 @@ pub fn kill_user_fault(addr: u64, vector: u8, error: u64) -> ! {
             addr,
             error
         );
-        (proc.parent, as_release)
+        as_release
     };
     if let Some((a, ipc)) = as_release {
         release_addr_space_user(&a, ipc.as_ref());
     }
-    if let Some(ppid) = parent_pid {
-        const CLD_KILLED: i32 = 2;
-        let info = crate::signal::SigInfo::for_child(cur.0, 128 + vector as i32, CLD_KILLED);
-        let (waiters, sigchld_deliverable) = {
-            let mut g = GLOBAL.lock();
-            if let Some(p) = g.processes.get_mut(&ppid) {
-                p.pending_signals |= 1u64 << SIGCHLD;
-                p.siginfo[SIGCHLD as usize] = info;
-                let deliverable = (p.blocked_signals & (1u64 << SIGCHLD)) == 0;
-                (p.child_exit.drain(), deliverable)
-            } else {
-                (Vec::new(), false)
-            }
-        };
-        for w in waiters {
-            let _ = wake_pid(w);
-        }
-        if sigchld_deliverable {
-            let _ = wake_pid(ppid);
-        }
-    }
-    drain_exit_waiters(cur);
     if let Some(cg) = process_cgroup(cur) {
         let charged = process_charged_bytes(cur);
         if charged > 0 {
@@ -2742,6 +2338,7 @@ pub fn kill_user_fault(addr: u64, vector: u8, error: u64) -> ! {
     let cpu = this_cpu() as usize;
     let idle_ctx_ptr: *mut Context = {
         let mut q = CPU_QUEUES[cpu].lock();
+        q.pending_corpse = Some(cur);
         &mut q.idle_ctx as *mut Context
     };
     let idle_xsave = task::bootstrap_xsave_ptr(cpu as u32);
@@ -2793,7 +2390,7 @@ fn park_on_inner(wq: &crate::wait::WaitQueue, pre_enqueued: bool) {
             }
         };
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Parked;
+        proc.state.0 = ProcessState::Parked;
         set_sched_owner(
             proc,
             SchedOwner::Parked {
@@ -2802,12 +2399,12 @@ fn park_on_inner(wq: &crate::wait::WaitQueue, pre_enqueued: bool) {
             "park_on_inner",
         );
         let ptrs = (
-            proc.task.context_ptr(),
-            proc.task.xsave_ptr(),
-            proc.task.kstack_bounds(),
+            proc.task.0.context_ptr(),
+            proc.task.0.xsave_ptr(),
+            proc.task.0.kstack_bounds(),
         );
         if !wq.contains(cur) {
-            proc.state = ProcessState::Runnable;
+            proc.state.0 = ProcessState::Runnable;
             set_sched_owner(
                 proc,
                 SchedOwner::Running { cpu: this_cpu() },
@@ -2877,21 +2474,21 @@ fn wait4_scan(g: &Global, cur: Pid, target_pid: i64, options: u64) -> WaitScan {
         Some(p) => p,
         None => return WaitScan::NoChildren,
     };
-    if me.children.is_empty() && me.tracees.is_empty() {
+    if me.children.is_empty() && me.trace.tracees().is_empty() {
         return WaitScan::NoChildren;
     }
-    let caller_pgid = me.pgid;
+    let caller_pgid = me.identity.pgid();
     let mut candidates: alloc::vec::Vec<Pid> = me.children.to_vec();
-    for t in &me.tracees {
+    for t in me.trace.tracees() {
         if !candidates.contains(t) {
             candidates.push(*t);
         }
     }
-    let tracee_set: alloc::vec::Vec<Pid> = me.tracees.to_vec();
+    let tracee_set: alloc::vec::Vec<Pid> = me.trace.tracees().to_vec();
     let any_selected = candidates.iter().any(|c| {
         g.processes
             .get(c)
-            .map(|ch| wait_selector_matches(target_pid, *c, ch.pgid, caller_pgid))
+            .map(|ch| wait_selector_matches(target_pid, *c, ch.identity.pgid(), caller_pgid))
             .unwrap_or(false)
     });
     if !any_selected {
@@ -2902,11 +2499,13 @@ fn wait4_scan(g: &Global, cur: Pid, target_pid: i64, options: u64) -> WaitScan {
             Some(c) => c,
             None => continue,
         };
-        if !wait_selector_matches(target_pid, *cpid, child.pgid, caller_pgid) {
+        if !wait_selector_matches(target_pid, *cpid, child.identity.pgid(), caller_pgid) {
             continue;
         }
-        match child.state {
-            ProcessState::Zombie(code) => return WaitScan::Reap(*cpid, exit_status_code(code)),
+        match child.state.0 {
+            ProcessState::Zombie(code) => {
+                return WaitScan::Reap(*cpid, exit_status_code(code));
+            }
             ProcessState::KilledByFault { .. } => {
                 return WaitScan::Reap(*cpid, fault_status_code());
             }
@@ -2941,7 +2540,7 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
                 };
                 let me = g.processes.get_mut(&cur_pid).unwrap();
                 me.children.retain(|p| *p != rpid);
-                me.tracees.retain(|p| *p != rpid);
+                me.trace.remove_tracee(rpid);
                 me.cutime_ns = me
                     .cutime_ns
                     .saturating_add(child_u)
@@ -2976,8 +2575,8 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
                 let caller_ns = process_pid_ns(cur_pid).unwrap_or_else(host_pid_ns);
                 let local_in_caller = caller_ns.host_to_local_in(rpid);
                 if let Some(boxed) = removed {
-                    if let Some(pns) = boxed.pid_ns.as_ref() {
-                        crate::process::PidNamespace::drop_chain(pns, rpid);
+                    if let Some(pns) = boxed.namespaces.pid() {
+                        crate::process::PidNamespace::drop_chain(&pns, rpid);
                     }
                     if let Some(root) = boxed.pml4_root {
                         let root_phys = root.start_address().as_u64();
@@ -2992,7 +2591,7 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
             WaitScan::Report(rpid, status, is_trace_stop) => {
                 if is_trace_stop {
                     if let Some(p) = g.processes.get_mut(&rpid) {
-                        p.trace_wait_consumed = true;
+                        p.trace.mark_wait_consumed();
                     }
                 }
                 drop(g);
@@ -3014,7 +2613,7 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
                             me.child_exit.enqueue(cur_pid);
                             let _ = q.current.take();
                             bank_slice_off_cpu(me);
-                            me.state = ProcessState::Parked;
+                            me.state.0 = ProcessState::Parked;
                             set_sched_owner(
                                 me,
                                 SchedOwner::Parked {
@@ -3023,9 +2622,9 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
                                 "wait4_park",
                             );
                             Some((
-                                me.task.context_ptr(),
-                                me.task.xsave_ptr(),
-                                me.task.kstack_bounds(),
+                                me.task.0.context_ptr(),
+                                me.task.0.xsave_ptr(),
+                                me.task.0.kstack_bounds(),
                             ))
                         }
                         _ => None,
@@ -3055,7 +2654,7 @@ pub fn wait4_current(target_pid: i64, options: u64) -> Result<Option<(Pid, u32, 
                     g.processes
                         .get(&cur_pid)
                         .map(|p| {
-                            let deliverable = p.pending_signals & !p.blocked_signals;
+                            let deliverable = p.signals.deliverable();
                             deliverable & !(1u64 << SIGCHLD) != 0
                         })
                         .unwrap_or(false)
@@ -3083,33 +2682,53 @@ pub fn wake_pid(pid: Pid) -> bool {
             Some(p) => p,
             None => return false,
         };
-        if proc.state != ProcessState::Parked {
+        if proc.state.0 != ProcessState::Parked {
             return false;
         }
-        proc.state = ProcessState::Runnable;
-        let home = proc.home_cpu;
+        proc.state.0 = ProcessState::Runnable;
+        let home = effective_home_cpu(proc);
         set_sched_owner(proc, SchedOwner::Runnable { cpu: home }, "wake_pid");
         home
     };
-    let needs_preempt_check = {
+    {
         let mut q = CPU_QUEUES[home as usize].lock();
         let mut g = GLOBAL.lock();
         if let Some(proc) = g.processes.get_mut(&pid) {
-            let placed = q
-                .runnable
-                .enqueue(pid, enqueue_data_from_proc(proc), CfsPlace::Wake);
-            proc.vruntime = placed;
-            record_enqueue(pid, "wake_pid", proc);
+            if proc.state.0 == ProcessState::Runnable {
+                let placed = q
+                    .runnable
+                    .enqueue(pid, enqueue_data_from_proc(proc), CfsPlace::Wake);
+                proc.vruntime = placed;
+                record_enqueue(pid, "wake_pid", proc);
+            }
         }
-        true
-    };
-    if needs_preempt_check {
-        send_resched_ipi(home);
     }
+    send_resched_ipi(home);
     true
 }
 
 fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
+    {
+        let cur = current_pid();
+        let consume = {
+            let mut g = GLOBAL.lock();
+            match g.processes.get_mut(&cur) {
+                Some(p)
+                    if p.trace.is_traced()
+                        && (p.signals.pending() & (1u64 << SIGKILL)) == 0
+                        && p.trace.attach_stop_pending() =>
+                {
+                    p.trace.take_attach_stop()
+                }
+                _ => false,
+            }
+        };
+        if consume {
+            crate::ptrace::save_user_regs_for_trace(cur, tf);
+            park_for_trace_stop(crate::process::TraceStop::Attach);
+            crate::ptrace::restore_user_regs_after_trace(cur, tf);
+        }
+    }
     for _ in 0..NSIG {
         let cur = current_pid();
         let (traced, signal) = {
@@ -3118,10 +2737,10 @@ fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
                 Some(p) => p,
                 None => return,
             };
-            if p.tracer_pid.is_none() {
+            if !p.trace.is_traced() {
                 return;
             }
-            let mask = p.pending_signals & !p.blocked_signals;
+            let mask = p.signals.deliverable();
             if mask == 0 {
                 return;
             }
@@ -3137,9 +2756,9 @@ fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
         {
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get_mut(&cur) {
-                p.pending_signals &= !(1u64 << signal);
-                p.trace_event_msg = signal as u64;
-                p.trace_pending_inject = 0;
+                p.signals.clear_pending(1u64 << signal);
+                p.trace.set_event_msg(signal as u64);
+                p.trace.clear_pending_inject();
             }
         }
         crate::ptrace::save_user_regs_for_trace(cur, tf);
@@ -3148,7 +2767,7 @@ fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
             let g = GLOBAL.lock();
             g.processes
                 .get(&cur)
-                .map(|p| p.trace_pending_inject)
+                .map(|p| p.trace.pending_inject())
                 .unwrap_or(0)
         };
         crate::ptrace::restore_user_regs_after_trace(cur, tf);
@@ -3158,34 +2777,28 @@ fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
         if inject < NSIG as u32 {
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get_mut(&cur) {
-                p.pending_signals |= 1u64 << inject;
-                p.trace_pending_inject = 0;
+                p.signals.raise(1u64 << inject);
+                p.trace.clear_pending_inject();
             }
         }
         break;
     }
 }
 
-
 pub(crate) fn detach_orphaned_tracees(tracer: Pid) {
     let to_resume: alloc::vec::Vec<Pid> = {
         let mut g = GLOBAL.lock();
         let tracees: alloc::vec::Vec<Pid> = match g.processes.get_mut(&tracer) {
-            Some(p) => core::mem::take(&mut p.tracees),
+            Some(p) => p.trace.take_tracees(),
             None => return,
         };
         let mut resume = alloc::vec::Vec::new();
         for tpid in &tracees {
             if let Some(t) = g.processes.get_mut(tpid) {
-                if t.tracer_pid == Some(tracer) {
-                    t.tracer_pid = None;
-                    t.trace_stop = None;
-                    t.trace_options = 0;
-                    t.trace_in_syscall_stop_mode = false;
-                    t.trace_pending_inject = 0;
-                    t.trace_wait_consumed = false;
-                    if t.state == ProcessState::Traced {
-                        t.state = ProcessState::Runnable;
+                if t.trace.traced_by(tracer) {
+                    t.trace.detach();
+                    if t.state.0 == ProcessState::Traced {
+                        t.state.0 = ProcessState::Runnable;
                         resume.push(*tpid);
                     }
                 }
@@ -3200,9 +2813,9 @@ pub(crate) fn detach_orphaned_tracees(tracer: Pid) {
 
 pub(crate) fn reenqueue_runnable(pid: Pid) {
     let home = {
-        let g = GLOBAL.lock();
-        match g.processes.get(&pid) {
-            Some(p) if p.state == ProcessState::Runnable => p.home_cpu,
+        let mut g = GLOBAL.lock();
+        match g.processes.get_mut(&pid) {
+            Some(p) if p.state.0 == ProcessState::Runnable => effective_home_cpu(p),
             _ => return,
         }
     };
@@ -3230,8 +2843,7 @@ pub(crate) fn drain_vfork_done(pid: Pid) {
         let mut g = GLOBAL.lock();
         match g.processes.get_mut(&pid) {
             Some(p) => {
-                p.vfork_done_set
-                    .store(true, core::sync::atomic::Ordering::Release);
+                p.lifecycle.set_vfork_done_set(true);
                 p.vfork_done.drain()
             }
             None => Vec::new(),
@@ -3255,9 +2867,9 @@ pub fn park_on_vfork_done(child: Pid) {
             let already_done = match g.processes.get(&child) {
                 None => true,
                 Some(p) => {
-                    p.vfork_done_set.load(core::sync::atomic::Ordering::Acquire)
+                    p.lifecycle.vfork_done_set()
                         || matches!(
-                            p.state,
+                            p.state.0,
                             ProcessState::Zombie(_)
                                 | ProcessState::KilledByFault { .. }
                                 | ProcessState::KilledBySignal { .. }
@@ -3269,11 +2881,11 @@ pub fn park_on_vfork_done(child: Pid) {
                 return;
             }
             let proc = g.processes.get_mut(&cur).unwrap();
-            let cur_ctx = proc.task.context_ptr();
-            let cur_xsave = proc.task.xsave_ptr();
-            let cur_kstack = proc.task.kstack_bounds();
+            let cur_ctx = proc.task.0.context_ptr();
+            let cur_xsave = proc.task.0.xsave_ptr();
+            let cur_kstack = proc.task.0.kstack_bounds();
             bank_slice_off_cpu(proc);
-            proc.state = ProcessState::Parked;
+            proc.state.0 = ProcessState::Parked;
             let waitq_addr = {
                 let child_proc = g.processes.get_mut(&child).unwrap();
                 if first {
@@ -3285,7 +2897,7 @@ pub fn park_on_vfork_done(child: Pid) {
             set_sched_owner(proc, SchedOwner::Parked { waitq_addr }, "vfork_park");
             if first {
                 if let Some(child_p) = g.processes.get_mut(&child) {
-                    if matches!(child_p.sched_owner, crate::process::SchedOwner::None) {
+                    if matches!(child_p.sched_owner.0, crate::process::SchedOwner::None) {
                         let placed = q.runnable.enqueue(
                             child,
                             enqueue_data_from_proc(child_p),
@@ -3349,11 +2961,11 @@ pub fn park_on_signalfd_wait() {
         let _ = q.current.take();
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
-        let cur_ctx = proc.task.context_ptr();
-        let cur_xsave = proc.task.xsave_ptr();
-        let cur_kstack = proc.task.kstack_bounds();
+        let cur_ctx = proc.task.0.context_ptr();
+        let cur_xsave = proc.task.0.xsave_ptr();
+        let cur_kstack = proc.task.0.kstack_bounds();
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Parked;
+        proc.state.0 = ProcessState::Parked;
         proc.signalfd_waiters.enqueue(cur);
         set_sched_owner(
             proc,
@@ -3392,7 +3004,7 @@ pub fn park_on_exit_of(target: Pid) {
         let already_dead = match g.processes.get(&target) {
             None => true,
             Some(p) => matches!(
-                p.state,
+                p.state.0,
                 ProcessState::Zombie(_)
                     | ProcessState::KilledByFault { .. }
                     | ProcessState::KilledBySignal { .. }
@@ -3403,11 +3015,11 @@ pub fn park_on_exit_of(target: Pid) {
             return;
         }
         let proc = g.processes.get_mut(&cur).unwrap();
-        let cur_ctx = proc.task.context_ptr();
-        let cur_xsave = proc.task.xsave_ptr();
-        let cur_kstack = proc.task.kstack_bounds();
+        let cur_ctx = proc.task.0.context_ptr();
+        let cur_xsave = proc.task.0.xsave_ptr();
+        let cur_kstack = proc.task.0.kstack_bounds();
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Parked;
+        proc.state.0 = ProcessState::Parked;
         let target_proc = g.processes.get_mut(&target).unwrap();
         target_proc.exit_waiters.enqueue(cur);
         let waitq_addr = &target_proc.exit_waiters as *const _ as usize;
@@ -3440,12 +3052,12 @@ pub fn stop_current() {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Stopped;
+        proc.state.0 = ProcessState::Stopped;
         set_sched_owner(proc, SchedOwner::Stopped, "stop_current");
         let parent = proc.parent;
-        let cur_ctx = proc.task.context_ptr();
-        let cur_xsave = proc.task.xsave_ptr();
-        let cur_kstack = proc.task.kstack_bounds();
+        let cur_ctx = proc.task.0.context_ptr();
+        let cur_xsave = proc.task.0.xsave_ptr();
+        let cur_kstack = proc.task.0.kstack_bounds();
         let waiters: Vec<Pid> = if let Some(ppid) = parent {
             if let Some(p) = g.processes.get_mut(&ppid) {
                 p.child_exit.drain()
@@ -3487,7 +3099,17 @@ pub fn sleep_until(deadline_ns: u64) {
         None => return,
     };
     crate::timeout::register(deadline_ns, cur);
-    park_self_at("sleep_until_or_signal");
+    loop {
+        if frame::cpu::clock::nanos_since_boot() >= deadline_ns {
+            break;
+        }
+        if current_signal_pending() {
+            break;
+        }
+        park_self_at_guarded("sleep_until_or_signal", &|| {
+            frame::cpu::clock::nanos_since_boot() < deadline_ns
+        });
+    }
     let _ = crate::timeout::unregister(cur);
 }
 
@@ -3509,21 +3131,21 @@ pub fn sleep_until_signal() {
                 Some(p) => p,
                 None => return,
             };
-            if (p.pending_signals & !p.blocked_signals) != 0 {
+            if (p.signals.deliverable()) != 0 {
                 return;
             }
             let _ = q.current.take();
             bank_slice_off_cpu(p);
-            p.state = ProcessState::Parked;
+            p.state.0 = ProcessState::Parked;
             set_sched_owner(
                 p,
                 SchedOwner::Parked { waitq_addr: 0 },
                 "sleep_until_signal",
             );
             (
-                p.task.context_ptr(),
-                p.task.xsave_ptr(),
-                p.task.kstack_bounds(),
+                p.task.0.context_ptr(),
+                p.task.0.xsave_ptr(),
+                p.task.0.kstack_bounds(),
             )
         };
         let cpu = this_cpu() as usize;
@@ -3556,13 +3178,13 @@ pub fn park_self_at(site: &'static str) {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Parked;
+        proc.state.0 = ProcessState::Parked;
         set_sched_owner(proc, SchedOwner::Parked { waitq_addr: 0 }, site);
         (
             cur,
-            proc.task.context_ptr(),
-            proc.task.xsave_ptr(),
-            proc.task.kstack_bounds(),
+            proc.task.0.context_ptr(),
+            proc.task.0.xsave_ptr(),
+            proc.task.0.kstack_bounds(),
         )
     };
     let cpu = this_cpu() as usize;
@@ -3608,15 +3230,15 @@ pub fn park_self_at_guarded(site: &'static str, still_queued: &dyn Fn() -> bool)
             }
         };
         bank_slice_off_cpu(proc);
-        proc.state = ProcessState::Parked;
+        proc.state.0 = ProcessState::Parked;
         set_sched_owner(proc, SchedOwner::Parked { waitq_addr: 0 }, site);
         let ptrs = (
-            proc.task.context_ptr(),
-            proc.task.xsave_ptr(),
-            proc.task.kstack_bounds(),
+            proc.task.0.context_ptr(),
+            proc.task.0.xsave_ptr(),
+            proc.task.0.kstack_bounds(),
         );
         if !still_queued() {
-            proc.state = ProcessState::Runnable;
+            proc.state.0 = ProcessState::Runnable;
             set_sched_owner(
                 proc,
                 SchedOwner::Running { cpu: this_cpu() },
@@ -3752,7 +3374,7 @@ fn account_tick_jiffy() {
             let (in_syscall, nice) = g
                 .processes
                 .get(&pid)
-                .map(|p| (p.in_syscall, p.nice))
+                .map(|p| (p.lifecycle.in_syscall(), p.nice))
                 .unwrap_or((false, 0));
             if in_syscall {
                 &CPU_STATS[cpu].system_jiffies
@@ -3860,7 +3482,7 @@ pub fn on_tick(is_timer: bool) {
                         if cgroup_throttled_now {
                             bank_cpu_time(cur_proc, delta);
                             cur_proc.last_run_ns = now_ns;
-                            cur_proc.state = ProcessState::CgroupThrottled;
+                            cur_proc.state.0 = ProcessState::CgroupThrottled;
                             force_throttle = true;
                         } else if runqueue_empty {
                             return;
@@ -3912,7 +3534,7 @@ pub fn on_tick(is_timer: bool) {
                         cur_proc.last_run_ns = now_ns;
                         if cur_proc.dl_runtime_remaining == 0 {
                             cur_proc.dl_throttled = true;
-                            cur_proc.state = ProcessState::DlThrottled;
+                            cur_proc.state.0 = ProcessState::DlThrottled;
                             force_throttle = true;
                         } else if runqueue_empty {
                             return;
@@ -3942,9 +3564,9 @@ pub fn on_tick(is_timer: bool) {
                         SchedOwner::Parked { waitq_addr: 0 },
                         "on_tick/throttle_idle",
                     );
-                    let cur_ctx = cur_proc.task.context_ptr();
-                    let cur_xsave = cur_proc.task.xsave_ptr();
-                    let cur_kstack = cur_proc.task.kstack_bounds();
+                    let cur_ctx = cur_proc.task.0.context_ptr();
+                    let cur_xsave = cur_proc.task.0.xsave_ptr();
+                    let cur_kstack = cur_proc.task.0.kstack_bounds();
                     drop(g);
                     drop(q);
                     {
@@ -3965,25 +3587,41 @@ pub fn on_tick(is_timer: bool) {
                 return;
             }
         };
-        // Invariant: q.current is not in q.runnable, so pick_next
-        // can't return cur. (Tasks enter runnable only via wake
-        // paths that check `state == Parked`, and a running task
-        // has `state == Running`.) The assertion below backstops
-        // that invariant — if it ever fires, the bug is in a
-        // wake path putting a Running task on the queue, and we
-        // want it to surface clearly rather than be silently masked.
+        {
+            let allowed = {
+                let g = GLOBAL.lock();
+                g.processes
+                    .get(&next)
+                    .map(|p| affinity_allows(p.cpu_affinity, this_cpu()))
+                    .unwrap_or(true)
+            };
+            if !allowed {
+                let mut g = GLOBAL.lock();
+                if let Some(proc) = g.processes.get_mut(&next) {
+                    let placed = q.runnable.enqueue(
+                        next,
+                        enqueue_data_from_proc(proc),
+                        CfsPlace::Continuing,
+                    );
+                    proc.vruntime = placed;
+                    record_enqueue(next, "on_tick/affinity_skip", proc);
+                }
+                return;
+            }
+        }
         debug_assert!(next != cur, "pick_next returned current task");
         q.current = Some(next);
 
         let mut g = GLOBAL.lock();
         let cur_proc = g.processes.get_mut(&cur).unwrap();
         if !force_throttle {
-            cur_proc.state = ProcessState::Runnable;
+            cur_proc.state.0 = ProcessState::Runnable;
             set_sched_owner(
                 cur_proc,
                 SchedOwner::Runnable { cpu: this_cpu() },
                 "on_tick/preempt(cur)",
             );
+            cur_proc.parking_unsaved = true;
             let placed =
                 q.runnable
                     .enqueue(cur, enqueue_data_from_proc(cur_proc), CfsPlace::Continuing);
@@ -3996,9 +3634,9 @@ pub fn on_tick(is_timer: bool) {
                 "on_tick/throttle_preempt",
             );
         }
-        let cur_ctx = cur_proc.task.context_ptr();
-        let cur_xsave = cur_proc.task.xsave_ptr();
-        let cur_kstack = cur_proc.task.kstack_bounds();
+        let cur_ctx = cur_proc.task.0.context_ptr();
+        let cur_xsave = cur_proc.task.0.xsave_ptr();
+        let cur_kstack = cur_proc.task.0.kstack_bounds();
         let next_proc = match g.processes.get_mut(&next) {
             Some(p) => p,
             None => {
@@ -4012,19 +3650,36 @@ pub fn on_tick(is_timer: bool) {
                 );
             }
         };
-        next_proc.state = ProcessState::Running;
+        if matches!(
+            next_proc.state.0,
+            ProcessState::Zombie(_)
+                | ProcessState::KilledByFault { .. }
+                | ProcessState::KilledBySignal { .. }
+        ) {
+            let k = state_kind(&next_proc.state.0);
+            drop(g);
+            drop(q);
+            print_stale_pid_provenance(next, this_cpu(), "on_tick/preempt(next)_DEAD");
+            panic!(
+                "[DEAD-RQ] on_tick/preempt(next): pid {} picked to run but state={} on cpu {} (resurrected dead task)",
+                next.0,
+                fmt_state_kind(k),
+                this_cpu(),
+            );
+        }
+        next_proc.state.0 = ProcessState::Running;
         set_sched_owner(
             next_proc,
             SchedOwner::Running { cpu: this_cpu() },
             "on_tick/preempt(next)",
         );
         next_proc.last_run_ns = now_ns;
-        let next_ctx = next_proc.task.context_ptr();
-        let next_xsave = next_proc.task.xsave_ptr();
-        let next_top = next_proc.task.kstack_top();
+        let next_ctx = next_proc.task.0.context_ptr();
+        let next_xsave = next_proc.task.0.xsave_ptr();
+        let next_top = next_proc.task.0.kstack_top();
         let next_vm = next_proc.vmspace();
         let next_pml4 = next_proc.pml4_root;
-        let next_fs_base = next_proc.fs_base;
+        let next_fs_base = next_proc.memory.fs_base();
         Some((
             cur,
             cur_ctx,
@@ -4114,10 +3769,10 @@ pub fn send_signal_with_info(
         let mut zombified = false;
         let mut dying_fds: Option<Arc<crate::vfs::fd::FdTable>> = None;
         let killed_as = proc.addr_space.clone();
-        let killed_ipc = proc.ipc_ns.clone();
-        match proc.state {
+        let killed_ipc = proc.namespaces.ipc();
+        match proc.state.0 {
             ProcessState::Running => {
-                proc.pending_signals |= 1u64 << SIGKILL;
+                proc.signals.raise(1u64 << SIGKILL);
                 let home = proc.home_cpu;
                 drop(g);
                 if home != this_cpu() {
@@ -4126,7 +3781,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Runnable => {
-                proc.pending_signals |= 1u64 << SIGKILL;
+                proc.signals.raise(1u64 << SIGKILL);
                 let home = proc.home_cpu;
                 drop(g);
                 if home != this_cpu() {
@@ -4135,7 +3790,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Stopped => {
-                proc.state = ProcessState::KilledBySignal { signal: SIGKILL };
+                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
                 let home = proc.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -4151,8 +3806,8 @@ pub fn send_signal_with_info(
                 zombified = true;
             }
             ProcessState::Parked => {
-                proc.pending_signals |= 1u64 << SIGKILL;
-                proc.state = ProcessState::Runnable;
+                proc.signals.raise(1u64 << SIGKILL);
+                proc.state.0 = ProcessState::Runnable;
                 let home = proc.home_cpu;
                 drop(g);
                 {
@@ -4163,6 +3818,11 @@ pub fn send_signal_with_info(
                             q.runnable
                                 .enqueue(target, enqueue_data_from_proc(p), CfsPlace::Wake);
                         p.vruntime = placed;
+                        set_sched_owner(
+                            p,
+                            SchedOwner::Runnable { cpu: home },
+                            "sigkill_parked_wake",
+                        );
                         record_enqueue(target, "sigkill_parked_wake", p);
                     }
                 }
@@ -4172,16 +3832,15 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Traced => {
-                proc.pending_signals |= 1u64 << SIGKILL;
-                proc.state = ProcessState::Runnable;
-                proc.trace_stop = None;
-                proc.trace_wait_consumed = false;
+                proc.signals.raise(1u64 << SIGKILL);
+                proc.state.0 = ProcessState::Runnable;
+                proc.trace.clear_stop();
                 drop(g);
                 reenqueue_runnable(target);
                 return Ok(());
             }
             ProcessState::CgroupThrottled => {
-                proc.state = ProcessState::KilledBySignal { signal: SIGKILL };
+                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
                         &mut proc.fds,
@@ -4204,7 +3863,7 @@ pub fn send_signal_with_info(
                     } => (runtime_ns, period_ns),
                     _ => (0, 0),
                 };
-                proc.state = ProcessState::KilledBySignal { signal: SIGKILL };
+                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
                 let home = proc.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -4252,8 +3911,8 @@ pub fn send_signal_with_info(
                 let waiters = {
                     let mut g = GLOBAL.lock();
                     if let Some(pp) = g.processes.get_mut(&ppid) {
-                        pp.pending_signals |= 1u64 << SIGCHLD;
-                        pp.siginfo[SIGCHLD as usize] = info_chld;
+                        pp.signals.raise(1u64 << SIGCHLD);
+                        pp.signals.set_siginfo(SIGCHLD as usize, info_chld);
                         pp.child_exit.drain()
                     } else {
                         Vec::new()
@@ -4262,21 +3921,19 @@ pub fn send_signal_with_info(
                 for w in waiters {
                     let _ = wake_pid(w);
                 }
+                let _ = wake_pid(ppid);
             }
         }
         return Ok(());
     }
 
-    proc.pending_signals |= 1u64 << signal;
-    proc.siginfo[signal as usize] = info;
+    proc.signals.raise(1u64 << signal);
+    proc.signals.set_siginfo(signal as usize, info);
 
-    if signal == SIGCONT && proc.state == ProcessState::Stopped {
-        let stop_mask = (1u64 << SIGSTOP)
-            | (1u64 << 20)
-            | (1u64 << 21)
-            | (1u64 << 22);
-        proc.pending_signals &= !stop_mask;
-        proc.state = ProcessState::Runnable;
+    if signal == SIGCONT && proc.state.0 == ProcessState::Stopped {
+        let stop_mask = (1u64 << SIGSTOP) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
+        proc.signals.clear_pending(stop_mask);
+        proc.state.0 = ProcessState::Runnable;
         let home = proc.home_cpu;
         drop(g);
         {
@@ -4297,11 +3954,11 @@ pub fn send_signal_with_info(
         return Ok(());
     }
 
-    let blocked = proc.blocked_signals;
+    let blocked = proc.signals.blocked();
     let sfd_waiters = proc.signalfd_waiters.drain();
 
-    if proc.state == ProcessState::Parked && (blocked & (1u64 << signal)) == 0 {
-        proc.state = ProcessState::Runnable;
+    if proc.state.0 == ProcessState::Parked && (blocked & (1u64 << signal)) == 0 {
+        proc.state.0 = ProcessState::Runnable;
         let home = proc.home_cpu;
         drop(g);
         {
@@ -4312,6 +3969,7 @@ pub fn send_signal_with_info(
                     .runnable
                     .enqueue(target, enqueue_data_from_proc(p), CfsPlace::Wake);
                 p.vruntime = placed;
+                set_sched_owner(p, SchedOwner::Runnable { cpu: home }, "signal_wake_parked");
                 record_enqueue(target, "signal_wake_parked", p);
             }
         }
@@ -4334,7 +3992,7 @@ pub fn current_signal_pending() -> bool {
         Some(p) => p,
         None => return false,
     };
-    let candidate = p.pending_signals & !p.blocked_signals;
+    let candidate = p.signals.deliverable();
     if candidate == 0 {
         return false;
     }
@@ -4369,6 +4027,29 @@ pub fn add_cgroup_charge(bytes: u64) {
     }
 }
 
+pub fn charge_process_memory(pid: Pid, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let cg = {
+        let g = GLOBAL.lock();
+        match g.processes.get(&pid) {
+            Some(p) => p.cgroup.clone(),
+            None => return,
+        }
+    };
+    if let Some(cg) = &cg {
+        if cg.try_charge_memory(bytes).is_err() {
+            cg.oom_kill_one();
+            return;
+        }
+    }
+    let mut g = GLOBAL.lock();
+    if let Some(p) = g.processes.get_mut(&pid) {
+        p.cgroup_charged_bytes = p.cgroup_charged_bytes.saturating_add(bytes);
+    }
+}
+
 pub fn sub_cgroup_charge(bytes: u64) {
     let cpu = this_cpu() as usize;
     let pid = match CPU_QUEUES[cpu].lock().current {
@@ -4390,71 +4071,6 @@ pub fn sub_cgroup_charge(bytes: u64) {
             cg.uncharge_memory(actual);
         }
     }
-}
-
-pub fn seccomp_append_filter(prog: Arc<crate::bpf::BpfProgram>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.seccomp_filters.push(prog);
-    }
-}
-
-pub fn seccomp_append_filter_tgid(prog: Arc<crate::bpf::BpfProgram>) {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let tgid = g.processes.get(&pid).map(|p| p.tgid).unwrap_or(pid);
-    for p in g.processes.values_mut() {
-        if p.tgid == tgid {
-            p.seccomp_filters.push(prog.clone());
-        }
-    }
-}
-
-pub fn current_seccomp_chain() -> Option<alloc::vec::Vec<Arc<crate::bpf::BpfProgram>>> {
-    let cpu = this_cpu() as usize;
-    let pid = CPU_QUEUES[cpu].lock().current?;
-    let g = GLOBAL.lock();
-    Some(g.processes.get(&pid)?.seccomp_filters.clone())
-}
-
-pub fn current_no_new_privs() -> bool {
-    let cpu = this_cpu() as usize;
-    let pid = match CPU_QUEUES[cpu].lock().current {
-        Some(p) => p,
-        None => return false,
-    };
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .map(|p| p.no_new_privs)
-        .unwrap_or(false)
-}
-
-pub fn set_current_no_new_privs() {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&pid) {
-        p.no_new_privs = true;
-    }
-}
-
-pub fn with_current_rseq<R>(f: impl FnOnce(&mut crate::process::Process) -> R) -> R {
-    let pid = current_pid();
-    let mut g = GLOBAL.lock();
-    let p = g
-        .processes
-        .get_mut(&pid)
-        .expect("with_current_rseq: no current");
-    f(p)
-}
-
-pub fn with_target_process<R>(
-    target: Pid,
-    f: impl FnOnce(&crate::process::Process) -> R,
-) -> Option<R> {
-    let g = GLOBAL.lock();
-    g.processes.get(&target).map(|p| f(p))
 }
 
 const LOAD_FSHIFT: u32 = 11;
@@ -4491,7 +4107,7 @@ fn sample_loadavg_if_due() {
         let g = GLOBAL.lock();
         let mut a = 0u64;
         for p in g.processes.values() {
-            match p.state {
+            match p.state.0 {
                 ProcessState::Running | ProcessState::Runnable => a += 1,
                 ProcessState::Parked => a += 1,
                 _ => {}
@@ -4535,7 +4151,7 @@ pub fn record_minor_fault() {
         None => return,
     };
     if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
-        p.minflt = p.minflt.saturating_add(1);
+        p.memory.incr_minflt();
     }
 }
 
@@ -4545,7 +4161,7 @@ pub fn record_major_fault() {
         None => return,
     };
     if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
-        p.majflt = p.majflt.saturating_add(1);
+        p.memory.incr_majflt();
     }
 }
 
@@ -4555,7 +4171,7 @@ pub fn procs_running_blocked() -> (u64, u64) {
     let mut running = 0u64;
     let mut blocked = 0u64;
     for p in g.processes.values() {
-        match p.state {
+        match p.state.0 {
             ProcessState::Running | ProcessState::Runnable => running += 1,
             ProcessState::Parked => blocked += 1,
             _ => {}
@@ -4572,7 +4188,7 @@ pub fn syscall_enter_account() {
     };
     let mut g = GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
-        p.in_syscall = true;
+        p.lifecycle.set_in_syscall(true);
     }
 }
 
@@ -4584,7 +4200,7 @@ pub fn syscall_exit_account() {
     };
     let mut g = GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
-        p.in_syscall = false;
+        p.lifecycle.set_in_syscall(false);
     }
 }
 
@@ -4601,18 +4217,20 @@ pub fn park_for_trace_stop(reason: crate::process::TraceStop) {
             Some(p) => p,
             None => return,
         };
-        let tracer = me.tracer_pid;
+        let tracer = me.trace.tracer_pid();
+        if tracer.is_none() || (me.signals.pending() & (1u64 << SIGKILL)) != 0 {
+            return;
+        }
         let _ = q.current.take();
         bank_slice_off_cpu(me);
-        me.state = ProcessState::Traced;
+        me.state.0 = ProcessState::Traced;
         set_sched_owner(me, SchedOwner::Traced, "park_for_trace_stop");
-        me.trace_stop = Some(reason);
-        me.trace_wait_consumed = false;
+        me.trace.enter_stop(reason);
         (
             tracer,
-            me.task.context_ptr(),
-            me.task.xsave_ptr(),
-            me.task.kstack_bounds(),
+            me.task.0.context_ptr(),
+            me.task.0.xsave_ptr(),
+            me.task.0.kstack_bounds(),
         )
     };
     if let Some(tracer_pid) = tracer {
@@ -4651,23 +4269,41 @@ pub fn resume_traced(target: Pid, inject_signal: u32, trace_syscall: bool) -> bo
             Some(p) => p,
             None => return false,
         };
-        if p.state != ProcessState::Traced {
+        if p.state.0 != ProcessState::Traced {
             return false;
         }
-        p.trace_stop = None;
-        p.trace_in_syscall_stop_mode = trace_syscall;
-        p.trace_wait_consumed = false;
+        p.trace.resume(trace_syscall);
         if inject_signal != 0 && inject_signal < NSIG as u32 {
-            p.pending_signals |= 1u64 << inject_signal;
-            p.trace_pending_inject = inject_signal;
+            p.signals.raise(1u64 << inject_signal);
+            p.trace.set_pending_inject(inject_signal);
         }
-        p.state = ProcessState::Runnable;
+        p.state.0 = ProcessState::Runnable;
         true
     };
     if needs_enqueue {
         reenqueue_runnable(target);
     }
     true
+}
+
+pub fn set_traced(p: &mut Process) {
+    p.state.0 = ProcessState::Traced;
+}
+
+pub fn resume_from_traced(p: &mut Process) -> bool {
+    if p.state.0 == ProcessState::Traced {
+        p.state.0 = ProcessState::Runnable;
+        true
+    } else {
+        false
+    }
+}
+
+pub fn cpu_to_nudge(p: &Process) -> u32 {
+    match p.sched_owner.0 {
+        SchedOwner::Running { cpu } | SchedOwner::Runnable { cpu } => cpu,
+        _ => p.home_cpu,
+    }
 }
 
 pub fn with_target_vmspace(
@@ -4682,14 +4318,14 @@ pub fn snapshot_user_regs(target: Pid) -> Option<crate::ptrace::UserRegs> {
         .lock()
         .processes
         .get(&target)
-        .and_then(|p| p.trace_saved_regs)
+        .and_then(|p| p.trace.saved_regs())
 }
 
 pub fn write_user_regs(target: Pid, regs: &crate::ptrace::UserRegs) -> bool {
     let mut g = GLOBAL.lock();
     match g.processes.get_mut(&target) {
         Some(p) => {
-            p.trace_saved_regs = Some(*regs);
+            p.trace.set_saved_regs(*regs);
             true
         }
         None => false,
@@ -4724,8 +4360,8 @@ fn handle_dying_children(cur: Pid) {
             depth += 1;
             match g.processes.get(&p) {
                 Some(proc) => {
-                    if proc.child_subreaper.load(Ordering::Relaxed)
-                        && !matches!(proc.state, ProcessState::Zombie(_))
+                    if proc.lifecycle.child_subreaper()
+                        && !matches!(proc.state.0, ProcessState::Zombie(_))
                     {
                         found = Some(p);
                         break;
@@ -4771,7 +4407,7 @@ fn cgroup_replenish_throttled(now_ns: u64) {
         g.processes
             .iter()
             .filter_map(|(pid, p)| {
-                if p.state == ProcessState::CgroupThrottled {
+                if p.state.0 == ProcessState::CgroupThrottled {
                     Some(*pid)
                 } else {
                     None
@@ -4810,8 +4446,8 @@ fn cgroup_replenish_throttled(now_ns: u64) {
         let mut q = CPU_QUEUES[home as usize].lock();
         let mut g = GLOBAL.lock();
         if let Some(proc) = g.processes.get_mut(&pid) {
-            if proc.state == ProcessState::CgroupThrottled {
-                proc.state = ProcessState::Runnable;
+            if proc.state.0 == ProcessState::CgroupThrottled {
+                proc.state.0 = ProcessState::Runnable;
                 set_sched_owner(
                     proc,
                     SchedOwner::Runnable { cpu: home },
@@ -4872,7 +4508,7 @@ pub fn set_deadline_class(
         }
         return Err(EBUSY);
     }
-    let was_runnable = proc.state == ProcessState::Runnable;
+    let was_runnable = proc.state.0 == ProcessState::Runnable;
     if was_runnable {
         let (rt_r, dl_r, cfs_r) = q.runnable.remove_pid(target);
         if rt_r + dl_r + cfs_r > 0 {
@@ -4923,10 +4559,10 @@ pub fn dl_replenish_callback(key: u64) {
         proc.dl_runtime_remaining = runtime_ns;
         proc.dl_absolute_deadline = proc.dl_absolute_deadline.saturating_add(period_ns);
         proc.dl_next_replenish = proc.dl_absolute_deadline;
-        let was_throttled = proc.state == ProcessState::DlThrottled;
+        let was_throttled = proc.state.0 == ProcessState::DlThrottled;
         proc.dl_throttled = false;
         if was_throttled {
-            proc.state = ProcessState::Runnable;
+            proc.state.0 = ProcessState::Runnable;
         }
         proc.dl_next_replenish
     };
@@ -4935,7 +4571,7 @@ pub fn dl_replenish_callback(key: u64) {
         let g = GLOBAL.lock();
         match g.processes.get(&pid) {
             Some(p) => {
-                let throttled = matches!(p.state, ProcessState::Runnable)
+                let throttled = matches!(p.state.0, ProcessState::Runnable)
                     && matches!(p.sched_class, crate::process::SchedClass::Deadline { .. });
                 (p.home_cpu, throttled)
             }
@@ -4946,7 +4582,7 @@ pub fn dl_replenish_callback(key: u64) {
         let mut q = CPU_QUEUES[home as usize].lock();
         let mut g = GLOBAL.lock();
         if let Some(proc) = g.processes.get_mut(&pid) {
-            if proc.state == ProcessState::Runnable {
+            if proc.state.0 == ProcessState::Runnable {
                 set_sched_owner(
                     proc,
                     SchedOwner::Runnable { cpu: home },
@@ -4984,8 +4620,8 @@ pub fn set_sched_class(target: Pid, new_class: crate::process::SchedClass) -> Re
         Some(p) => p,
         None => return Err(ESRCH),
     };
-    let was_running = proc.state == ProcessState::Running;
-    let was_queued = proc.state == ProcessState::Runnable && !was_running;
+    let was_running = proc.state.0 == ProcessState::Running;
+    let was_queued = proc.state.0 == ProcessState::Runnable && !was_running;
     if was_queued {
         let (rt_r, dl_r, cfs_r) = q.runnable.remove_pid(target);
         if rt_r + dl_r + cfs_r > 0 {
@@ -5008,8 +4644,8 @@ pub fn set_sched_class(target: Pid, new_class: crate::process::SchedClass) -> Re
             proc.dl_absolute_deadline = 0;
             proc.dl_next_replenish = 0;
             proc.dl_throttled = false;
-            if proc.state == ProcessState::DlThrottled {
-                proc.state = ProcessState::Runnable;
+            if proc.state.0 == ProcessState::DlThrottled {
+                proc.state.0 = ProcessState::Runnable;
             }
         }
     }
@@ -5036,26 +4672,16 @@ pub fn set_sched_class(target: Pid, new_class: crate::process::SchedClass) -> Re
     Ok(())
 }
 
-pub fn with_target_process_mut(target: Pid, f: impl FnOnce(&mut crate::process::Process)) -> bool {
-    let mut g = GLOBAL.lock();
-    if let Some(p) = g.processes.get_mut(&target) {
-        f(p);
-        true
-    } else {
-        false
-    }
-}
-
 pub fn process_pid_ns(pid: Pid) -> Option<Arc<crate::process::PidNamespace>> {
     let g = GLOBAL.lock();
-    g.processes.get(&pid).and_then(|p| p.pid_ns.clone())
+    g.processes.get(&pid).and_then(|p| p.namespaces.pid())
 }
 
 pub fn set_current_pending_pid_ns(ns: Option<Arc<crate::process::PidNamespace>>) {
     let pid = current_pid();
     let mut g = GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
-        p.pending_pid_ns = ns;
+        p.namespaces.set_pending_pid(ns);
     }
 }
 
@@ -5063,7 +4689,7 @@ pub fn set_current_pending_ipc_ns(ns: Option<Arc<crate::process::IpcNamespace>>)
     let pid = current_pid();
     let mut g = GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
-        p.pending_ipc_ns = ns;
+        p.namespaces.set_pending_ipc(ns);
     }
 }
 
@@ -5094,6 +4720,19 @@ pub fn caller_local_to_host(local: u32) -> Option<Pid> {
     ns.local_to_host_in(local)
 }
 
+pub fn caller_visible_pids() -> Vec<(Pid, u32)> {
+    let cur = current_pid();
+    match process_pid_ns(cur) {
+        None => all_pids().into_iter().map(|p| (p, p.0)).collect(),
+        Some(ns) => ns
+            .host_to_local
+            .lock()
+            .iter()
+            .map(|(host, local)| (*host, *local))
+            .collect(),
+    }
+}
+
 pub fn caller_host_to_local(host: Pid) -> u32 {
     let cur = current_pid();
     match process_pid_ns(cur) {
@@ -5102,25 +4741,9 @@ pub fn caller_host_to_local(host: Pid) -> u32 {
     }
 }
 
-pub fn process_no_new_privs(pid: Pid) -> bool {
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .map(|p| p.no_new_privs)
-        .unwrap_or(false)
-}
-
-pub fn process_seccomp_active(pid: Pid) -> bool {
-    let g = GLOBAL.lock();
-    g.processes
-        .get(&pid)
-        .map(|p| !p.seccomp_filters.is_empty())
-        .unwrap_or(false)
-}
-
 pub fn process_umask(pid: Pid) -> u16 {
     let g = GLOBAL.lock();
-    g.processes.get(&pid).map(|p| p.umask).unwrap_or(0)
+    g.processes.get(&pid).map(|p| p.files.umask()).unwrap_or(0)
 }
 
 pub fn process_charged_bytes(pid: Pid) -> u64 {
@@ -5135,7 +4758,7 @@ pub fn process_count_alive() -> u64 {
     let g = GLOBAL.lock();
     g.processes
         .values()
-        .filter(|p| !matches!(p.state, ProcessState::Zombie(_)))
+        .filter(|p| !matches!(p.state.0, ProcessState::Zombie(_)))
         .count() as u64
 }
 
@@ -5150,6 +4773,32 @@ pub fn process_cgroup(pid: Pid) -> Option<Arc<crate::cgroup::Cgroup>> {
     g.processes.get(&pid).and_then(|p| p.cgroup.clone())
 }
 
+pub fn cpu_affinity(pid: Pid) -> Option<u64> {
+    GLOBAL.lock().processes.get(&pid).map(|p| p.cpu_affinity)
+}
+
+pub fn process_euid(pid: Pid) -> Option<u32> {
+    GLOBAL
+        .lock()
+        .processes
+        .get(&pid)
+        .map(|p| p.creds.lock().euid)
+}
+
+pub fn set_cpu_affinity(pid: Pid, mask: u64) -> bool {
+    let owner = {
+        let mut g = GLOBAL.lock();
+        let p = match g.processes.get_mut(&pid) {
+            Some(p) => p,
+            None => return false,
+        };
+        p.cpu_affinity = mask;
+        cpu_to_nudge(p)
+    };
+    send_resched_ipi_pub(owner);
+    true
+}
+
 pub fn set_process_cgroup(pid: Pid, cg: Arc<crate::cgroup::Cgroup>) {
     let mut g = GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
@@ -5159,7 +4808,7 @@ pub fn set_process_cgroup(pid: Pid, cg: Arc<crate::cgroup::Cgroup>) {
 
 pub fn process_state(pid: Pid) -> Option<crate::process::ProcessState> {
     let g = GLOBAL.lock();
-    g.processes.get(&pid).map(|p| p.state.clone())
+    g.processes.get(&pid).map(|p| p.state.0.clone())
 }
 
 pub fn current_pending_in_mask(mask: u64) -> u64 {
@@ -5167,7 +4816,7 @@ pub fn current_pending_in_mask(mask: u64) -> u64 {
     let g = GLOBAL.lock();
     g.processes
         .get(&pid)
-        .map(|p| p.pending_signals & mask)
+        .map(|p| p.signals.pending() & mask)
         .unwrap_or(0)
 }
 
@@ -5182,12 +4831,13 @@ pub fn consume_pending_signal(signum: u32) -> (i32, u64) {
         None => return (0, 0),
     };
     let bit = 1u64 << signum;
-    if proc.pending_signals & bit == 0 {
+    if proc.signals.pending() & bit == 0 {
         return (0, 0);
     }
-    proc.pending_signals &= !bit;
-    let pinfo = proc.siginfo[signum as usize];
-    proc.siginfo[signum as usize] = crate::signal::PendingSigInfo::default();
+    proc.signals.clear_pending(bit);
+    let pinfo = proc.signals.siginfo(signum as usize);
+    proc.signals
+        .set_siginfo(signum as usize, crate::signal::PendingSigInfo::default());
     (pinfo.si_code, pinfo.aux)
 }
 
@@ -5221,7 +4871,7 @@ pub fn current_blocked() -> u64 {
     let g = GLOBAL.lock();
     g.processes
         .get(&pid)
-        .map(|p| p.blocked_signals)
+        .map(|p| p.signals.blocked())
         .unwrap_or(0)
 }
 
@@ -5236,15 +4886,65 @@ pub fn sigprocmask(how: u32, set: u64) -> Result<u64, SignalError> {
         .processes
         .get_mut(&pid)
         .ok_or(SignalError::NoSuchProcess)?;
-    let old = proc.blocked_signals;
+    let old = proc.signals.blocked();
     let new = match how {
         SIG_BLOCK => old | (set & kept),
         SIG_UNBLOCK => old & !set,
         SIG_SETMASK => set & kept,
         _ => return Err(SignalError::Invalid),
     };
-    proc.blocked_signals = new;
+    proc.signals.set_blocked(new);
     Ok(old)
+}
+
+pub fn irq_notify_resume_checkpoint() {
+    enum Act {
+        Term(u32),
+        Stop,
+    }
+    let act = {
+        let pid = match CPU_QUEUES[this_cpu() as usize].lock().current {
+            Some(p) => p,
+            None => return,
+        };
+        let mut g = GLOBAL.lock();
+        let proc = match g.processes.get_mut(&pid) {
+            Some(p) => p,
+            None => return,
+        };
+        let mask = proc.signals.deliverable();
+        if mask == 0 {
+            return;
+        }
+        let signal = mask.trailing_zeros();
+        if signal != SIGKILL && proc.trace.is_traced() {
+            return;
+        }
+        let force_default = signal == SIGKILL || signal == SIGSTOP;
+        let handler = proc.sigactions.lock()[signal as usize].handler;
+        if handler != 0 && !force_default {
+            return;
+        }
+        use crate::signal::DefaultAction;
+        match crate::signal::default_action(signal) {
+            DefaultAction::Term | DefaultAction::Core => {
+                proc.signals.clear_pending(1u64 << signal);
+                Act::Term(signal)
+            }
+            DefaultAction::Stop => {
+                proc.signals.clear_pending(1u64 << signal);
+                Act::Stop
+            }
+            DefaultAction::Cont | DefaultAction::Ignore => {
+                proc.signals.clear_pending(1u64 << signal);
+                return;
+            }
+        }
+    };
+    match act {
+        Act::Term(signal) => terminate_current_with_signal(signal),
+        Act::Stop => stop_current(),
+    }
 }
 
 pub fn deliver_pending_signals(tf: &mut TrapFrame) {
@@ -5271,15 +4971,16 @@ pub fn deliver_pending_signals(tf: &mut TrapFrame) {
         };
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&pid).unwrap();
-        let mask = proc.pending_signals & !proc.blocked_signals;
+        let mask = proc.signals.deliverable();
         if mask == 0 {
             Action::None
         } else {
             let signal = mask.trailing_zeros();
-            proc.pending_signals &= !(1u64 << signal);
+            proc.signals.clear_pending(1u64 << signal);
             let act = proc.sigactions.lock()[signal as usize];
-            let pinfo = proc.siginfo[signal as usize];
-            proc.siginfo[signal as usize] = crate::signal::PendingSigInfo::default();
+            let pinfo = proc.signals.siginfo(signal as usize);
+            proc.signals
+                .set_siginfo(signal as usize, crate::signal::PendingSigInfo::default());
             let info = pinfo.expand(signal);
             let force_default = signal == SIGKILL || signal == SIGSTOP;
             if act.handler == 1 && !force_default {
@@ -5287,9 +4988,7 @@ pub fn deliver_pending_signals(tf: &mut TrapFrame) {
             } else if act.handler == 0 || force_default {
                 use crate::signal::DefaultAction;
                 match crate::signal::default_action(signal) {
-                    DefaultAction::Term | DefaultAction::Core => {
-                        Action::TerminateBySignal(signal)
-                    }
+                    DefaultAction::Term | DefaultAction::Core => Action::TerminateBySignal(signal),
                     DefaultAction::Stop => Action::Stop,
                     DefaultAction::Cont => Action::Cont,
                     DefaultAction::Ignore => Action::None,
@@ -5298,9 +4997,9 @@ pub fn deliver_pending_signals(tf: &mut TrapFrame) {
                 Action::InvokeHandler {
                     signal,
                     action: act,
-                    pre_blocked: proc.blocked_signals,
+                    pre_blocked: proc.signals.blocked(),
                     info,
-                    altstack: proc.altstack,
+                    altstack: proc.signals.altstack(),
                 }
             }
         }
@@ -5308,10 +5007,9 @@ pub fn deliver_pending_signals(tf: &mut TrapFrame) {
 
     match action {
         Action::None => {}
-        Action::TerminateBySignal(signal) => terminate_current_with_signal(tf, signal),
+        Action::TerminateBySignal(signal) => terminate_current_with_signal(signal),
         Action::Stop => stop_current(),
-        Action::Cont => {
-        }
+        Action::Cont => {}
         Action::InvokeHandler {
             signal,
             action,
@@ -5331,7 +5029,7 @@ pub fn deliver_pending_signals(tf: &mut TrapFrame) {
                     let pid = current_pid();
                     let mut g = GLOBAL.lock();
                     if let Some(p) = g.processes.get_mut(&pid) {
-                        p.blocked_signals = new_blocked;
+                        p.signals.set_blocked(new_blocked);
                         if action.flags & crate::process::sa::SA_RESETHAND != 0 {
                             p.sigactions.lock()[signal as usize] =
                                 crate::process::SigAction::default();
@@ -5350,7 +5048,7 @@ pub fn rt_sigreturn(tf: &mut TrapFrame) {
             let pid = current_pid();
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get_mut(&pid) {
-                p.blocked_signals = saved_blocked;
+                p.signals.set_blocked(saved_blocked);
             }
         }
         Err(_) => exit_current(tf, 128 + SIGSEGV as i32),

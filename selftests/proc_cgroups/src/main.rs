@@ -125,14 +125,7 @@ pub extern "C" fn _start() -> ! {
         if r < 0 {
             sys_exit(80);
         }
-        let map = sys_mmap(
-            0,
-            1024 * 1024,
-            3,
-            0x22,
-            -1,
-            0,
-        );
+        let map = sys_mmap(0, 1024 * 1024, 3, 0x22, -1, 0);
         if map < 0 {
             sys_exit(81);
         }
@@ -282,10 +275,8 @@ pub extern "C" fn _start() -> ! {
         if write_file_n(b"/sys/fs/cgroup/migB/cgroup.procs\0".as_ptr(), &buf[..n]) < 0 {
             sys_exit(72);
         }
-        let a_cur =
-            parse_leading_u64(&read_file(b"/sys/fs/cgroup/migA/memory.current\0".as_ptr()));
-        let b_cur =
-            parse_leading_u64(&read_file(b"/sys/fs/cgroup/migB/memory.current\0".as_ptr()));
+        let a_cur = parse_leading_u64(&read_file(b"/sys/fs/cgroup/migA/memory.current\0".as_ptr()));
+        let b_cur = parse_leading_u64(&read_file(b"/sys/fs/cgroup/migB/memory.current\0".as_ptr()));
         if a_cur != 0 {
             sys_exit(73);
         }
@@ -305,6 +296,39 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_rmdir(b"/sys/fs/cgroup/migA\0".as_ptr());
     let _ = sys_rmdir(b"/sys/fs/cgroup/migB\0".as_ptr());
     log("migration transfers the memory charge OK\n");
+
+    {
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        if sys_mkdir(b"/sys/fs/cgroup/nstest\0".as_ptr(), 0o755) != 0 {
+            log("cgroupns: mkdir nstest failed\n");
+            sys_exit(1);
+        }
+        let mut pbuf = [0u8; 16];
+        let pn = format_pid(my_pid, &mut pbuf);
+        if write_file_n(
+            b"/sys/fs/cgroup/nstest/cgroup.procs\0".as_ptr(),
+            &pbuf[..pn],
+        ) < 0
+        {
+            log("cgroupns: migrate into nstest failed\n");
+            sys_exit(1);
+        }
+        let before = read_file(b"/proc/self/cgroup\0".as_ptr());
+        if !starts_with(&before, b"0::/nstest") {
+            log("cgroupns: pre-unshare cgroup path not absolute\n");
+            sys_exit(1);
+        }
+        if sys_unshare(CLONE_NEWCGROUP) != 0 {
+            log("cgroupns: unshare(NEWCGROUP) failed\n");
+            sys_exit(1);
+        }
+        let after = read_file(b"/proc/self/cgroup\0".as_ptr());
+        if !starts_with(&after, b"0::/\n") {
+            log("cgroupns: post-unshare cgroup path not ns-root-relative\n");
+            sys_exit(1);
+        }
+        log("cgroup namespace makes /proc/self/cgroup root-relative OK\n");
+    }
 
     log("all cgroups tests OK\n");
     sys_exit(0);
@@ -461,6 +485,16 @@ fn sys_write(fd: u64, buf: *const u8, len: usize) -> i64 {
     let r: i64;
     unsafe {
         asm!("syscall", in("rax") 1u64, in("rdi") fd, in("rsi") buf, in("rdx") len,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_unshare(flags: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 272u64, in("rdi") flags,
         lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
     }
     r

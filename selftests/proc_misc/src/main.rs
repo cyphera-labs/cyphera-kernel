@@ -152,16 +152,12 @@ pub extern "C" fn _start() -> ! {
     report(b"misc: getrandom ok\n");
 
     let mut rnd2 = [0u8; 32];
-    if sys_getrandom(rnd2.as_mut_ptr() as u64, rnd2.len() as u64, 1)
-        != rnd2.len() as i64
-    {
+    if sys_getrandom(rnd2.as_mut_ptr() as u64, rnd2.len() as u64, 1) != rnd2.len() as i64 {
         report(b"getrandom nonblock short\n");
         sys_exit(19);
     }
     let mut rnd3 = [0u8; 32];
-    if sys_getrandom(rnd3.as_mut_ptr() as u64, rnd3.len() as u64, 2)
-        != rnd3.len() as i64
-    {
+    if sys_getrandom(rnd3.as_mut_ptr() as u64, rnd3.len() as u64, 2) != rnd3.len() as i64 {
         report(b"getrandom GRND_RANDOM short\n");
         sys_exit(20);
     }

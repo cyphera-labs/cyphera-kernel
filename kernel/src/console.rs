@@ -12,6 +12,10 @@ pub fn install_screen_sink() {
     frame::io::uart::set_console_sink(fb::putbytes);
 }
 
+pub fn suspend_fb_sink(on: bool) {
+    fb::set_suspended(on);
+}
+
 const RING_CAPACITY: usize = 4096;
 const LINE_MAX: usize = 4096;
 
@@ -257,7 +261,6 @@ pub fn poll_rx_from_tick() {
     }
 }
 
-
 const KBD_LSHIFT: u16 = 42;
 const KBD_RSHIFT: u16 = 54;
 const KBD_LCTRL: u16 = 29;
@@ -266,7 +269,7 @@ const KBD_CAPSLOCK: u16 = 58;
 
 fn keycode_to_ascii(kc: u16, shift: bool) -> Option<u8> {
     let (lo, hi): (u8, u8) = match kc {
-        1 => (0x1b, 0x1b), // Esc
+        1 => (0x1b, 0x1b),
         2 => (b'1', b'!'),
         3 => (b'2', b'@'),
         4 => (b'3', b'#'),
@@ -279,7 +282,7 @@ fn keycode_to_ascii(kc: u16, shift: bool) -> Option<u8> {
         11 => (b'0', b')'),
         12 => (b'-', b'_'),
         13 => (b'=', b'+'),
-        14 => (0x7f, 0x7f), 
+        14 => (0x7f, 0x7f),
         15 => (b'\t', b'\t'),
         16 => (b'q', b'Q'),
         17 => (b'w', b'W'),
@@ -293,7 +296,7 @@ fn keycode_to_ascii(kc: u16, shift: bool) -> Option<u8> {
         25 => (b'p', b'P'),
         26 => (b'[', b'{'),
         27 => (b']', b'}'),
-        28 => (b'\r', b'\r'), 
+        28 => (b'\r', b'\r'),
         30 => (b'a', b'A'),
         31 => (b's', b'S'),
         32 => (b'd', b'D'),
@@ -317,8 +320,8 @@ fn keycode_to_ascii(kc: u16, shift: bool) -> Option<u8> {
         51 => (b',', b'<'),
         52 => (b'.', b'>'),
         53 => (b'/', b'?'),
-        55 => (b'*', b'*'), 
-        57 => (b' ', b' '), 
+        55 => (b'*', b'*'),
+        57 => (b' ', b' '),
         _ => return None,
     };
     Some(if shift { hi } else { lo })
@@ -350,7 +353,7 @@ pub(crate) fn feed_keycode(keycode: u16, press: bool) {
             _ => {}
         }
         if !press {
-            return; 
+            return;
         }
         let Some(mut b) = keycode_to_ascii(keycode, st.kbd_shift) else {
             return;
@@ -359,7 +362,7 @@ pub(crate) fn feed_keycode(keycode: u16, press: bool) {
         if st.kbd_caps && b.is_ascii_alphabetic() {
             b ^= 0x20;
         }
-          if st.kbd_ctrl {
+        if st.kbd_ctrl {
             let up = b.to_ascii_uppercase();
             if (b'@'..=b'_').contains(&up) {
                 b = up & 0x1f;
@@ -388,24 +391,19 @@ pub fn read(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError
     if kbd_mode_get() == K_MEDIUMRAW {
         return read_kbd(out, nonblock);
     }
-    loop {
-        {
-            let mut st = STATE.lock();
-            st.last_reader = Some(crate::sched::current_pid());
-
-            if !st.cooked.is_empty() {
-                return Ok(st.cooked.pop_into(out));
-            }
-            if st.eof_pending {
-                st.eof_pending = false;
-                return Ok(0);
-            }
-            if nonblock {
-                return Err(crate::vfs::FsError::WouldBlock);
-            }
+    use crate::vfs::blocking::IoAttempt;
+    crate::vfs::blocking::block_io("console_read", &READERS, nonblock, None, || {
+        let mut st = STATE.lock();
+        st.last_reader = Some(crate::sched::current_pid());
+        if !st.cooked.is_empty() {
+            IoAttempt::Ready(st.cooked.pop_into(out))
+        } else if st.eof_pending {
+            st.eof_pending = false;
+            IoAttempt::Ready(0)
+        } else {
+            IoAttempt::WouldBlock
         }
-        crate::sched::park_on(&READERS);
-    }
+    })
 }
 
 fn read_kbd(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError> {
@@ -424,4 +422,18 @@ fn read_kbd(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError
 
 pub fn read_blocking(out: &mut [u8]) -> usize {
     read(out, false).unwrap_or(0)
+}
+
+pub fn poll_readable() -> bool {
+    if kbd_mode_get() == K_MEDIUMRAW {
+        crate::input::kbd_has_event()
+    } else {
+        let st = STATE.lock();
+        !st.cooked.is_empty() || st.eof_pending
+    }
+}
+
+pub fn for_each_read_wq(f: &mut dyn FnMut(&WaitQueue)) {
+    f(&READERS);
+    crate::input::for_each_kbd_wq(f);
 }

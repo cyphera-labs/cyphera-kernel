@@ -111,9 +111,7 @@ pub fn load_static(elf_bytes: &[u8], vmspace: &mut VmSpace) -> Result<Loaded, Lo
                 interp_segments = segs;
                 (Some(base), Some(entry))
             }
-            Err(_) => {
-                (None, None)
-            }
+            Err(_) => (None, None),
         }
     } else {
         (None, None)

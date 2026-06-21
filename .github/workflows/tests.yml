@@ -1,0 +1,71 @@
+name: Tests
+on:
+  # The pass/fail gate: runs the full QEMU battery and FAILS the check if
+  # any test fails. This is the correctness gate (the Coverage workflow
+  # measures coverage and is intentionally lenient about excluded tests;
+  # it does not assert pass/fail). Scoped on push to code paths; runs
+  # unconditionally on PRs so it can be a required status check.
+  push:
+    branches: [main]
+    paths:
+      - 'kernel/**'
+      - 'frame/**'
+      - 'runtime/**'
+      - 'drivers/**'
+      - 'tools/test.sh'
+      - 'tools/run-qemu.sh'
+      - 'tools/build-userland.sh'
+      - '.github/workflows/tests.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Test kind (smoke | subsystem | all)'
+        required: false
+        default: 'all'
+
+permissions:
+  contents: read
+
+jobs:
+  battery:
+    name: QEMU test battery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2026-03-01
+          components: rust-src
+          targets: x86_64-unknown-none
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # post-v2.9.1
+        with:
+          key: tests
+
+      # KVM is unavailable on GitHub-hosted runners, so run-qemu.sh falls
+      # through to TCG — slower, but the battery still runs to completion
+      # (tests boot in seconds-to-tens-of-seconds under TCG, well within
+      # run-qemu.sh's 180s per-test timeout).
+      - name: Install QEMU
+        run: |
+          set -eo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      # cargo runs the integration-test binaries sequentially; each boots
+      # the kernel under QEMU via run-qemu.sh (the cargo runner) and exits
+      # non-zero on a failed assertion / panic / timeout, so `test.sh all`
+      # fails the job the moment any test fails. This is the gate.
+      - name: Run full test battery
+        env:
+          KIND: ${{ github.event.inputs.kind || 'all' }}
+        run: |
+          set -eo pipefail
+          bash tools/test.sh "$KIND"

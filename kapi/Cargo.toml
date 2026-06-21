@@ -1,0 +1,17 @@
+[package]
+name = "cyphera-kapi"
+description = "Cyphera Kernel shared vocabulary — dumb Copy/Clone ids, flag newtypes, and the Errno/KResult error type. No locks, no globals, no engine handles."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cyphera_kapi"
+path = "src/lib.rs"

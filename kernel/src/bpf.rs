@@ -104,8 +104,7 @@ impl BpfProgram {
                                 return Err(BpfError::InvalidLoad);
                             }
                         }
-                        m if m == BPF_IND => {
-                        }
+                        m if m == BPF_IND => {}
                         m if m == BPF_MEM => {
                             if ins.k as usize >= SCRATCH_LEN {
                                 return Err(BpfError::InvalidScratch);

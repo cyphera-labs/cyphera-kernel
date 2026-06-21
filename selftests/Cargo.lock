@@ -59,6 +59,26 @@ name = "proc_compat_intro"
 version = "0.0.1"
 
 [[package]]
+name = "proc_cow_fork"
+version = "0.0.1"
+
+[[package]]
+name = "proc_cow_forkrace"
+version = "0.0.1"
+
+[[package]]
+name = "proc_cow_futex"
+version = "0.0.1"
+
+[[package]]
+name = "proc_cow_ptrace"
+version = "0.0.1"
+
+[[package]]
+name = "proc_cow_threads"
+version = "0.0.1"
+
+[[package]]
 name = "proc_cpu_throttle"
 version = "0.0.1"
 
@@ -79,6 +99,10 @@ name = "proc_dl_overrun"
 version = "0.0.1"
 
 [[package]]
+name = "proc_epoll_signal_eintr"
+version = "0.0.1"
+
+[[package]]
 name = "proc_exec"
 version = "0.0.1"
 
@@ -88,6 +112,10 @@ version = "0.0.1"
 
 [[package]]
 name = "proc_ext4"
+version = "0.0.1"
+
+[[package]]
+name = "proc_fault_race"
 version = "0.0.1"
 
 [[package]]
@@ -116,6 +144,10 @@ version = "0.0.1"
 
 [[package]]
 name = "proc_futex"
+version = "0.0.1"
+
+[[package]]
+name = "proc_futex_timeout"
 version = "0.0.1"
 
 [[package]]
@@ -183,6 +215,10 @@ name = "proc_pidfd"
 version = "0.0.1"
 
 [[package]]
+name = "proc_pidfd_reap"
+version = "0.0.1"
+
+[[package]]
 name = "proc_pidns"
 version = "0.0.1"
 
@@ -199,7 +235,23 @@ name = "proc_ptrace"
 version = "0.0.1"
 
 [[package]]
+name = "proc_ptrace_attach_run"
+version = "0.0.1"
+
+[[package]]
+name = "proc_ptrace_orphan"
+version = "0.0.1"
+
+[[package]]
 name = "proc_ptrace_signal"
+version = "0.0.1"
+
+[[package]]
+name = "proc_ptrace_traceexec"
+version = "0.0.1"
+
+[[package]]
+name = "proc_ptrace_traceexit"
 version = "0.0.1"
 
 [[package]]
@@ -219,11 +271,19 @@ name = "proc_rt"
 version = "0.0.1"
 
 [[package]]
+name = "proc_sched_churn"
+version = "0.0.1"
+
+[[package]]
 name = "proc_seccomp"
 version = "0.0.1"
 
 [[package]]
 name = "proc_segv"
+version = "0.0.1"
+
+[[package]]
+name = "proc_select"
 version = "0.0.1"
 
 [[package]]
@@ -239,7 +299,15 @@ name = "proc_sigsuspend_race"
 version = "0.0.1"
 
 [[package]]
+name = "proc_sigwait_kill"
+version = "0.0.1"
+
+[[package]]
 name = "proc_sockopt"
+version = "0.0.1"
+
+[[package]]
+name = "proc_spin_kill"
 version = "0.0.1"
 
 [[package]]
@@ -260,6 +328,18 @@ version = "0.0.1"
 
 [[package]]
 name = "proc_timeouts"
+version = "0.0.1"
+
+[[package]]
+name = "proc_timer_storm"
+version = "0.0.1"
+
+[[package]]
+name = "proc_timerfd_race"
+version = "0.0.1"
+
+[[package]]
+name = "proc_tmpfs_leak"
 version = "0.0.1"
 
 [[package]]

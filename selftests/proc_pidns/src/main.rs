@@ -9,6 +9,8 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 const CLONE_NEWPID: u64 = 0x2000_0000;
+const O_RDONLY: u64 = 0o0;
+const AT_FDCWD: i64 = -100;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -74,6 +76,19 @@ pub extern "C" fn _start() -> ! {
         if pp != 0 {
             sys_exit(22);
         }
+        let mut buf = [0u8; 256];
+        let n = read_path(b"/proc/self/stat\0", &mut buf);
+        if n <= 0 {
+            sys_exit(23);
+        }
+        if parse_leading_u32(&buf[..n as usize]) != Some(1) {
+            sys_exit(24);
+        }
+        let fd = sys_openat(AT_FDCWD, b"/proc/2/stat\0".as_ptr(), O_RDONLY, 0);
+        if fd >= 0 {
+            sys_close(fd as u64);
+            sys_exit(25);
+        }
         sys_exit(0);
     }
     let child_in_parent_ns = r as i32;
@@ -133,6 +148,75 @@ fn log_num(n: i64) {
     buf[i] = b'\n';
     i += 1;
     sys_write(1, buf.as_ptr(), i);
+}
+
+fn read_path(path: &[u8], buf: &mut [u8]) -> i64 {
+    let fd = sys_openat(AT_FDCWD, path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let mut total = 0usize;
+    loop {
+        let n = sys_read(
+            fd as u64,
+            unsafe { buf.as_mut_ptr().add(total) },
+            buf.len() - total,
+        );
+        if n <= 0 {
+            break;
+        }
+        total += n as usize;
+        if total >= buf.len() {
+            break;
+        }
+    }
+    sys_close(fd as u64);
+    total as i64
+}
+
+fn parse_leading_u32(s: &[u8]) -> Option<u32> {
+    let mut v: u32 = 0;
+    let mut any = false;
+    for &c in s {
+        if c.is_ascii_digit() {
+            v = v.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+            any = true;
+        } else {
+            break;
+        }
+    }
+    if any { Some(v) } else { None }
+}
+
+#[inline(never)]
+fn sys_openat(dirfd: i64, path: *const u8, flags: u64, mode: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 257u64, in("rdi") dirfd, in("rsi") path,
+        in("rdx") flags, in("r10") mode,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_read(fd: u64, buf: *mut u8, len: usize) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 0u64, in("rdi") fd, in("rsi") buf, in("rdx") len,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_close(fd: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 3u64, in("rdi") fd,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
 }
 
 #[inline(never)]

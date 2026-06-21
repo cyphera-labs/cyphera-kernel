@@ -462,7 +462,14 @@ fn sys_connect(fd: i32, addr: *const u8, addrlen: u64) -> i64 {
 }
 
 #[inline(never)]
-fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, flags: u64, addr: *mut u8, addrlen: *mut u8) -> i64 {
+fn sys_recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    flags: u64,
+    addr: *mut u8,
+    addrlen: *mut u8,
+) -> i64 {
     let r: i64;
     unsafe {
         asm!("syscall", in("rax") 45u64, in("rdi") fd as i64,

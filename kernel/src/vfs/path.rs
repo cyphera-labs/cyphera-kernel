@@ -49,23 +49,35 @@ impl Context {
         self.mounts.snapshot_one(path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install_mount(
         &self,
         target_path: &str,
         target_inode_id: u64,
         root: Arc<dyn Inode>,
         propagation: MountPropagation,
+        source: &str,
+        fstype: &str,
     ) {
-        self.mounts
-            .install(target_path, target_inode_id, root, propagation);
+        self.mounts.install(
+            target_path,
+            target_inode_id,
+            root,
+            propagation,
+            source,
+            fstype,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install_mount_propagating(
         &self,
         target_path: &str,
         target_inode_id: u64,
         root: Arc<dyn Inode>,
         propagation: MountPropagation,
+        source: &str,
+        fstype: &str,
     ) -> alloc::vec::Vec<alloc::string::String> {
         use alloc::string::String;
 
@@ -75,6 +87,8 @@ impl Context {
             target_inode_id,
             root.clone(),
             propagation.clone(),
+            source,
+            fstype,
         );
 
         let (containing_path, containing_entry) = match containing {
@@ -109,6 +123,8 @@ impl Context {
                     mirror_target_id,
                     root.clone(),
                     propagation.clone(),
+                    source,
+                    fstype,
                 );
                 mirrored.push(mirror_path);
             }
@@ -122,6 +138,8 @@ impl Context {
                     mirror_target_id,
                     root.clone(),
                     MountPropagation::Private,
+                    source,
+                    fstype,
                 );
                 mirrored.push(mirror_path);
             }

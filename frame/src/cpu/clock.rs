@@ -3,8 +3,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::registers::model_specific::Msr;
 
-use crate::boot::KERNEL_VMA_OFFSET;
-
 const FALLBACK_TSC_HZ: u64 = 2_000_000_000;
 
 const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
@@ -214,8 +212,8 @@ fn setup_kvm_pvclock_bsp() -> bool {
     let time_pa = time_frame.start_address().as_u64();
     let wall_pa = wall_frame.start_address().as_u64();
 
-    let time_va = time_pa | KERNEL_VMA_OFFSET;
-    let wall_va = wall_pa | KERNEL_VMA_OFFSET;
+    let time_va = crate::mm::direct_map::phys_to_virt(time_pa);
+    let wall_va = crate::mm::direct_map::phys_to_virt(wall_pa);
     // SAFETY: time_va/wall_va are the kernel high-VA aliases (physical
     // base | KERNEL_VMA_OFFSET) of the two frames just handed out by
     // alloc_frame, so each is mapped, 4096-byte page-aligned, and owned
@@ -261,7 +259,7 @@ pub fn init_ap(cpu_id: u32) {
         None => return,
     };
     let pa = frame_.start_address().as_u64();
-    let va = pa | KERNEL_VMA_OFFSET;
+    let va = crate::mm::direct_map::phys_to_virt(pa);
     // SAFETY: va is the kernel high-VA alias of the frame just returned
     // by alloc_frame, so it is mapped, page-aligned, and owned solely by
     // this AP path until stored into PVCLOCK_TIME_INFO below; zeroing one

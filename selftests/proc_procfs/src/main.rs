@@ -92,6 +92,30 @@ pub extern "C" fn _start() -> ! {
     }
     log("/proc/sys/kernel/random/uuid OK\n");
 
+    let mut b1 = [0u8; 64];
+    if read_path(b"/proc/sys/kernel/random/boot_id\0", &mut b1) < 37 {
+        log("read boot_id #1 failed\n");
+        sys_exit(1);
+    }
+    let mut b2 = [0u8; 64];
+    if read_path(b"/proc/sys/kernel/random/boot_id\0", &mut b2) < 37 {
+        log("read boot_id #2 failed\n");
+        sys_exit(1);
+    }
+    if !uuid_shape_ok(&b1[..36]) {
+        log("boot_id not canonical v4 shape\n");
+        sys_exit(1);
+    }
+    if b1[..36] != b2[..36] {
+        log("boot_id not stable across opens\n");
+        sys_exit(1);
+    }
+    if &b1[..36] == b"00000000-0000-0000-0000-000000000001" {
+        log("boot_id is the old hardcoded placeholder\n");
+        sys_exit(1);
+    }
+    log("/proc/sys/kernel/random/boot_id stable + random OK\n");
+
     log("all procfs reads OK\n");
     sys_exit(0);
 }

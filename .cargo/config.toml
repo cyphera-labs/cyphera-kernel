@@ -1,6 +1,12 @@
 [build]
 target = "x86_64-unknown-none"
 
+# smoltcp sizes its per-interface address vector at build time (default 2). The
+# loopback interface needs three: 127.0.0.1, ::1, and a non-loopback v6 source
+# (fe80::1) since RFC 6724 source selection refuses a loopback source for ::1.
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "4"
+
 [target.x86_64-unknown-none]
 runner = "tools/run-qemu.sh"
 rustflags = [

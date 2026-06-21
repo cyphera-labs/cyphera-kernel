@@ -11,15 +11,10 @@ use crate::sched;
 use crate::vfs::Inode;
 
 pub fn detach_shared_file_current() {
-    if sched::with_current_process(|p| {
-        p.vfork_shared_vm
-            .load(core::sync::atomic::Ordering::Acquire)
-    })
-    .unwrap_or(false)
-    {
+    if sched::with_current_lifecycle(|l| l.vfork_shared_vm()).unwrap_or(false) {
         return;
     }
-    let Some(Some(addr_space)) = sched::with_current_process(|p| p.addr_space.clone()) else {
+    let Some(addr_space) = sched::current_addr_space_opt() else {
         return;
     };
     detach_shared_file_for(&addr_space);
@@ -77,18 +72,31 @@ const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 
 pub fn try_handle(cr2: u64, error: u64) -> bool {
-    if (error & PF_PRESENT) != 0 {
-        return false;
-    }
     if sched::current_pid_opt().is_none() {
         return false;
     }
     let page_addr = cr2 & !0xfff;
     let is_write = (error & PF_WRITE) != 0;
 
+    if (error & PF_PRESENT) != 0 {
+        if is_write {
+            return try_break_cow(page_addr);
+        }
+        return false;
+    }
+
     let snap = match sched::with_current_mmap(|m| {
-        m.find_containing(page_addr)
-            .map(|v| (v.start, v.end, v.prot, v.flags, v.backing.clone()))
+        let generation = m.generation();
+        m.find_containing(page_addr).map(|v| {
+            (
+                v.start,
+                v.end,
+                v.prot,
+                v.flags,
+                v.backing.clone(),
+                generation,
+            )
+        })
     }) {
         Some(v) => v,
         None => {
@@ -100,7 +108,7 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
             return false;
         }
     };
-    let (vma_start, _vma_end, prot, vma_flags, backing) = snap;
+    let (vma_start, _vma_end, prot, vma_flags, backing, snap_generation) = snap;
 
     if !prot.intersects(
         frame::mm::vm::Perms::READ
@@ -190,7 +198,6 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
         frame
     };
 
-    let mut vmspace = VmSpace::current();
     let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(page_addr)) {
         Ok(p) => p,
         Err(_) => {
@@ -211,7 +218,7 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
             return false;
         }
     };
-    if vmspace.map_one_frame(page, frame, prot).is_err() {
+    let release = || {
         if is_shared_file {
             if let VmaBacking::File {
                 inode,
@@ -226,7 +233,63 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
         } else {
             frame_alloc::free_frame(frame);
         }
+        sched::sub_cgroup_charge(4096);
+    };
+    let Some(addr_space) = sched::current_addr_space_opt() else {
+        release();
         return false;
+    };
+    let install = {
+        let mut vmspace = addr_space.vmspace.lock();
+        let install_prot = {
+            let mmap = addr_space.mmap.lock();
+            if mmap.generation() == snap_generation {
+                Some(prot)
+            } else {
+                mmap.find_containing(page_addr).and_then(|v| {
+                    let perm_ok = if is_write {
+                        v.prot.contains(frame::mm::vm::Perms::WRITE)
+                    } else {
+                        v.prot.intersects(
+                            frame::mm::vm::Perms::READ
+                                .union(frame::mm::vm::Perms::WRITE)
+                                .union(frame::mm::vm::Perms::EXECUTE),
+                        )
+                    };
+                    let backing_ok = match (&backing, &v.backing) {
+                        (VmaBacking::Anonymous, VmaBacking::Anonymous) => true,
+                        (
+                            VmaBacking::File {
+                                inode: a,
+                                file_offset_base: ao,
+                            },
+                            VmaBacking::File {
+                                inode: b,
+                                file_offset_base: bo,
+                            },
+                        ) => a.inode_id() == b.inode_id() && ao == bo && v.start == vma_start,
+                        _ => false,
+                    };
+                    (perm_ok && backing_ok).then_some(v.prot)
+                })
+            }
+        };
+        let Some(install_prot) = install_prot else {
+            release();
+            return false;
+        };
+        vmspace.map_one_frame(page, frame, install_prot)
+    };
+    match install {
+        Ok(()) => {}
+        Err(frame::mm::vm::MapError::AlreadyMapped) => {
+            release();
+            return true;
+        }
+        Err(_) => {
+            release();
+            return false;
+        }
     }
     let was_major = !is_shared_file && matches!(backing, VmaBacking::File { .. });
     if was_major {
@@ -235,6 +298,63 @@ pub fn try_handle(cr2: u64, error: u64) -> bool {
         sched::record_minor_fault();
     }
     true
+}
+
+fn try_break_cow(page_addr: u64) -> bool {
+    let vma_prot = sched::with_current_mmap(|m| m.find_containing(page_addr).map(|v| v.prot));
+    if let Some(prot) = vma_prot {
+        if !prot.contains(frame::mm::vm::Perms::WRITE) {
+            return false;
+        }
+    }
+
+    let Some(addr_space) = sched::current_addr_space_opt() else {
+        return false;
+    };
+
+    let cg = sched::current_cgroup();
+    if let Some(cg) = &cg {
+        if cg.try_charge_memory(4096).is_err() {
+            cg.oom_kill_one();
+            return false;
+        }
+    }
+
+    let outcome = {
+        let mut vmspace = addr_space.vmspace.lock();
+        vmspace.break_cow(VirtAddr::new(page_addr), None)
+    };
+
+    match outcome {
+        Ok(frame::mm::vm::CowBreak::Broken { old_frame }) => {
+            frame::cpu::tlb::shootdown_all();
+            frame_alloc::free_frame(old_frame);
+            sched::add_cgroup_charge(4096);
+            sched::record_minor_fault();
+            true
+        }
+        Ok(frame::mm::vm::CowBreak::BrokenInPlace) => {
+            frame::cpu::tlb::shootdown_all();
+            if let Some(cg) = &cg {
+                cg.uncharge_memory(4096);
+            }
+            sched::record_minor_fault();
+            true
+        }
+        Ok(frame::mm::vm::CowBreak::AlreadyWritable) => {
+            frame::cpu::tlb::flush_local_page(page_addr);
+            if let Some(cg) = &cg {
+                cg.uncharge_memory(4096);
+            }
+            true
+        }
+        _ => {
+            if let Some(cg) = &cg {
+                cg.uncharge_memory(4096);
+            }
+            false
+        }
+    }
 }
 
 fn grow_stack(page_addr: u64) -> bool {

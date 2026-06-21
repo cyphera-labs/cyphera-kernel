@@ -77,15 +77,13 @@ fn traceme() -> i64 {
     };
     {
         let me_proc = g.processes.get_mut(&me).unwrap();
-        if me_proc.tracer_pid.is_some() {
+        if me_proc.trace.is_traced() {
             return EPERM;
         }
-        me_proc.tracer_pid = Some(parent_pid);
+        me_proc.trace.set_tracer(parent_pid);
     }
     if let Some(parent) = g.processes.get_mut(&parent_pid) {
-        if !parent.tracees.contains(&me) {
-            parent.tracees.push(me);
-        }
+        parent.trace.add_tracee(me);
     }
     0
 }
@@ -95,7 +93,7 @@ fn attach(target: Pid) -> i64 {
     if target == caller {
         return EPERM;
     }
-    let waiters_to_wake = {
+    let (waiters_to_wake, nudge_cpu) = {
         let mut g = sched::GLOBAL.lock();
         let (caller_uid, caller_is_root) = match g.processes.get(&caller) {
             Some(p) => {
@@ -108,7 +106,7 @@ fn attach(target: Pid) -> i64 {
             Some(p) => p,
             None => return ESRCH,
         };
-        if target_proc.tracer_pid.is_some() {
+        if target_proc.trace.is_traced() {
             return EPERM;
         }
         if matches!(target_proc.kind, crate::process::ProcessKind::Kernel) {
@@ -116,16 +114,14 @@ fn attach(target: Pid) -> i64 {
         }
         if !caller_is_root {
             let target_uid = target_proc.creds.lock().euid;
-            let dumpable = target_proc
-                .dumpable
-                .load(core::sync::atomic::Ordering::Relaxed);
+            let dumpable = target_proc.security.dumpable();
             if target_uid != caller_uid || dumpable == 0 {
                 return EPERM;
             }
         }
 
         let target_mut = g.processes.get_mut(&target).unwrap();
-        match target_mut.state {
+        match target_mut.state.get() {
             ProcessState::Zombie(_)
             | ProcessState::KilledByFault { .. }
             | ProcessState::KilledBySignal { .. } => {
@@ -133,19 +129,27 @@ fn attach(target: Pid) -> i64 {
             }
             _ => {}
         }
-        target_mut.tracer_pid = Some(caller);
-        target_mut.state = ProcessState::Traced;
-        target_mut.trace_stop = Some(TraceStop::Attach);
-        target_mut.trace_wait_consumed = false;
+        let nudge = match target_mut.state.get() {
+            ProcessState::Running | ProcessState::Runnable => {
+                target_mut.trace.attach_deferred(caller);
+                Some(sched::cpu_to_nudge(target_mut))
+            }
+            _ => {
+                sched::set_traced(target_mut);
+                target_mut.trace.attach(caller);
+                None
+            }
+        };
 
         let caller_mut = g.processes.get_mut(&caller).unwrap();
-        if !caller_mut.tracees.contains(&target) {
-            caller_mut.tracees.push(target);
-        }
-        caller_mut.child_exit.drain()
+        caller_mut.trace.add_tracee(target);
+        (caller_mut.child_exit.drain(), nudge)
     };
     for pid in waiters_to_wake {
         let _ = sched::wake_pid(pid);
+    }
+    if let Some(cpu) = nudge_cpu {
+        sched::send_resched_ipi_pub(cpu);
     }
     0
 }
@@ -158,25 +162,17 @@ fn detach(target: Pid, signal: u32) -> i64 {
             Some(p) => p,
             None => return ESRCH,
         };
-        if target_proc.tracer_pid != Some(caller) {
+        if !target_proc.trace.traced_by(caller) {
             return EPERM;
         }
         let target_mut = g.processes.get_mut(&target).unwrap();
-        target_mut.tracer_pid = None;
-        target_mut.trace_stop = None;
-        target_mut.trace_options = 0;
-        target_mut.trace_in_syscall_stop_mode = false;
-        target_mut.trace_wait_consumed = false;
+        target_mut.trace.detach();
         if signal != 0 && signal < 64 {
-            target_mut.pending_signals |= 1u64 << signal;
+            target_mut.signals.raise(1u64 << signal);
         }
-        target_mut.trace_pending_inject = 0;
-        let resume = matches!(target_mut.state, ProcessState::Traced);
-        if resume {
-            target_mut.state = ProcessState::Runnable;
-        }
+        let resume = sched::resume_from_traced(target_mut);
         if let Some(caller_mut) = g.processes.get_mut(&caller) {
-            caller_mut.tracees.retain(|p| *p != target);
+            caller_mut.trace.remove_tracee(target);
         }
         if resume { Some(target) } else { None }
     };
@@ -190,10 +186,10 @@ fn require_tracer_and_stopped(target: Pid) -> Result<(), i64> {
     let caller = sched::current_pid();
     let g = sched::GLOBAL.lock();
     let target_proc = g.processes.get(&target).ok_or(ESRCH)?;
-    if target_proc.tracer_pid != Some(caller) {
+    if !target_proc.trace.traced_by(caller) {
         return Err(ESRCH);
     }
-    if target_proc.state != ProcessState::Traced {
+    if *target_proc.state.get() != ProcessState::Traced {
         return Err(ESRCH);
     }
     Ok(())
@@ -229,8 +225,19 @@ fn poke(target: Pid, addr: u64, data: u64) -> i64 {
         Some(v) => v,
         None => return ESRCH,
     };
-    let mut vm = vmspace.lock();
-    if frame::user::poke_other_vmspace(&mut vm, addr, &bytes).is_err() {
+    let (breaks, status) = {
+        let mut vm = vmspace.lock();
+        frame::user::poke_other_vmspace(&mut vm, addr, &bytes)
+    };
+    if !breaks.0.is_empty() {
+        frame::cpu::tlb::shootdown_all();
+        let n = breaks.0.len();
+        for f in breaks.0 {
+            frame::mm::frame_alloc::free_frame(f);
+        }
+        crate::sched::charge_process_memory(target, (n as u64) * 4096);
+    }
+    if status.is_err() {
         return EIO;
     }
     0
@@ -291,7 +298,7 @@ fn get_syscall_info(target: Pid, user_size: u64, data: u64) -> i64 {
         Some(r) => r,
         None => return ESRCH,
     };
-    let stop = crate::sched::with_target_process(target, |p| p.trace_stop).flatten();
+    let stop = crate::sched::with_trace(target, |t| t.stop()).flatten();
 
     let mut buf = [0u8; 88];
     let op = match stop {
@@ -405,9 +412,9 @@ fn geteventmsg(target: Pid, data: u64) -> i64 {
     if let Err(e) = require_tracer_and_stopped(target) {
         return e;
     }
-    let (raw_msg, is_pid_event) = sched::with_target_process(target, |p| {
-        let is_pid = matches!(p.trace_stop, Some(TraceStop::EventStop(_)));
-        (p.trace_event_msg, is_pid)
+    let (raw_msg, is_pid_event) = sched::with_trace(target, |t| {
+        let is_pid = matches!(t.stop(), Some(TraceStop::EventStop(_)));
+        (t.event_msg(), is_pid)
     })
     .unwrap_or((0, false));
     let msg: u64 = if is_pid_event && raw_msg != 0 {
@@ -429,22 +436,20 @@ fn kill(target: Pid) -> i64 {
             Some(p) => p,
             None => return ESRCH,
         };
-        if p.tracer_pid != Some(caller) {
+        if !p.trace.traced_by(caller) {
             return ESRCH;
         }
-        p.pending_signals |= 1u64 << crate::process::SIGKILL;
-        let was = p.state == ProcessState::Traced;
+        p.signals.raise(1u64 << crate::process::SIGKILL);
+        let was = sched::resume_from_traced(p);
         if was {
-            p.state = ProcessState::Runnable;
-            p.trace_stop = None;
-            p.trace_wait_consumed = false;
+            p.trace.clear_stop();
         }
         was
     };
     if was_traced {
         sched::reenqueue_runnable(target);
     } else {
-        if let Some(home) = sched::with_target_process(target, |p| p.home_cpu) {
+        if let Some(home) = sched::scheduling::home_cpu(target) {
             sched::send_resched_ipi_pub(home);
         }
     }
@@ -458,9 +463,7 @@ fn cont(target: Pid, signal: u32, trace_syscall: bool, single_step: bool) -> i64
     if single_step {
         let mut g = crate::sched::GLOBAL.lock();
         if let Some(p) = g.processes.get_mut(&target) {
-            if let Some(regs) = p.trace_saved_regs.as_mut() {
-                regs.rflags |= 0x100;
-            }
+            p.trace.enable_single_step();
         }
     }
     if !crate::sched::resume_traced(target, signal, trace_syscall) {
@@ -475,31 +478,27 @@ fn setoptions(target: Pid, data: u64) -> i64 {
     }
     let mut g = sched::GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&target) {
-        p.trace_options = data;
+        p.trace.set_options(data);
     }
     0
 }
 
 pub fn trace_trap_hook(rip: &mut u64, rflags: &mut u64, _vector: u8) -> bool {
     let cur = sched::current_pid();
-    let traced = sched::with_target_process(cur, |p| p.tracer_pid.is_some()).unwrap_or(false);
+    let traced = sched::with_trace(cur, |t| t.is_traced()).unwrap_or(false);
     if !traced {
         return false;
     }
     {
         let mut g = sched::GLOBAL.lock();
         if let Some(p) = g.processes.get_mut(&cur) {
-            let mut r = p.trace_saved_regs.unwrap_or_default();
-            r.rip = *rip;
-            r.rflags = *rflags;
-            r.rflags &= !0x100;
-            p.trace_saved_regs = Some(r);
+            p.trace.record_trap_regs(*rip, *rflags);
         }
     }
     sched::park_for_trace_stop(crate::process::TraceStop::Signal(crate::process::SIGTRAP));
     let regs = {
         let g = sched::GLOBAL.lock();
-        g.processes.get(&cur).and_then(|p| p.trace_saved_regs)
+        g.processes.get(&cur).and_then(|p| p.trace.saved_regs())
     };
     if let Some(r) = regs {
         *rip = r.rip;
@@ -517,7 +516,7 @@ pub fn syscall_entry_hook(tf: &mut frame::user::TrapFrame) {
     let should_stop = {
         let g = sched::GLOBAL.lock();
         match g.processes.get(&cur) {
-            Some(p) => p.tracer_pid.is_some() && p.trace_in_syscall_stop_mode,
+            Some(p) => p.trace.is_traced() && p.trace.in_syscall_stop_mode(),
             None => false,
         }
     };
@@ -536,9 +535,10 @@ pub fn syscall_exit_hook(tf: &mut frame::user::TrapFrame) {
     let (exec_stop, syscall_stop_armed) = {
         let mut g = sched::GLOBAL.lock();
         match g.processes.get_mut(&cur) {
-            Some(p) if p.tracer_pid.is_some() => {
-                (p.pending_event_stop.take(), p.trace_in_syscall_stop_mode)
-            }
+            Some(p) if p.trace.is_traced() => (
+                p.trace.take_pending_event_stop(),
+                p.trace.in_syscall_stop_mode(),
+            ),
             _ => (None, false),
         }
     };
@@ -546,10 +546,8 @@ pub fn syscall_exit_hook(tf: &mut frame::user::TrapFrame) {
         save_tf_to_proc(cur, tf);
         sched::park_for_trace_stop(ev);
         restore_tf_from_proc(cur, tf);
-        let still_syscall_stop = sched::with_target_process(cur, |p| {
-            p.tracer_pid.is_some() && p.trace_in_syscall_stop_mode
-        })
-        .unwrap_or(false);
+        let still_syscall_stop =
+            sched::with_trace(cur, |t| t.is_traced() && t.in_syscall_stop_mode()).unwrap_or(false);
         if still_syscall_stop {
             save_tf_to_proc(cur, tf);
             sched::park_for_trace_stop(crate::process::TraceStop::SyscallExit);
@@ -601,14 +599,14 @@ fn save_tf_to_proc(pid: Pid, tf: &frame::user::TrapFrame) {
     };
     let mut g = sched::GLOBAL.lock();
     if let Some(p) = g.processes.get_mut(&pid) {
-        p.trace_saved_regs = Some(regs);
+        p.trace.set_saved_regs(regs);
     }
 }
 
 fn restore_tf_from_proc(pid: Pid, tf: &mut frame::user::TrapFrame) {
     let regs = {
         let g = sched::GLOBAL.lock();
-        match g.processes.get(&pid).and_then(|p| p.trace_saved_regs) {
+        match g.processes.get(&pid).and_then(|p| p.trace.saved_regs()) {
             Some(r) => r,
             None => return,
         }
@@ -635,8 +633,8 @@ fn restore_tf_from_proc(pid: Pid, tf: &mut frame::user::TrapFrame) {
 use crate::errno::EFAULT;
 
 pub fn stop_status_signal(p: &Process) -> Option<u32> {
-    let stop = p.trace_stop?;
-    let trace_sysgood = (p.trace_options & PTRACE_O_TRACESYSGOOD) != 0;
+    let stop = p.trace.stop()?;
+    let trace_sysgood = (p.trace.options() & PTRACE_O_TRACESYSGOOD) != 0;
     let sig = match stop {
         TraceStop::Attach => crate::process::SIGSTOP,
         TraceStop::Signal(s) => s,
@@ -653,7 +651,7 @@ pub fn stop_status_signal(p: &Process) -> Option<u32> {
 }
 
 pub fn is_reportable_stop(p: &Process) -> bool {
-    p.state == ProcessState::Traced && !p.trace_wait_consumed && p.trace_stop.is_some()
+    *p.state.get() == ProcessState::Traced && !p.trace.wait_consumed() && p.trace.stop().is_some()
 }
 
 #[doc(hidden)]

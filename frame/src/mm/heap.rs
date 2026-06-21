@@ -11,6 +11,8 @@ const BOOTSTRAP_SIZE: usize = 1024 * 1024;
 
 const TARGET_HEAP_BYTES: usize = 128 * 1024 * 1024;
 
+const PHASE1_HEAP_BYTES: usize = 32 * 1024 * 1024;
+
 const FIRST_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 const MIN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -124,18 +126,35 @@ pub unsafe fn init() {
     );
 }
 
+pub fn expand_initial() {
+    // SAFETY: invoked once during single-threaded boot, after
+    // frame_alloc::init and before any other CPU is online.
+    unsafe { expand_main(PHASE1_HEAP_BYTES, PHASE1_HEAP_BYTES) }
+}
+
+pub fn expand_full() {
+    // SAFETY: invoked once during single-threaded boot, after
+    // expand_initial + the module reclaim and before any AP is online.
+    unsafe { expand_main(TARGET_HEAP_BYTES, FIRST_CHUNK_BYTES) }
+}
+
 /// # Safety
 ///
-/// Caller must invoke this at most once, after `frame_alloc::init`.
-pub unsafe fn expand_to_main() {
-    use crate::boot::KERNEL_VMA_OFFSET;
+/// Caller must invoke this only after `frame_alloc::init`, and must not
+/// run it concurrently with allocations on other CPUs (boot-time only).
+unsafe fn expand_main(target_bytes: usize, first_chunk_bytes: usize) {
     use crate::mm::frame_alloc;
 
-    let mut claimed: usize = 0;
-    let mut chunk_bytes: usize = FIRST_CHUNK_BYTES;
-    let mut regions_used: usize = 0;
+    let mut regions_used = HEAP.region_count.load(Ordering::Acquire);
+    let mut claimed: usize = (0..regions_used)
+        .map(|i| {
+            HEAP.regions[i].end.load(Ordering::Relaxed)
+                - HEAP.regions[i].start.load(Ordering::Relaxed)
+        })
+        .sum();
+    let mut chunk_bytes: usize = first_chunk_bytes;
 
-    while claimed < TARGET_HEAP_BYTES && regions_used < MAX_REGIONS {
+    while claimed < target_bytes && regions_used < MAX_REGIONS {
         if chunk_bytes < MIN_CHUNK_BYTES {
             break;
         }
@@ -148,7 +167,7 @@ pub unsafe fn expand_to_main() {
             }
         };
         let phys = frame.start_address().as_u64();
-        let va = (phys | KERNEL_VMA_OFFSET) as *mut u8;
+        let va = crate::mm::direct_map::phys_to_virt(phys) as *mut u8;
 
         let slot = &HEAP.regions[regions_used];
         slot.heap.lock().init(va, chunk_bytes);
@@ -160,13 +179,13 @@ pub unsafe fn expand_to_main() {
     }
 
     crate::println!(
-        "heap: main expanded — {} region(s), {} MiB total",
+        "heap: expanded — {} region(s), {} MiB total",
         regions_used,
         claimed / (1024 * 1024)
     );
 
     if claimed == 0 {
-        panic!("heap::expand_to_main: buddy could not satisfy any chunk");
+        panic!("heap::expand_main: buddy could not satisfy any chunk");
     }
 }
 

@@ -236,20 +236,29 @@ extern "x86-interrupt" fn handle_virt(frame: InterruptStackFrame) {
     panic_with_frame("#VE virtualization", &frame, None);
 }
 
-extern "x86-interrupt" fn handle_timer(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn handle_timer(frame: InterruptStackFrame) {
     crate::intr::lapic::handle_tick();
+    notify_resume_on_user_return(&frame);
 }
 
-extern "x86-interrupt" fn handle_resched_ipi(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn handle_resched_ipi(frame: InterruptStackFrame) {
     crate::intr::lapic::handle_resched();
+    notify_resume_on_user_return(&frame);
+}
+
+fn notify_resume_on_user_return(frame: &InterruptStackFrame) {
+    if from_user(frame) {
+        if let Some(h) = crate::user::irq_notify_resume() {
+            h();
+        }
+    }
 }
 
 extern "x86-interrupt" fn handle_tlb_shootdown(_frame: InterruptStackFrame) {
     crate::cpu::tlb::handle_shootdown_ipi();
 }
 
-extern "x86-interrupt" fn handle_spurious(_frame: InterruptStackFrame) {
-}
+extern "x86-interrupt" fn handle_spurious(_frame: InterruptStackFrame) {}
 
 #[track_caller]
 fn panic_with_frame(name: &str, frame: &InterruptStackFrame, err: Option<u64>) -> ! {

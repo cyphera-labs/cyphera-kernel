@@ -68,7 +68,7 @@ flock 9
 GRAPHICAL_ARGS=()
 if [[ "${CYPHERA_GRAPHICAL:-0}" = "1" ]]; then
     GRAPHICAL_ARGS=(
-        -m 512M
+        -m "${CYPHERA_MEM:-512M}"
         -display sdl
         -device virtio-gpu-device,xres=640,yres=400
         -device virtio-keyboard-device
@@ -78,7 +78,7 @@ if [[ "${CYPHERA_GRAPHICAL:-0}" = "1" ]]; then
     MEM_FLAG=()
 else
     DISPLAY_FLAG=(-display none)
-    MEM_FLAG=(-m 1024M)
+    MEM_FLAG=(-m "${CYPHERA_MEM:-1024M}")
 fi
 
 # Audio backend selection. virtio-sound-device is always attached
@@ -127,9 +127,21 @@ if [[ "${CYPHERA_GDB:-0}" = "1" ]]; then
 elif [[ "${CYPHERA_GDB:-0}" = "2" ]]; then
     GDB_ARGS=(-s)
 fi
-# Force TCG (no KVM) when gdb stub active — KVM doesn't support
-# hardware watchpoints via gdb stub, only TCG does.
-ACCEL=accel=kvm:tcg
+# Accelerator selection. Default `kvm:tcg` uses KVM when the host
+# exposes it and falls back to TCG otherwise (the path CI hits, since
+# GitHub runners have no KVM). CYPHERA_ACCEL overrides: `tcg` forces
+# pure software emulation (reproduces the CI/TCG timing locally),
+# `kvm` requires hardware acceleration. The gdb stub forces TCG
+# regardless — KVM doesn't support hardware watchpoints via gdb stub.
+case "${CYPHERA_ACCEL:-}" in
+    tcg) ACCEL=accel=tcg ;;
+    kvm) ACCEL=accel=kvm ;;
+    "") ACCEL=accel=kvm:tcg ;;
+    *)
+        echo "run-qemu.sh: invalid CYPHERA_ACCEL='${CYPHERA_ACCEL}' (want tcg|kvm)" >&2
+        exit 2
+        ;;
+esac
 if [[ "${CYPHERA_GDB:-0}" != "0" ]]; then
     ACCEL=accel=tcg
 fi
@@ -138,7 +150,7 @@ fi
     -machine microvm,$ACCEL,pit=off,pic=off,rtc=on \
     -rtc base=utc,clock=host \
     -cpu max \
-    -smp 2 \
+    -smp "${CYPHERA_SMP:-2}" \
     "${MEM_FLAG[@]}" \
     -kernel "$KERNEL" \
     -nodefaults \

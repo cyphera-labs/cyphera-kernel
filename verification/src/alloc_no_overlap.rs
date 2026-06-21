@@ -34,7 +34,6 @@ impl Tracker {
         }
     }
 
-    /// Invariant: no two currently-allocated regions overlap.
     pub fn no_overlap_invariant(&self) -> bool {
         let mut i = 0;
         while i < self.count as usize && i < N {

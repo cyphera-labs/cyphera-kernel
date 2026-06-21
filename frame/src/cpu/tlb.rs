@@ -25,6 +25,14 @@ pub fn flush_local() {
     unsafe { Cr3::write(frame, flags) };
 }
 
+#[inline]
+pub fn flush_local_page(vaddr: u64) {
+    // SAFETY: `invlpg` invalidates only the single TLB entry for the page
+    // containing `vaddr` on this CPU; it touches no memory and is always
+    // valid for any address.
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags)) };
+}
+
 pub fn shootdown_all() {
     flush_local();
 

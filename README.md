@@ -154,7 +154,7 @@ tools/          Dev container Dockerfile, run-qemu helper, ext4
 Every signed release on GitHub ships:
 
 - The kernel binary (`cyphera-kernel-vX.Y.Z.elf`) + SHA-256
-- Sigstore cosign signature + certificate (`.sig` + `.pem`)
+- Sigstore cosign signature bundle (`.sigstore.json`)
 - SLSA-style build provenance attestation (`.intoto.jsonl`)
 - CycloneDX + SPDX SBOMs (signed independently)
 

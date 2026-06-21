@@ -7,17 +7,7 @@ use frame::cpu::task::Task;
 use frame::mm::{PhysFrame, Size4KiB};
 use frame::user::TrapFrame;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Pid(pub u32);
-
-impl Pid {
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-    pub const fn from_raw(raw: u32) -> Self {
-        Pid(raw)
-    }
-}
+pub use cyphera_kapi::Pid;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedClass {
@@ -50,10 +40,9 @@ impl SchedClass {
 pub const NICE_0_LOAD: u64 = 1024;
 
 pub const PRIO_TO_WEIGHT: [u64; 40] = [
-    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949,
-    11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586,
-    1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137,
-    110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
+    3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
+    70, 56, 45, 36, 29, 23, 18, 15,
 ];
 
 pub fn nice_to_weight(nice: i8) -> u64 {
@@ -83,18 +72,12 @@ pub enum ProcessState {
     Running,
     Parked,
     Zombie(i32),
-    KilledByFault {
-        vector: u8,
-        addr: u64,
-        error: u64,
-    },
+    KilledByFault { vector: u8, addr: u64, error: u64 },
     Stopped,
     DlThrottled,
     CgroupThrottled,
     Traced,
-    KilledBySignal {
-        signal: u32,
-    },
+    KilledBySignal { signal: u32 },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -104,6 +87,774 @@ pub enum TraceStop {
     SyscallExit,
     Signal(u32),
     EventStop(u32),
+}
+
+#[derive(Debug, Default)]
+pub struct TraceContext {
+    tracer_pid: Option<Pid>,
+    tracees: alloc::vec::Vec<Pid>,
+    stop: Option<TraceStop>,
+    options: u64,
+    in_syscall_stop_mode: bool,
+    pending_event_stop: Option<TraceStop>,
+    pending_inject: u32,
+    wait_consumed: bool,
+    event_msg: u64,
+    saved_regs: Option<crate::ptrace::UserRegs>,
+    pending_attach_stop: bool,
+}
+
+impl TraceContext {
+    pub fn tracer_pid(&self) -> Option<Pid> {
+        self.tracer_pid
+    }
+
+    pub fn is_traced(&self) -> bool {
+        self.tracer_pid.is_some()
+    }
+
+    pub fn traced_by(&self, tracer: Pid) -> bool {
+        self.tracer_pid == Some(tracer)
+    }
+
+    pub fn stop(&self) -> Option<TraceStop> {
+        self.stop
+    }
+
+    pub fn options(&self) -> u64 {
+        self.options
+    }
+
+    pub fn in_syscall_stop_mode(&self) -> bool {
+        self.in_syscall_stop_mode
+    }
+
+    pub fn pending_inject(&self) -> u32 {
+        self.pending_inject
+    }
+
+    pub fn wait_consumed(&self) -> bool {
+        self.wait_consumed
+    }
+
+    pub fn event_msg(&self) -> u64 {
+        self.event_msg
+    }
+
+    pub fn saved_regs(&self) -> Option<crate::ptrace::UserRegs> {
+        self.saved_regs
+    }
+
+    pub fn tracees(&self) -> &[Pid] {
+        &self.tracees
+    }
+
+    pub fn set_tracer(&mut self, tracer: Pid) {
+        self.tracer_pid = Some(tracer);
+    }
+
+    pub fn add_tracee(&mut self, tracee: Pid) {
+        if !self.tracees.contains(&tracee) {
+            self.tracees.push(tracee);
+        }
+    }
+
+    pub fn remove_tracee(&mut self, tracee: Pid) {
+        self.tracees.retain(|p| *p != tracee);
+    }
+
+    pub fn take_tracees(&mut self) -> alloc::vec::Vec<Pid> {
+        core::mem::take(&mut self.tracees)
+    }
+
+    pub fn attach(&mut self, tracer: Pid) {
+        self.tracer_pid = Some(tracer);
+        self.stop = Some(TraceStop::Attach);
+        self.wait_consumed = false;
+    }
+
+    pub fn attach_deferred(&mut self, tracer: Pid) {
+        self.tracer_pid = Some(tracer);
+        self.pending_attach_stop = true;
+    }
+
+    pub fn attach_stop_pending(&self) -> bool {
+        self.pending_attach_stop
+    }
+
+    pub fn take_attach_stop(&mut self) -> bool {
+        let armed = self.pending_attach_stop;
+        self.pending_attach_stop = false;
+        armed
+    }
+
+    pub fn inherit_trace(&mut self, tracer: Pid, options: u64) {
+        self.tracer_pid = Some(tracer);
+        self.in_syscall_stop_mode = true;
+        self.options = options;
+    }
+
+    pub fn detach(&mut self) {
+        self.tracer_pid = None;
+        self.stop = None;
+        self.options = 0;
+        self.in_syscall_stop_mode = false;
+        self.wait_consumed = false;
+        self.pending_inject = 0;
+        self.pending_attach_stop = false;
+    }
+
+    pub fn set_options(&mut self, options: u64) {
+        self.options = options;
+    }
+
+    pub fn enter_stop(&mut self, reason: TraceStop) {
+        self.stop = Some(reason);
+        self.wait_consumed = false;
+    }
+
+    pub fn clear_stop(&mut self) {
+        self.stop = None;
+        self.wait_consumed = false;
+    }
+
+    pub fn resume(&mut self, trace_syscall: bool) {
+        self.stop = None;
+        self.in_syscall_stop_mode = trace_syscall;
+        self.wait_consumed = false;
+        self.pending_attach_stop = false;
+    }
+
+    pub fn mark_wait_consumed(&mut self) {
+        self.wait_consumed = true;
+    }
+
+    pub fn post_event_stop(&mut self, stop: TraceStop, msg: u64) {
+        self.event_msg = msg;
+        self.pending_event_stop = Some(stop);
+    }
+
+    pub fn arm_post_exec_trap(&mut self) {
+        self.pending_event_stop = Some(TraceStop::Signal(SIGTRAP));
+    }
+
+    pub fn clear_pending_event_stop(&mut self) {
+        self.pending_event_stop = None;
+    }
+
+    pub fn take_pending_event_stop(&mut self) -> Option<TraceStop> {
+        self.pending_event_stop.take()
+    }
+
+    pub fn set_event_msg(&mut self, msg: u64) {
+        self.event_msg = msg;
+    }
+
+    pub fn set_pending_inject(&mut self, signal: u32) {
+        self.pending_inject = signal;
+    }
+
+    pub fn clear_pending_inject(&mut self) {
+        self.pending_inject = 0;
+    }
+
+    pub fn set_saved_regs(&mut self, regs: crate::ptrace::UserRegs) {
+        self.saved_regs = Some(regs);
+    }
+
+    pub fn enable_single_step(&mut self) {
+        if let Some(regs) = self.saved_regs.as_mut() {
+            regs.rflags |= 0x100;
+        }
+    }
+
+    pub fn record_trap_regs(&mut self, rip: u64, rflags: u64) {
+        let mut r = self.saved_regs.unwrap_or_default();
+        r.rip = rip;
+        r.rflags = rflags & !0x100;
+        self.saved_regs = Some(r);
+    }
+}
+
+pub struct SecurityContext {
+    no_new_privs: bool,
+    dumpable: core::sync::atomic::AtomicU32,
+    keep_caps: core::sync::atomic::AtomicBool,
+    seccomp_filters: alloc::vec::Vec<alloc::sync::Arc<crate::bpf::BpfProgram>>,
+}
+
+impl Default for SecurityContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecurityContext {
+    pub fn new() -> Self {
+        Self {
+            no_new_privs: false,
+            dumpable: core::sync::atomic::AtomicU32::new(1),
+            keep_caps: core::sync::atomic::AtomicBool::new(false),
+            seccomp_filters: alloc::vec::Vec::new(),
+        }
+    }
+
+    pub fn inherit(parent: &SecurityContext) -> Self {
+        Self {
+            no_new_privs: parent.no_new_privs,
+            dumpable: core::sync::atomic::AtomicU32::new(1),
+            keep_caps: core::sync::atomic::AtomicBool::new(false),
+            seccomp_filters: parent.seccomp_filters.clone(),
+        }
+    }
+
+    pub fn no_new_privs(&self) -> bool {
+        self.no_new_privs
+    }
+
+    pub fn set_no_new_privs(&mut self) {
+        self.no_new_privs = true;
+    }
+
+    pub fn dumpable(&self) -> u32 {
+        self.dumpable.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_dumpable(&self, value: u32) {
+        self.dumpable
+            .store(value, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn keep_caps(&self) -> bool {
+        self.keep_caps.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_keep_caps(&self, value: bool) {
+        self.keep_caps
+            .store(value, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn add_seccomp_filter(&mut self, prog: alloc::sync::Arc<crate::bpf::BpfProgram>) {
+        self.seccomp_filters.push(prog);
+    }
+
+    pub fn seccomp_filters(&self) -> &[alloc::sync::Arc<crate::bpf::BpfProgram>] {
+        &self.seccomp_filters
+    }
+
+    pub fn has_seccomp(&self) -> bool {
+        !self.seccomp_filters.is_empty()
+    }
+}
+
+#[derive(Default)]
+pub struct NamespaceContext {
+    uts: Option<Arc<UtsNamespace>>,
+    ipc: Option<Arc<IpcNamespace>>,
+    pid: Option<Arc<PidNamespace>>,
+    cgroup: Option<Arc<CgroupNamespace>>,
+    time: Option<Arc<TimeNamespace>>,
+    net: Option<Arc<crate::net::NetNamespace>>,
+    pending_pid: Option<Arc<PidNamespace>>,
+    pending_ipc: Option<Arc<IpcNamespace>>,
+    pending_net: Option<Arc<crate::net::NetNamespace>>,
+}
+
+impl NamespaceContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn inherit(parent: &NamespaceContext) -> Self {
+        Self {
+            uts: parent.uts.clone(),
+            ipc: parent.ipc.clone(),
+            pid: parent.pid.clone(),
+            cgroup: parent.cgroup.clone(),
+            time: parent.time.clone(),
+            net: parent.net.clone(),
+            pending_pid: None,
+            pending_ipc: None,
+            pending_net: None,
+        }
+    }
+
+    pub fn uts(&self) -> Option<Arc<UtsNamespace>> {
+        self.uts.clone()
+    }
+
+    pub fn set_uts(&mut self, ns: Option<Arc<UtsNamespace>>) {
+        self.uts = ns;
+    }
+
+    pub fn ipc(&self) -> Option<Arc<IpcNamespace>> {
+        self.ipc.clone()
+    }
+
+    pub fn set_ipc(&mut self, ns: Option<Arc<IpcNamespace>>) {
+        self.ipc = ns;
+    }
+
+    pub fn pid(&self) -> Option<Arc<PidNamespace>> {
+        self.pid.clone()
+    }
+
+    pub fn set_pid(&mut self, ns: Option<Arc<PidNamespace>>) {
+        self.pid = ns;
+    }
+
+    pub fn cgroup(&self) -> Option<Arc<CgroupNamespace>> {
+        self.cgroup.clone()
+    }
+
+    pub fn set_cgroup(&mut self, ns: Option<Arc<CgroupNamespace>>) {
+        self.cgroup = ns;
+    }
+
+    pub fn time(&self) -> Option<Arc<TimeNamespace>> {
+        self.time.clone()
+    }
+
+    pub fn set_time(&mut self, ns: Option<Arc<TimeNamespace>>) {
+        self.time = ns;
+    }
+
+    pub fn take_pending_pid(&mut self) -> Option<Arc<PidNamespace>> {
+        self.pending_pid.take()
+    }
+
+    pub fn set_pending_pid(&mut self, ns: Option<Arc<PidNamespace>>) {
+        self.pending_pid = ns;
+    }
+
+    pub fn take_pending_ipc(&mut self) -> Option<Arc<IpcNamespace>> {
+        self.pending_ipc.take()
+    }
+
+    pub fn set_pending_ipc(&mut self, ns: Option<Arc<IpcNamespace>>) {
+        self.pending_ipc = ns;
+    }
+
+    pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
+        self.net.clone()
+    }
+
+    pub fn set_net(&mut self, ns: Option<Arc<crate::net::NetNamespace>>) {
+        self.net = ns;
+    }
+
+    pub fn take_pending_net(&mut self) -> Option<Arc<crate::net::NetNamespace>> {
+        self.pending_net.take()
+    }
+
+    pub fn set_pending_net(&mut self, ns: Option<Arc<crate::net::NetNamespace>>) {
+        self.pending_net = ns;
+    }
+}
+
+#[derive(Default)]
+pub struct LifecycleContext {
+    pending_exit: Option<ProcessState>,
+    in_syscall: bool,
+    vfork_done_set: core::sync::atomic::AtomicBool,
+    vfork_shared_vm: core::sync::atomic::AtomicBool,
+    did_memfd_exec: core::sync::atomic::AtomicBool,
+    child_subreaper: core::sync::atomic::AtomicBool,
+}
+
+impl LifecycleContext {
+    pub fn with_vfork_shared(share: bool) -> Self {
+        Self {
+            vfork_shared_vm: core::sync::atomic::AtomicBool::new(share),
+            ..Self::default()
+        }
+    }
+
+    pub fn pending_exit(&self) -> Option<&ProcessState> {
+        self.pending_exit.as_ref()
+    }
+
+    pub fn set_pending_exit(&mut self, st: ProcessState) {
+        self.pending_exit = Some(st);
+    }
+
+    pub fn take_pending_exit(&mut self) -> Option<ProcessState> {
+        self.pending_exit.take()
+    }
+
+    pub fn in_syscall(&self) -> bool {
+        self.in_syscall
+    }
+
+    pub fn set_in_syscall(&mut self, v: bool) {
+        self.in_syscall = v;
+    }
+
+    pub fn vfork_done_set(&self) -> bool {
+        self.vfork_done_set
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_vfork_done_set(&self, v: bool) {
+        self.vfork_done_set
+            .store(v, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn vfork_shared_vm(&self) -> bool {
+        self.vfork_shared_vm
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_vfork_shared_vm(&self, v: bool) {
+        self.vfork_shared_vm
+            .store(v, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn did_memfd_exec(&self) -> bool {
+        self.did_memfd_exec
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_did_memfd_exec(&self, v: bool) {
+        self.did_memfd_exec
+            .store(v, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn child_subreaper(&self) -> bool {
+        self.child_subreaper
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_child_subreaper(&self, v: bool) {
+        self.child_subreaper
+            .store(v, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub struct SignalContext {
+    pending: u64,
+    blocked: u64,
+    siginfo: [crate::signal::PendingSigInfo; NSIG],
+    altstack: crate::signal::AltStack,
+    itimer_real_interval_ns: u64,
+    itimer_real_deadline_ns: u64,
+}
+
+impl SignalContext {
+    pub fn new() -> Self {
+        Self {
+            pending: 0,
+            blocked: 0,
+            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
+            altstack: crate::signal::AltStack::disabled(),
+            itimer_real_interval_ns: 0,
+            itimer_real_deadline_ns: 0,
+        }
+    }
+
+    pub fn inherit(parent: &SignalContext) -> Self {
+        Self {
+            pending: 0,
+            blocked: parent.blocked,
+            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
+            altstack: parent.altstack,
+            itimer_real_interval_ns: parent.itimer_real_interval_ns,
+            itimer_real_deadline_ns: parent.itimer_real_deadline_ns,
+        }
+    }
+
+    pub fn pending(&self) -> u64 {
+        self.pending
+    }
+
+    pub fn blocked(&self) -> u64 {
+        self.blocked
+    }
+
+    pub fn deliverable(&self) -> u64 {
+        self.pending & !self.blocked
+    }
+
+    pub fn set_pending(&mut self, mask: u64) {
+        self.pending = mask;
+    }
+
+    pub fn set_blocked(&mut self, mask: u64) {
+        self.blocked = mask;
+    }
+
+    pub fn raise(&mut self, mask: u64) {
+        self.pending |= mask;
+    }
+
+    pub fn clear_pending(&mut self, mask: u64) {
+        self.pending &= !mask;
+    }
+
+    pub fn siginfo(&self, signal: usize) -> crate::signal::PendingSigInfo {
+        self.siginfo[signal]
+    }
+
+    pub fn set_siginfo(&mut self, signal: usize, info: crate::signal::PendingSigInfo) {
+        self.siginfo[signal] = info;
+    }
+
+    pub fn reset_siginfo(&mut self) {
+        self.siginfo = [crate::signal::PendingSigInfo::default(); NSIG];
+    }
+
+    pub fn altstack(&self) -> crate::signal::AltStack {
+        self.altstack
+    }
+
+    pub fn set_altstack(&mut self, alt: crate::signal::AltStack) {
+        self.altstack = alt;
+    }
+
+    pub fn replace_altstack(&mut self, alt: crate::signal::AltStack) -> crate::signal::AltStack {
+        core::mem::replace(&mut self.altstack, alt)
+    }
+
+    pub fn itimer_interval(&self) -> u64 {
+        self.itimer_real_interval_ns
+    }
+
+    pub fn itimer_deadline(&self) -> u64 {
+        self.itimer_real_deadline_ns
+    }
+
+    pub fn set_itimer_interval(&mut self, ns: u64) {
+        self.itimer_real_interval_ns = ns;
+    }
+
+    pub fn set_itimer_deadline(&mut self, ns: u64) {
+        self.itimer_real_deadline_ns = ns;
+    }
+}
+
+impl Default for SignalContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryContext {
+    maps_layout: MapsLayout,
+    fs_base: u64,
+    clear_child_tid: u64,
+    robust_list_head: u64,
+    rseq_addr: u64,
+    rseq_len: u32,
+    rseq_sig: u32,
+    minflt: u64,
+    majflt: u64,
+}
+
+impl MemoryContext {
+    pub fn inherit(parent: &MemoryContext) -> Self {
+        Self {
+            maps_layout: parent.maps_layout.clone(),
+            fs_base: parent.fs_base,
+            ..Self::default()
+        }
+    }
+
+    pub fn maps_layout(&self) -> &MapsLayout {
+        &self.maps_layout
+    }
+
+    pub fn set_maps_layout(&mut self, layout: MapsLayout) {
+        self.maps_layout = layout;
+    }
+
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
+    pub fn set_fs_base(&mut self, v: u64) {
+        self.fs_base = v;
+    }
+
+    pub fn clear_child_tid(&self) -> u64 {
+        self.clear_child_tid
+    }
+
+    pub fn set_clear_child_tid(&mut self, v: u64) {
+        self.clear_child_tid = v;
+    }
+
+    pub fn robust_list_head(&self) -> u64 {
+        self.robust_list_head
+    }
+
+    pub fn set_robust_list_head(&mut self, v: u64) {
+        self.robust_list_head = v;
+    }
+
+    pub fn rseq_addr(&self) -> u64 {
+        self.rseq_addr
+    }
+
+    pub fn set_rseq_addr(&mut self, v: u64) {
+        self.rseq_addr = v;
+    }
+
+    pub fn rseq_len(&self) -> u32 {
+        self.rseq_len
+    }
+
+    pub fn set_rseq_len(&mut self, v: u32) {
+        self.rseq_len = v;
+    }
+
+    pub fn rseq_sig(&self) -> u32 {
+        self.rseq_sig
+    }
+
+    pub fn set_rseq_sig(&mut self, v: u32) {
+        self.rseq_sig = v;
+    }
+
+    pub fn minflt(&self) -> u64 {
+        self.minflt
+    }
+
+    pub fn incr_minflt(&mut self) {
+        self.minflt = self.minflt.saturating_add(1);
+    }
+
+    pub fn majflt(&self) -> u64 {
+        self.majflt
+    }
+
+    pub fn incr_majflt(&mut self) {
+        self.majflt = self.majflt.saturating_add(1);
+    }
+}
+
+pub struct FileContext {
+    cwd: Option<CwdState>,
+    fs_root: Option<Arc<dyn Inode>>,
+    mount_table: Option<Arc<crate::vfs::MountTable>>,
+    umask: u16,
+}
+
+impl FileContext {
+    pub fn new() -> Self {
+        Self {
+            cwd: None,
+            fs_root: None,
+            mount_table: None,
+            umask: 0o022,
+        }
+    }
+
+    pub fn inherit(parent: &FileContext) -> Self {
+        Self {
+            cwd: parent.cwd.clone(),
+            fs_root: parent.fs_root.clone(),
+            mount_table: parent.mount_table.clone(),
+            umask: parent.umask,
+        }
+    }
+
+    pub fn cwd(&self) -> Option<&CwdState> {
+        self.cwd.as_ref()
+    }
+
+    pub fn set_cwd(&mut self, cwd: CwdState) {
+        self.cwd = Some(cwd);
+    }
+
+    pub fn fs_root(&self) -> Option<&Arc<dyn Inode>> {
+        self.fs_root.as_ref()
+    }
+
+    pub fn set_fs_root(&mut self, inode: Arc<dyn Inode>) {
+        self.fs_root = Some(inode);
+    }
+
+    pub fn mount_table(&self) -> &Option<Arc<crate::vfs::MountTable>> {
+        &self.mount_table
+    }
+
+    pub fn set_mount_table(&mut self, table: Option<Arc<crate::vfs::MountTable>>) {
+        self.mount_table = table;
+    }
+
+    pub fn umask(&self) -> u16 {
+        self.umask
+    }
+
+    pub fn set_umask(&mut self, v: u16) {
+        self.umask = v;
+    }
+}
+
+impl Default for FileContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct IdentityContext {
+    pgid: Pid,
+    sid: Pid,
+    cmdline: alloc::vec::Vec<u8>,
+    exe_path: alloc::vec::Vec<u8>,
+}
+
+impl IdentityContext {
+    pub fn new(pid: Pid) -> Self {
+        Self {
+            pgid: pid,
+            sid: pid,
+            cmdline: alloc::vec::Vec::new(),
+            exe_path: alloc::vec::Vec::new(),
+        }
+    }
+
+    pub fn inherit(parent: &IdentityContext) -> Self {
+        Self {
+            pgid: parent.pgid,
+            sid: parent.sid,
+            cmdline: parent.cmdline.clone(),
+            exe_path: parent.exe_path.clone(),
+        }
+    }
+
+    pub fn pgid(&self) -> Pid {
+        self.pgid
+    }
+
+    pub fn set_pgid(&mut self, pgid: Pid) {
+        self.pgid = pgid;
+    }
+
+    pub fn sid(&self) -> Pid {
+        self.sid
+    }
+
+    pub fn set_sid(&mut self, sid: Pid) {
+        self.sid = sid;
+    }
+
+    pub fn cmdline(&self) -> &[u8] {
+        &self.cmdline
+    }
+
+    pub fn set_cmdline(&mut self, cmdline: alloc::vec::Vec<u8>) {
+        self.cmdline = cmdline;
+    }
+
+    pub fn exe_path(&self) -> &[u8] {
+        &self.exe_path
+    }
+
+    pub fn set_exe_path(&mut self, exe_path: alloc::vec::Vec<u8>) {
+        self.exe_path = exe_path;
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -221,6 +972,7 @@ pub struct MmapState {
     pub last_end: u64,
     pub arena_lo: u64,
     pub arena_hi: u64,
+    pub generation: u64,
 }
 
 #[derive(Clone)]
@@ -284,6 +1036,7 @@ impl MmapState {
             last_end: base,
             arena_lo: base,
             arena_hi: base + MMAP_PER_PID_STRIDE,
+            generation: 0,
         }
     }
 
@@ -293,7 +1046,16 @@ impl MmapState {
             last_end: self.last_end,
             arena_lo: self.arena_lo,
             arena_hi: self.arena_hi,
+            generation: 0,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn find_gap(&self, length: u64) -> Option<u64> {
@@ -329,6 +1091,7 @@ impl MmapState {
             .unwrap_or_else(|p| p);
         self.last_end = vma.end;
         self.vmas.insert(pos, vma);
+        self.bump_generation();
     }
 
     pub fn find_containing(&self, addr: u64) -> Option<&Vma> {
@@ -460,6 +1223,7 @@ impl MmapState {
         }
         new_vmas.sort_by_key(|v| v.start);
         self.vmas = new_vmas;
+        self.bump_generation();
         removed
     }
 
@@ -530,6 +1294,7 @@ impl MmapState {
         }
         new_vmas.sort_by_key(|v| v.start);
         self.vmas = new_vmas;
+        self.bump_generation();
         gaps
     }
 }
@@ -663,14 +1428,16 @@ impl PidNamespace {
 }
 
 pub struct CgroupNamespace {
-    pub _placeholder: u8,
+    pub root: alloc::sync::Arc<crate::cgroup::Cgroup>,
 }
 impl CgroupNamespace {
     pub fn host() -> alloc::sync::Arc<Self> {
-        alloc::sync::Arc::new(Self { _placeholder: 0 })
+        alloc::sync::Arc::new(Self {
+            root: crate::cgroup::root(),
+        })
     }
-    pub fn fresh() -> alloc::sync::Arc<Self> {
-        alloc::sync::Arc::new(Self { _placeholder: 0 })
+    pub fn new(root: alloc::sync::Arc<crate::cgroup::Cgroup>) -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self { root })
     }
 }
 
@@ -992,6 +1759,7 @@ pub const NSIG: usize = 64;
 use crate::vfs::Inode;
 pub use crate::vfs::fd::FdTable;
 
+#[derive(Clone)]
 pub struct CwdState {
     pub inode: Arc<dyn Inode>,
     pub path: String,
@@ -1011,61 +1779,38 @@ pub enum ProcessKind {
 pub struct Process {
     pub pid: Pid,
     pub tgid: Pid,
-    pub pgid: Pid,
-    pub sid: Pid,
+    pub identity: IdentityContext,
     pub creds: alloc::sync::Arc<frame::sync::SpinIrq<Credentials>>,
     pub parent: Option<Pid>,
-    pub state: ProcessState,
+    pub state: crate::sched::SchedCell<ProcessState>,
     pub kind: ProcessKind,
     pub saved: SavedRegs,
     pub addr_space: Option<Arc<AddressSpace>>,
-    pub maps_layout: MapsLayout,
+    pub memory: MemoryContext,
     pub fds: Arc<FdTable>,
-    pub cwd: Option<CwdState>,
-    pub fs_root: Option<Arc<dyn Inode>>,
-    pub mount_table: Option<Arc<crate::vfs::MountTable>>,
-    pub cmdline: alloc::vec::Vec<u8>,
-    pub exe_path: alloc::vec::Vec<u8>,
-    pub uts_ns: Option<alloc::sync::Arc<UtsNamespace>>,
-    pub ipc_ns: Option<alloc::sync::Arc<IpcNamespace>>,
-    pub pid_ns: Option<alloc::sync::Arc<PidNamespace>>,
-    pub pending_pid_ns: Option<alloc::sync::Arc<PidNamespace>>,
-    pub pending_ipc_ns: Option<alloc::sync::Arc<IpcNamespace>>,
-    pub cgroup_ns: Option<alloc::sync::Arc<CgroupNamespace>>,
-    pub time_ns: Option<alloc::sync::Arc<TimeNamespace>>,
+    pub files: FileContext,
+    pub namespaces: NamespaceContext,
     pub cgroup: Option<alloc::sync::Arc<crate::cgroup::Cgroup>>,
     pub cgroup_charged_bytes: u64,
-    pub seccomp_filters: alloc::vec::Vec<alloc::sync::Arc<crate::bpf::BpfProgram>>,
-    pub no_new_privs: bool,
-    pub pending_signals: u64,
-    pub blocked_signals: u64,
+    pub security: SecurityContext,
+    pub signals: SignalContext,
     pub sigactions: Arc<frame::sync::SpinIrq<[SigAction; NSIG]>>,
-    pub task: Task,
+    pub task: crate::sched::SchedCell<Task>,
     pub first_launch: Option<FirstLaunch>,
     pub home_cpu: u32,
-    pub sched_owner: SchedOwner,
+    pub cpu_affinity: u64,
+    pub sched_owner: crate::sched::SchedCell<SchedOwner>,
+    pub parking_unsaved: bool,
     pub pml4_root: Option<PhysFrame<Size4KiB>>,
     pub children: alloc::vec::Vec<Pid>,
     pub child_exit: crate::wait::WaitQueue,
     pub exit_waiters: crate::wait::WaitQueue,
     pub signalfd_waiters: crate::wait::WaitQueue,
     pub vfork_done: crate::wait::WaitQueue,
-    pub vfork_done_set: core::sync::atomic::AtomicBool,
-    pub vfork_shared_vm: core::sync::atomic::AtomicBool,
-    pub did_memfd_exec: core::sync::atomic::AtomicBool,
-    pub child_subreaper: core::sync::atomic::AtomicBool,
+    pub lifecycle: LifecycleContext,
     pub pdeathsig: core::sync::atomic::AtomicU32,
-    pub dumpable: core::sync::atomic::AtomicU32,
-    pub keep_caps: core::sync::atomic::AtomicBool,
-    pub fs_base: u64,
-    pub clear_child_tid: u64,
-    pub robust_list_head: u64,
     pub name: [u8; 16],
     pub rlimits: [Option<Rlimit>; 16],
-    pub umask: u16,
-    pub rseq_addr: u64,
-    pub rseq_len: u32,
-    pub rseq_sig: u32,
     pub nice: i8,
     pub sched_class: SchedClass,
     pub vruntime: u64,
@@ -1080,26 +1825,10 @@ pub struct Process {
     pub total_cpu_ns: u64,
     pub total_stime_ns: u64,
     pub total_utime_ns: u64,
-    pub minflt: u64,
-    pub majflt: u64,
     pub cutime_ns: u64,
     pub cstime_ns: u64,
-    pub in_syscall: bool,
-    pub itimer_real_interval_ns: u64,
-    pub itimer_real_deadline_ns: u64,
     pub pi_orig_class: Option<SchedClass>,
-    pub siginfo: [crate::signal::PendingSigInfo; NSIG],
-    pub altstack: crate::signal::AltStack,
-    pub tracer_pid: Option<Pid>,
-    pub tracees: alloc::vec::Vec<Pid>,
-    pub trace_stop: Option<TraceStop>,
-    pub trace_options: u64,
-    pub trace_in_syscall_stop_mode: bool,
-    pub pending_event_stop: Option<TraceStop>,
-    pub trace_pending_inject: u32,
-    pub trace_wait_consumed: bool,
-    pub trace_event_msg: u64,
-    pub trace_saved_regs: Option<crate::ptrace::UserRegs>,
+    pub(crate) trace: TraceContext,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1135,37 +1864,24 @@ impl Process {
     }
 
     pub fn new(pid: Pid, entry: u64, user_stack_top: u64, _brk_start: u64) -> Self {
-        let task = Task::spawn(crate::sched::first_launch_trampoline);
+        let task = crate::sched::SchedCell::new(Task::spawn(crate::sched::first_launch_trampoline));
         Self {
             pid,
             tgid: pid,
-            pgid: pid,
-            sid: pid,
+            identity: IdentityContext::new(pid),
             parent: None,
-            state: ProcessState::Runnable,
+            state: crate::sched::SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::User,
             saved: SavedRegs::fresh(entry, user_stack_top),
             addr_space: None,
-            maps_layout: MapsLayout::default(),
+            memory: MemoryContext::default(),
             fds: Arc::new(FdTable::new()),
-            cwd: None,
-            fs_root: None,
-            mount_table: None,
-            cmdline: alloc::vec::Vec::new(),
-            exe_path: alloc::vec::Vec::new(),
-            uts_ns: None,
-            ipc_ns: None,
-            pid_ns: None,
-            pending_pid_ns: None,
-            pending_ipc_ns: None,
-            cgroup_ns: None,
-            time_ns: None,
+            files: FileContext::new(),
+            namespaces: NamespaceContext::new(),
             cgroup: None,
             cgroup_charged_bytes: 0,
-            seccomp_filters: alloc::vec::Vec::new(),
-            no_new_privs: false,
-            pending_signals: 0,
-            blocked_signals: 0,
+            security: SecurityContext::new(),
+            signals: SignalContext::new(),
             sigactions: Arc::new(frame::sync::SpinIrq::new(
                 [SigAction {
                     handler: 0,
@@ -1181,29 +1897,19 @@ impl Process {
                 user_stack_top,
             }),
             home_cpu: 0,
+            cpu_affinity: u64::MAX,
             pml4_root: None,
-            sched_owner: SchedOwner::None,
+            sched_owner: crate::sched::SchedCell::new(SchedOwner::None),
+            parking_unsaved: false,
             children: alloc::vec::Vec::new(),
             child_exit: crate::wait::WaitQueue::new(),
             exit_waiters: crate::wait::WaitQueue::new(),
             signalfd_waiters: crate::wait::WaitQueue::new(),
             vfork_done: crate::wait::WaitQueue::new(),
-            vfork_done_set: core::sync::atomic::AtomicBool::new(false),
-            vfork_shared_vm: core::sync::atomic::AtomicBool::new(false),
-            did_memfd_exec: core::sync::atomic::AtomicBool::new(false),
-            child_subreaper: core::sync::atomic::AtomicBool::new(false),
+            lifecycle: LifecycleContext::default(),
             pdeathsig: core::sync::atomic::AtomicU32::new(0),
-            dumpable: core::sync::atomic::AtomicU32::new(1),
-            keep_caps: core::sync::atomic::AtomicBool::new(false),
-            fs_base: 0,
-            clear_child_tid: 0,
-            robust_list_head: 0,
             name: [0u8; 16],
             rlimits: [None; 16],
-            umask: 0o022,
-            rseq_addr: 0,
-            rseq_len: 0,
-            rseq_sig: 0,
             nice: 0,
             sched_class: SchedClass::default_cfs(),
             vruntime: 0,
@@ -1219,60 +1925,31 @@ impl Process {
             total_cpu_ns: 0,
             total_stime_ns: 0,
             total_utime_ns: 0,
-            in_syscall: false,
-            minflt: 0,
-            majflt: 0,
             cutime_ns: 0,
             cstime_ns: 0,
-            itimer_real_interval_ns: 0,
-            itimer_real_deadline_ns: 0,
-            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
-            altstack: crate::signal::AltStack::disabled(),
-            tracer_pid: None,
-            tracees: alloc::vec::Vec::new(),
-            trace_stop: None,
-            trace_options: 0,
-            trace_in_syscall_stop_mode: false,
-            pending_event_stop: None,
-            trace_pending_inject: 0,
-            trace_wait_consumed: false,
-            trace_saved_regs: None,
-            trace_event_msg: 0,
+            trace: TraceContext::default(),
         }
     }
 
     pub fn new_kthread(pid: Pid, entry: extern "C" fn() -> !) -> Self {
-        let task = Task::spawn(entry);
+        let task = crate::sched::SchedCell::new(Task::spawn(entry));
         Self {
             pid,
             tgid: pid,
-            pgid: pid,
-            sid: pid,
+            identity: IdentityContext::new(pid),
             parent: None,
-            state: ProcessState::Runnable,
+            state: crate::sched::SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::Kernel,
             saved: SavedRegs::fresh(0, 0),
             addr_space: None,
-            maps_layout: MapsLayout::default(),
+            memory: MemoryContext::default(),
             fds: Arc::new(FdTable::new()),
-            cwd: None,
-            fs_root: None,
-            mount_table: None,
-            cmdline: alloc::vec::Vec::new(),
-            exe_path: alloc::vec::Vec::new(),
-            uts_ns: None,
-            ipc_ns: None,
-            pid_ns: None,
-            pending_pid_ns: None,
-            pending_ipc_ns: None,
-            cgroup_ns: None,
-            time_ns: None,
+            files: FileContext::new(),
+            namespaces: NamespaceContext::new(),
             cgroup: None,
             cgroup_charged_bytes: 0,
-            seccomp_filters: alloc::vec::Vec::new(),
-            no_new_privs: false,
-            pending_signals: 0,
-            blocked_signals: 0,
+            security: SecurityContext::new(),
+            signals: SignalContext::new(),
             sigactions: Arc::new(frame::sync::SpinIrq::new(
                 [SigAction {
                     handler: 0,
@@ -1285,29 +1962,19 @@ impl Process {
             task,
             first_launch: None,
             home_cpu: 0,
+            cpu_affinity: u64::MAX,
             pml4_root: None,
-            sched_owner: SchedOwner::None,
+            sched_owner: crate::sched::SchedCell::new(SchedOwner::None),
+            parking_unsaved: false,
             children: alloc::vec::Vec::new(),
             child_exit: crate::wait::WaitQueue::new(),
             exit_waiters: crate::wait::WaitQueue::new(),
             signalfd_waiters: crate::wait::WaitQueue::new(),
             vfork_done: crate::wait::WaitQueue::new(),
-            vfork_done_set: core::sync::atomic::AtomicBool::new(false),
-            vfork_shared_vm: core::sync::atomic::AtomicBool::new(false),
-            did_memfd_exec: core::sync::atomic::AtomicBool::new(false),
-            child_subreaper: core::sync::atomic::AtomicBool::new(false),
+            lifecycle: LifecycleContext::default(),
             pdeathsig: core::sync::atomic::AtomicU32::new(0),
-            dumpable: core::sync::atomic::AtomicU32::new(1),
-            keep_caps: core::sync::atomic::AtomicBool::new(false),
-            fs_base: 0,
-            clear_child_tid: 0,
-            robust_list_head: 0,
             name: [0u8; 16],
             rlimits: [None; 16],
-            umask: 0o022,
-            rseq_addr: 0,
-            rseq_len: 0,
-            rseq_sig: 0,
             nice: 0,
             sched_class: SchedClass::default_cfs(),
             vruntime: 0,
@@ -1323,25 +1990,9 @@ impl Process {
             total_cpu_ns: 0,
             total_stime_ns: 0,
             total_utime_ns: 0,
-            in_syscall: false,
-            minflt: 0,
-            majflt: 0,
             cutime_ns: 0,
             cstime_ns: 0,
-            itimer_real_interval_ns: 0,
-            itimer_real_deadline_ns: 0,
-            siginfo: [crate::signal::PendingSigInfo::default(); NSIG],
-            altstack: crate::signal::AltStack::disabled(),
-            tracer_pid: None,
-            tracees: alloc::vec::Vec::new(),
-            trace_stop: None,
-            trace_options: 0,
-            trace_in_syscall_stop_mode: false,
-            pending_event_stop: None,
-            trace_pending_inject: 0,
-            trace_wait_consumed: false,
-            trace_saved_regs: None,
-            trace_event_msg: 0,
+            trace: TraceContext::default(),
         }
     }
 }

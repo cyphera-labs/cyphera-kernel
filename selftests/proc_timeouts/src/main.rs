@@ -182,7 +182,13 @@ pub extern "C" fn _start() -> ! {
     }
     let now_ns = decode_total_ns(&rt);
     let its = encode_itimerspec(now_ns + 80_000_000);
-    if sys_timerfd_settime(tfd as u64, TFD_TIMER_ABSTIME, its.as_ptr(), core::ptr::null_mut()) != 0 {
+    if sys_timerfd_settime(
+        tfd as u64,
+        TFD_TIMER_ABSTIME,
+        its.as_ptr(),
+        core::ptr::null_mut(),
+    ) != 0
+    {
         log("timerfd_settime(ABSTIME) failed\n");
         sys_exit(1);
     }
@@ -198,8 +204,12 @@ pub extern "C" fn _start() -> ! {
     log("timerfd CLOCK_REALTIME ABSTIME fired OK\n");
 
     let its_past = encode_itimerspec(now_ns.saturating_sub(1_000_000_000));
-    if sys_timerfd_settime(tfd as u64, TFD_TIMER_ABSTIME, its_past.as_ptr(), core::ptr::null_mut())
-        != 0
+    if sys_timerfd_settime(
+        tfd as u64,
+        TFD_TIMER_ABSTIME,
+        its_past.as_ptr(),
+        core::ptr::null_mut(),
+    ) != 0
     {
         log("timerfd_settime(past) failed\n");
         sys_exit(1);

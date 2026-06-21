@@ -37,6 +37,7 @@ host_test = ["dep:frame_host"]
 prod = ["dep:frame", "dep:virtio", "dep:smoltcp", "dep:object"]
 
 [dependencies]
+cyphera-kapi = { path = "../kapi" }
 frame = { path = "../frame", optional = true }
 frame_host = { path = "../frame_host", optional = true }
 virtio = { path = "../drivers/virtio", optional = true }
@@ -48,13 +49,22 @@ object = { version = "0.36", default-features = false, features = ["read_core", 
 bitflags = { version = "2.12", default-features = false }
 # smoltcp — TCP/IP stack. Wraps our virtio-net driver via a Device
 # adapter. MIT/Apache, used under MIT. The heapless "medium-ip"
-# deps are pruned; we only need ethernet + v4.
+# deps are pruned; we carry ethernet + dual-stack v4/v6.
 smoltcp = { version = "0.11", default-features = false, optional = true, features = [
     "alloc",
     "medium-ethernet",
     "medium-ip",
     "proto-ipv4",
+    "proto-ipv6",
     "socket-udp",
     "socket-tcp",
     "socket-icmp",
 ] }
+
+# chacha20 (RustCrypto, RFC 8439) — HOST-ONLY test oracle, never shipped. The
+# host_test suite cross-checks our hand-rolled block() against this independent
+# ChaCha20 over randomized inputs. Target-gated to non-`none` targets so it is
+# never compiled into the bare-metal build (its SIMD backend does not build for
+# x86_64-unknown-none), and it stays a dev-dependency regardless. MIT/Apache.
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }

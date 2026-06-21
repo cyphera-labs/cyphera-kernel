@@ -44,9 +44,13 @@ impl Inode for ProcRoot {
             "filesystems" => Ok(Arc::new(StaticFile::new(FILESYSTEMS))),
             "cmdline" => Ok(Arc::new(StaticFile::new(KCMDLINE))),
             "sys" => Ok(Arc::new(SysDir)),
-            _ => match name.parse::<u32>() {
-                Ok(pid) if crate::sched::process_summary(Pid(pid)).is_some() => {
-                    Ok(Arc::new(PidDir { pid: Pid(pid) }))
+            _ => match name
+                .parse::<u32>()
+                .ok()
+                .and_then(crate::sched::caller_local_to_host)
+            {
+                Some(host) if crate::sched::process_summary(host).is_some() => {
+                    Ok(Arc::new(PidDir { pid: host }))
                 }
                 _ => Err(FsError::NotFound),
             },
@@ -76,11 +80,11 @@ impl Inode for ProcRoot {
                 inode_id: hash_str(name),
             });
         }
-        for pid in crate::sched::all_pids() {
+        for (host, local) in crate::sched::caller_visible_pids() {
             out.push(DirEntry {
-                name: format!("{}", pid.0),
+                name: format!("{}", local),
                 kind: InodeKind::Directory,
-                inode_id: 0x9000_0000_0000_0000 | pid.0 as u64,
+                inode_id: 0x9000_0000_0000_0000 | host.0 as u64,
             });
         }
         Ok(out)
@@ -106,6 +110,7 @@ impl Inode for PidDir {
             "fd" => Ok(Arc::new(PidFdDir { pid: self.pid })),
             "status" => Ok(Arc::new(PidStatusFile { pid: self.pid })),
             "comm" => Ok(Arc::new(PidCommFile { pid: self.pid })),
+            "cgroup" => Ok(Arc::new(PidCgroupFile { pid: self.pid })),
             "uid_map" => Ok(Arc::new(IdMapFile {
                 kind: IdMapKind::Uid,
                 pid: self.pid,
@@ -121,6 +126,7 @@ impl Inode for PidDir {
                 let s = alloc::string::String::from_utf8(target).map_err(|_| FsError::NotFound)?;
                 Ok(crate::fs::tmpfs::TmpfsInode::new_symlink(s))
             }
+            "ns" => Ok(Arc::new(PidNsDir { pid: self.pid })),
             _ => Err(FsError::NotFound),
         }
     }
@@ -157,6 +163,11 @@ impl Inode for PidDir {
                 kind: InodeKind::Regular,
                 inode_id: 0xa600_0000_0000_0000 | pid,
             },
+            DirEntry {
+                name: "cgroup".to_string(),
+                kind: InodeKind::Regular,
+                inode_id: 0xa800_0000_0000_0000 | pid,
+            },
         ];
         if crate::sched::process_exe(self.pid).is_some() {
             entries.push(DirEntry {
@@ -165,7 +176,53 @@ impl Inode for PidDir {
                 inode_id: 0xa400_0000_0000_0000 | pid,
             });
         }
+        entries.push(DirEntry {
+            name: "ns".to_string(),
+            kind: InodeKind::Directory,
+            inode_id: 0xa700_0000_0000_0000 | pid,
+        });
         Ok(entries)
+    }
+}
+
+struct PidNsDir {
+    pid: Pid,
+}
+
+const NS_ENTRIES: [(&str, u64); 6] = [
+    ("uts", 0x0400_0000),
+    ("ipc", 0x0800_0000),
+    ("pid", 0x2000_0000),
+    ("cgroup", 0x0200_0000),
+    ("time", 0x0000_0080),
+    ("net", 0x4000_0000),
+];
+
+impl Inode for PidNsDir {
+    fn kind(&self) -> InodeKind {
+        InodeKind::Directory
+    }
+    fn stat(&self) -> Stat {
+        dir_stat()
+    }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+        let ty = NS_ENTRIES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, t)| *t)
+            .ok_or(FsError::NotFound)?;
+        let handle = crate::sched::ns_handle_for(self.pid, ty).ok_or(FsError::NotFound)?;
+        Ok(crate::fdtypes::NamespaceFdInode::new(handle))
+    }
+    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+        Ok(NS_ENTRIES
+            .iter()
+            .map(|(n, _)| DirEntry {
+                name: n.to_string(),
+                kind: InodeKind::Regular,
+                inode_id: hash_str(n),
+            })
+            .collect())
     }
 }
 
@@ -513,8 +570,12 @@ impl Inode for SysKernelDir {
         match name {
             "cap_last_cap" => Ok(Arc::new(StaticFile::new("40\n"))),
             "ostype" => Ok(Arc::new(StaticFile::new("Linux\n"))),
-            "osrelease" => Ok(Arc::new(StaticFile::new("6.7.0-cyphera\n"))),
-            "version" => Ok(Arc::new(StaticFile::new("#1 SMP Cyphera 0.1.0\n"))),
+            "osrelease" => Ok(Arc::new(StaticFile::new("6.1.0\n"))),
+            "version" => Ok(Arc::new(StaticFile::new(concat!(
+                "#1 SMP Cyphera ",
+                env!("CARGO_PKG_VERSION"),
+                "\n"
+            )))),
             "hostname" => Ok(Arc::new(StaticFile::new("cyphera\n"))),
             "pid_max" => Ok(Arc::new(StaticFile::new("32768\n"))),
             "random" => Ok(Arc::new(SysKernelRandomDir)),
@@ -609,9 +670,7 @@ impl Inode for SysKernelRandomDir {
     }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         match name {
-            "boot_id" => Ok(Arc::new(StaticFile::new(
-                "00000000-0000-0000-0000-000000000001\n",
-            ))),
+            "boot_id" => Ok(Arc::new(UuidFile::boot_id())),
             "uuid" => Ok(Arc::new(UuidFile::new())),
             "entropy_avail" => Ok(Arc::new(StaticFile::new("4096\n"))),
             _ => Err(FsError::NotFound),
@@ -632,21 +691,39 @@ struct UuidFile {
 
 impl UuidFile {
     fn new() -> Self {
-        use core::fmt::Write;
-        let mut raw = [0u8; 16];
-        let _ = virtio::fill_random(&mut raw);
-        raw[6] = (raw[6] & 0x0f) | 0x40;
-        raw[8] = (raw[8] & 0x3f) | 0x80;
-        let mut body = alloc::string::String::with_capacity(37);
-        for (i, b) in raw.iter().enumerate() {
-            if matches!(i, 4 | 6 | 8 | 10) {
-                let _ = body.write_char('-');
-            }
-            let _ = write!(body, "{b:02x}");
+        Self {
+            body: random_uuid_string(),
         }
-        body.push('\n');
-        Self { body }
     }
+
+    fn boot_id() -> Self {
+        static BOOT_ID: frame::sync::SpinIrq<Option<alloc::string::String>> =
+            frame::sync::SpinIrq::new(None);
+        let mut g = BOOT_ID.lock();
+        if g.is_none() {
+            *g = Some(random_uuid_string());
+        }
+        Self {
+            body: g.as_ref().unwrap().clone(),
+        }
+    }
+}
+
+fn random_uuid_string() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut raw = [0u8; 16];
+    crate::random::fill(&mut raw);
+    raw[6] = (raw[6] & 0x0f) | 0x40;
+    raw[8] = (raw[8] & 0x3f) | 0x80;
+    let mut body = alloc::string::String::with_capacity(37);
+    for (i, b) in raw.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            let _ = body.write_char('-');
+        }
+        let _ = write!(body, "{b:02x}");
+    }
+    body.push('\n');
+    body
 }
 
 impl Inode for UuidFile {
@@ -706,7 +783,7 @@ struct IdMapFile {
 
 impl IdMapFile {
     fn target_ns(&self) -> Option<Arc<crate::process::UserNamespace>> {
-        crate::sched::with_target_process(self.pid, |p| p.creds.lock().user_ns.clone()).flatten()
+        crate::sched::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
     }
 }
 
@@ -816,7 +893,7 @@ struct SetgroupsFile {
 
 impl SetgroupsFile {
     fn target_ns(&self) -> Option<Arc<crate::process::UserNamespace>> {
-        crate::sched::with_target_process(self.pid, |p| p.creds.lock().user_ns.clone()).flatten()
+        crate::sched::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
     }
 }
 
@@ -903,12 +980,12 @@ impl Inode for PidStatFile {
         };
         let body = format!(
             "{} ({}) {} {} {} {} 0 0 0 {} 0 {} 0 {} {} {} {} {} {} {} 0 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 17 {} {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
-            s.pid.0,
+            crate::sched::host_to_caller_local(s.pid),
             comm_str,
             s.state_char,
-            s.parent_pid,
-            s.pgrp,
-            s.session,
+            crate::sched::host_to_caller_local(Pid(s.parent_pid)),
+            crate::sched::host_to_caller_local(Pid(s.pgrp)),
+            crate::sched::host_to_caller_local(Pid(s.session)),
             s.minflt,
             s.majflt,
             s.utime_clk,
@@ -952,6 +1029,7 @@ impl Inode for MagicFdLink {
 fn synthesize_fd_link_target(inode: &dyn Inode) -> alloc::string::String {
     match inode.kind() {
         InodeKind::Pipe => alloc::format!("pipe:[{}]", inode.inode_id()),
+        InodeKind::Socket => alloc::format!("socket:[{}]", inode.inode_id()),
         InodeKind::CharDevice => alloc::format!("anon_inode:[char:{}]", inode.inode_id()),
         InodeKind::Symlink => alloc::format!("anon_inode:[symlink:{}]", inode.inode_id()),
         InodeKind::Directory => alloc::format!("anon_inode:[dir:{}]", inode.inode_id()),
@@ -1009,7 +1087,10 @@ impl Inode for StatFile {
         }
         let _ = writeln!(body, "intr {}", crate::sched::intr_count());
         let _ = writeln!(body, "ctxt {}", crate::sched::ctxt_switches());
-        let _ = writeln!(body, "btime 0");
+        let btime = frame::cpu::clock::wall_clock_nanos()
+            .saturating_sub(frame::cpu::clock::nanos_since_boot())
+            / 1_000_000_000;
+        let _ = writeln!(body, "btime {btime}");
         let total = crate::sched::all_pids().len() as u64;
         let _ = writeln!(body, "processes {total}");
         let (running, blocked) = crate::sched::procs_running_blocked();
@@ -1029,7 +1110,25 @@ impl Inode for MountsFile {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let body = "rootfs / tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\ndevtmpfs /dev devtmpfs rw 0 0\nproc /proc proc rw 0 0\nsysfs /sys sysfs rw 0 0\n";
+        use core::fmt::Write;
+        let table = crate::sched::with_current_mount_table(|m| m.clone())
+            .flatten()
+            .unwrap_or_else(crate::vfs::global_mount_table);
+        let mut entries = table.collect_subtree("/");
+        for (mountpoint, _) in entries.iter_mut() {
+            if mountpoint.is_empty() {
+                mountpoint.push('/');
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut body = alloc::string::String::new();
+        for (mountpoint, entry) in entries.iter() {
+            let _ = writeln!(
+                body,
+                "{} {} {} rw 0 0",
+                entry.source, mountpoint, entry.fstype
+            );
+        }
         slice_into(body.as_bytes(), offset, buf)
     }
 }
@@ -1110,9 +1209,9 @@ impl Inode for PidStatusFile {
              voluntary_ctxt_switches:\t0\n\
              nonvoluntary_ctxt_switches:\t0\n",
             crate::sched::process_umask(self.pid),
-            s.pid.0,
-            s.pid.0,
-            s.parent_pid,
+            crate::sched::host_to_caller_local(s.pid),
+            crate::sched::host_to_caller_local(s.pid),
+            crate::sched::host_to_caller_local(Pid(s.parent_pid)),
             vis_ruid,
             vis_euid,
             vis_suid,
@@ -1129,6 +1228,37 @@ impl Inode for PidStatusFile {
             if no_new_privs { 1 } else { 0 },
             seccomp_mode,
         );
+        slice_into(body.as_bytes(), offset, buf)
+    }
+}
+
+struct PidCgroupFile {
+    pid: Pid,
+}
+
+impl Inode for PidCgroupFile {
+    fn kind(&self) -> InodeKind {
+        InodeKind::Regular
+    }
+    fn stat(&self) -> Stat {
+        Stat::fresh(InodeKind::Regular, 0, 0o444)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let target = crate::sched::process_cgroup(self.pid).ok_or(FsError::NotFound)?;
+        let root = crate::sched::current_cgroup_ns_root();
+        let target_path = target.path();
+        let root_path = root.path();
+        let rel = if root_path == "/" {
+            target_path
+        } else if target_path == root_path {
+            "/".to_string()
+        } else {
+            match target_path.strip_prefix(&root_path) {
+                Some(s) if s.starts_with('/') => s.to_string(),
+                _ => target_path,
+            }
+        };
+        let body = format!("0::{}\n", rel);
         slice_into(body.as_bytes(), offset, buf)
     }
 }
@@ -1153,7 +1283,11 @@ impl Inode for PidCommFile {
     }
 }
 
-const VERSION: &str = "Linux version 0.0.1 (rustc nightly) #1 SMP x86_64 Cyphera\n";
+const VERSION: &str = concat!(
+    "Linux version 6.1.0 (cyphera ",
+    env!("CARGO_PKG_VERSION"),
+    ") #1 SMP x86_64 Cyphera\n",
+);
 struct LoadavgFile;
 
 impl Inode for LoadavgFile {

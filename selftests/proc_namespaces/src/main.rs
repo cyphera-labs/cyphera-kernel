@@ -182,6 +182,46 @@ pub extern "C" fn _start() -> ! {
     }
     log("unshare(other CLONE_NEW* markers) accepts OK\n");
 
+    {
+        const O_RDONLY: u64 = 0;
+        const AT_FDCWD: i64 = -100;
+        const CLONE_NEWUTS_FLAG: u64 = 0x0400_0000;
+
+        let fd = sys_openat(AT_FDCWD, b"/proc/self/ns/uts\0".as_ptr(), O_RDONLY, 0);
+        if fd < 0 {
+            log("setns: open /proc/self/ns/uts failed\n");
+            sys_exit(1);
+        }
+        if sys_unshare(CLONE_NEWUTS_FLAG) != 0 {
+            log("setns: unshare(NEWUTS) failed\n");
+            sys_exit(1);
+        }
+        if sys_sethostname(b"setns-tmp".as_ptr(), 9) != 0 {
+            log("setns: sethostname in new ns failed\n");
+            sys_exit(1);
+        }
+        sys_uname(&mut u as *mut Utsname as u64);
+        if !nodename_is(&u, b"setns-tmp") {
+            log("setns: new-ns hostname not applied\n");
+            sys_exit(1);
+        }
+        if sys_setns(fd as u64, CLONE_NEWUTS_FLAG) != 0 {
+            log("setns: setns(uts) failed\n");
+            sys_exit(1);
+        }
+        sys_uname(&mut u as *mut Utsname as u64);
+        if !nodename_is(&u, b"host-a") {
+            log("setns: did not rejoin the original uts namespace\n");
+            sys_exit(1);
+        }
+        if sys_setns(fd as u64, 0x2000_0000) != -22 {
+            log("setns: type mismatch not rejected\n");
+            sys_exit(1);
+        }
+        sys_close(fd as u64);
+        log("setns(uts) rejoins the pinned namespace OK\n");
+    }
+
     log("all namespaces tests OK\n");
     sys_exit(0);
 }
@@ -242,6 +282,37 @@ fn sys_uname(buf: u64) -> i64 {
     let r: i64;
     unsafe {
         asm!("syscall", in("rax") 63u64, in("rdi") buf,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_openat(dirfd: i64, path: *const u8, flags: u64, mode: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 257u64, in("rdi") dirfd, in("rsi") path,
+        in("rdx") flags, in("r10") mode,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_setns(fd: u64, nstype: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 308u64, in("rdi") fd, in("rsi") nstype,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_close(fd: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 3u64, in("rdi") fd,
         lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
     }
     r

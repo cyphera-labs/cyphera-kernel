@@ -147,7 +147,14 @@ pub(super) fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i6
             let _ = inode.truncate(0);
         }
         let mount_guard = mount_tag.map(vfs::MountInUseGuard::new);
-        let file = Arc::new(OpenFile::new_with_mount(inode, open_flags, mount_guard));
+        let child_path = if dir_file.path.is_empty() {
+            String::new()
+        } else {
+            vfs::path::normalize(&dir_file.path, path)
+        };
+        let file = Arc::new(
+            OpenFile::new_with_mount(inode, open_flags, mount_guard).with_path(child_path),
+        );
         return match sched::with_current_fds(|t| t.install(file)) {
             Ok(fd) => fd as i64,
             Err(_) => EMFILE,
@@ -231,7 +238,8 @@ pub(super) fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i6
     }
 
     let mount_guard = mount_tag.map(vfs::MountInUseGuard::new);
-    let file = Arc::new(OpenFile::new_with_mount(inode, open_flags, mount_guard));
+    let file =
+        Arc::new(OpenFile::new_with_mount(inode, open_flags, mount_guard).with_path(normalized));
     match sched::with_current_fds(|t| t.install(file)) {
         Ok(fd) => fd as i64,
         Err(_) => EMFILE,
@@ -246,7 +254,14 @@ pub(crate) fn resolve_user_path(dirfd: i64, path: &str) -> Result<String, i64> {
         return Ok(vfs::path::normalize("/", path));
     }
     if dirfd != AT_FDCWD {
-        return Err(ENOSYS);
+        let dir = match sched::with_current_fds(|t| t.get(dirfd as i32)) {
+            Some(f) => f,
+            None => return Err(EBADF),
+        };
+        if dir.path.is_empty() {
+            return Err(ENOSYS);
+        }
+        return Ok(vfs::path::normalize(&dir.path, path));
     }
     let cwd_path = sched::with_current_cwd(|c| c.path.clone()).unwrap_or_else(|| String::from("/"));
     Ok(vfs::path::normalize(&cwd_path, path))
@@ -273,7 +288,7 @@ fn resolve_at_inode(dirfd: i64, path: &str) -> Result<Arc<dyn Inode>, i64> {
     vfs::path::resolve(&ctx, &start, path).map_err(|e| e.errno())
 }
 
-fn resolve_at_parent(
+pub(super) fn resolve_at_parent(
     dirfd: i64,
     path: &str,
 ) -> Result<(Arc<dyn Inode>, alloc::string::String), i64> {
@@ -412,6 +427,7 @@ fn pack_stat(st: &Stat) -> [u8; STAT_SIZE] {
     const S_IFCHR: u32 = 0o020_000;
     const S_IFLNK: u32 = 0o120_000;
     const S_IFIFO: u32 = 0o010_000;
+    const S_IFSOCK: u32 = 0o140_000;
 
     let kind_bits = match st.kind {
         InodeKind::Regular => S_IFREG,
@@ -419,6 +435,7 @@ fn pack_stat(st: &Stat) -> [u8; STAT_SIZE] {
         InodeKind::CharDevice => S_IFCHR,
         InodeKind::Symlink => S_IFLNK,
         InodeKind::Pipe => S_IFIFO,
+        InodeKind::Socket => S_IFSOCK,
     };
     let mode = kind_bits | st.mode as u32;
 
@@ -481,6 +498,7 @@ pub(super) fn sys_getdents(fd: u64, dirp: u64, count: u64) -> i64 {
             InodeKind::CharDevice => 2,
             InodeKind::Symlink => 10,
             InodeKind::Pipe => 1,
+            InodeKind::Socket => 12,
         };
         let p = written;
         out[p..p + 8].copy_from_slice(&entry.inode_id.to_le_bytes());
@@ -540,6 +558,7 @@ pub(super) fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> i64 {
             InodeKind::CharDevice => 2,
             InodeKind::Symlink => 10,
             InodeKind::Pipe => 1,
+            InodeKind::Socket => 12,
         };
 
         let p = written;
@@ -822,15 +841,18 @@ pub(super) fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
     }
 }
 
-const IOV_MAX: usize = 16;
+pub(super) const IOV_MAX: usize = 1024;
 
-fn read_iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, usize)>, i64> {
+pub(super) fn read_iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, usize)>, i64> {
     if count > IOV_MAX as u64 {
         return Err(EINVAL);
     }
-    let mut raw = [0u8; IOV_MAX * 16];
+    if count == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
     let bytes = (count as usize) * 16;
-    if frame::user::copy_from_user(iov, &mut raw[..bytes]).is_err() {
+    let mut raw = alloc::vec![0u8; bytes];
+    if frame::user::copy_from_user(iov, &mut raw).is_err() {
         return Err(EFAULT);
     }
     let mut out = alloc::vec::Vec::with_capacity(count as usize);
@@ -973,6 +995,9 @@ pub(super) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     };
     let is_tty = file.inode.kind() == InodeKind::CharDevice;
     let cmd = cmd & 0xFFFF_FFFF;
+    if file.inode.is_drm_card() && (cmd >> 8) & 0xff == 0x64 {
+        return crate::drm::ioctl(cmd as u32, arg);
+    }
     match cmd {
         TIOCGWINSZ => {
             if !is_tty {
@@ -1247,12 +1272,8 @@ fn do_dsp_ioctl(cmd: u64, arg: u64) -> i64 {
             }
             0
         }
-        SNDCTL_DSP_SETFRAGMENT => {
-            0
-        }
-        SNDCTL_DSP_SYNC | SNDCTL_DSP_RESET => {
-            0
-        }
+        SNDCTL_DSP_SETFRAGMENT => 0,
+        SNDCTL_DSP_SYNC | SNDCTL_DSP_RESET => 0,
         _ => ENOTTY,
     }
 }
@@ -1376,7 +1397,7 @@ pub(super) fn sys_mkdirat(dirfd: u64, pathname: u64, mode: u64) -> i64 {
     }
 }
 
-fn apply_create_owner(inode: &alloc::sync::Arc<dyn vfs::Inode>) {
+pub(super) fn apply_create_owner(inode: &alloc::sync::Arc<dyn vfs::Inode>) {
     let (euid, egid) = sched::with_current_creds(|c| (c.euid, c.egid));
     let _ = inode.set_owner(Some(euid), Some(egid));
 }
@@ -1563,30 +1584,12 @@ pub(super) fn sys_symlinkat(target: u64, newdirfd: u64, linkpath: u64) -> i64 {
 }
 
 pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _data: u64) -> i64 {
-    if !sched::with_current_creds(|c| c.capable_host(crate::process::CAP_SYS_ADMIN)) {
+    if !crate::security::capable(crate::process::CAP_SYS_ADMIN) {
         return EPERM;
     }
-    const MS_BIND: u64 = 0x1000;
-    const MS_REC: u64 = 0x4000;
-    const MS_REMOUNT: u64 = 0x0020;
-    const MS_SHARED: u64 = 1 << 20;
-    const MS_PRIVATE: u64 = 1 << 18;
-    const MS_SLAVE: u64 = 1 << 19;
-    const MS_UNBINDABLE: u64 = 1 << 17;
-    const MS_MOVE: u64 = 0x2000;
-    const PROPAGATION_MASK: u64 = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
+    use vfs::mount as m;
 
-    let new_mount_propagation = |_ctx: &vfs::path::Context, f: u64| -> vfs::MountPropagation {
-        if f & MS_UNBINDABLE != 0 {
-            vfs::MountPropagation::Unbindable
-        } else if f & MS_SHARED != 0 {
-            vfs::MountPropagation::Shared(vfs::PeerGroup::new_empty())
-        } else {
-            vfs::MountPropagation::Private
-        }
-    };
-
-    if (flags & PROPAGATION_MASK) != 0 && (flags & MS_BIND) == 0 {
+    if (flags & m::PROPAGATION_MASK) != 0 && (flags & m::MS_BIND) == 0 {
         let mut tbuf = [0u8; PATH_MAX];
         let tlen = match frame::user::copy_cstr_from_user(target, &mut tbuf) {
             Ok(n) => n,
@@ -1601,53 +1604,10 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Err(e) => return e,
         };
         let ctx = vfs::path::Context::current();
-        let mut targets: alloc::vec::Vec<String> = alloc::vec::Vec::new();
-        if (flags & MS_REC) != 0 {
-            for (suffix, _) in ctx.collect_subtree(&t_norm) {
-                let p = if suffix.is_empty() {
-                    String::from(&t_norm)
-                } else if t_norm == "/" {
-                    suffix
-                } else {
-                    let mut s = String::from(&t_norm);
-                    s.push_str(&suffix);
-                    s
-                };
-                targets.push(p);
-            }
-            if targets.is_empty() {
-                targets.push(String::from(&t_norm));
-            }
-        } else {
-            targets.push(String::from(&t_norm));
-        }
-        for p in targets.iter() {
-            let existing = match ctx.lookup_mount_full(p) {
-                Some(e) => e,
-                None => continue,
-            };
-            let new_prop = if flags & MS_UNBINDABLE != 0 {
-                vfs::MountPropagation::Unbindable
-            } else if flags & MS_PRIVATE != 0 {
-                vfs::MountPropagation::Private
-            } else if flags & MS_SHARED != 0 {
-                match existing.propagation.clone() {
-                    vfs::MountPropagation::Shared(g) => vfs::MountPropagation::Shared(g),
-                    _ => vfs::MountPropagation::Shared(vfs::PeerGroup::new_empty()),
-                }
-            } else if flags & MS_SLAVE != 0 {
-                match existing.propagation.clone() {
-                    vfs::MountPropagation::Shared(g) => vfs::MountPropagation::Slave(g),
-                    other => other,
-                }
-            } else {
-                existing.propagation.clone()
-            };
-            ctx.set_mount_propagation(p, new_prop);
-        }
-        return 0;
+        return m::change_propagation(&ctx, &t_norm, flags);
     }
-    if (flags & MS_MOVE) != 0 {
+
+    if (flags & m::MS_MOVE) != 0 {
         let mut sbuf = [0u8; PATH_MAX];
         let slen = match frame::user::copy_cstr_from_user(source, &mut sbuf) {
             Ok(n) => n,
@@ -1675,24 +1635,14 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Err(e) => return e,
         };
         let ctx = vfs::path::Context::current();
-        let entry = match ctx.lookup_mount_full(&s_norm) {
-            Some(e) => e,
-            None => return EINVAL,
-        };
-        let tgt_inode = match vfs::path::resolve(&ctx, &ctx.root, &t_norm) {
-            Ok(i) => i,
-            Err(e) => return e.errno(),
-        };
-        ctx.remove_mount(&s_norm);
-        ctx.install_mount(&t_norm, tgt_inode.inode_id(), entry.root, entry.propagation);
+        return m::move_mount(&ctx, &s_norm, &t_norm);
+    }
+
+    if (flags & m::MS_REMOUNT) != 0 {
         return 0;
     }
 
-    if (flags & MS_REMOUNT) != 0 {
-        return 0;
-    }
-
-    if (flags & MS_BIND) != 0 {
+    if (flags & m::MS_BIND) != 0 {
         let mut sbuf = [0u8; PATH_MAX];
         let slen = match frame::user::copy_cstr_from_user(source, &mut sbuf) {
             Ok(n) => n,
@@ -1720,56 +1670,7 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Err(e) => return e,
         };
         let ctx = vfs::path::Context::current();
-        if let Some(containing) = ctx.containing_mount(&s_norm) {
-            if containing.propagation.is_unbindable() {
-                return EINVAL;
-            }
-        }
-        let src_inode = match vfs::path::resolve(&ctx, &ctx.root, &s_norm) {
-            Ok(i) => i,
-            Err(e) => return e.errno(),
-        };
-        let tgt_inode = match vfs::path::resolve(&ctx, &ctx.root, &t_norm) {
-            Ok(i) => i,
-            Err(e) => return e.errno(),
-        };
-        let explicit = flags & PROPAGATION_MASK;
-        let bind_prop = if explicit != 0 {
-            new_mount_propagation(&ctx, flags)
-        } else {
-            let src_entry = ctx
-                .lookup_mount_full(&s_norm)
-                .or_else(|| ctx.containing_mount(&s_norm));
-            match src_entry.map(|e| e.propagation) {
-                Some(vfs::MountPropagation::Shared(g)) => vfs::MountPropagation::Shared(g),
-                Some(vfs::MountPropagation::Slave(g)) => vfs::MountPropagation::Slave(g),
-                _ => vfs::MountPropagation::Private,
-            }
-        };
-        ctx.install_mount_propagating(&t_norm, tgt_inode.inode_id(), src_inode, bind_prop);
-        if (flags & MS_REC) != 0 {
-            for (suffix, entry) in ctx.collect_subtree(&s_norm) {
-                if suffix.is_empty() {
-                    continue;
-                }
-                let mirror_path = if t_norm == "/" {
-                    suffix.clone()
-                } else {
-                    let mut s = String::from(t_norm.as_str());
-                    s.push_str(&suffix);
-                    s
-                };
-                if let Ok(mirror_target_inode) = vfs::path::resolve(&ctx, &ctx.root, &mirror_path) {
-                    ctx.install_mount_propagating(
-                        &mirror_path,
-                        mirror_target_inode.inode_id(),
-                        entry.root.clone(),
-                        entry.propagation,
-                    );
-                }
-            }
-        }
-        return 0;
+        return m::bind_mount(&ctx, &s_norm, &t_norm, flags);
     }
 
     let _ = source;
@@ -1807,6 +1708,19 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         Err(e) => return e,
     };
 
+    let mut src_buf = [0u8; PATH_MAX];
+    let src_owned = if source == 0 {
+        alloc::string::String::from("none")
+    } else {
+        match frame::user::copy_cstr_from_user(source, &mut src_buf) {
+            Ok(slen) => match core::str::from_utf8(&src_buf[..slen]) {
+                Ok(s) => alloc::string::String::from(s),
+                Err(_) => return EINVAL,
+            },
+            Err(_) => return ENAMETOOLONG,
+        }
+    };
+
     let ctx = vfs::path::Context::current();
     let target_inode = match vfs::path::resolve(&ctx, &ctx.root, &normalized) {
         Ok(i) => i,
@@ -1817,45 +1731,37 @@ pub(super) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
     }
 
     let new_root: Arc<dyn vfs::Inode> = if fst == "ext4" {
-        let mut src_buf = [0u8; PATH_MAX];
-        let slen = match frame::user::copy_cstr_from_user(source, &mut src_buf) {
-            Ok(n) => n,
-            Err(_) => return ENAMETOOLONG,
-        };
-        let src = match core::str::from_utf8(&src_buf[..slen]) {
-            Ok(s) => s,
-            Err(_) => return EINVAL,
-        };
-        if src != "/dev/vda" {
-            return -19; // ENODEV — no such block device
+        if src_owned != "/dev/vda" {
+            return -19;
         }
         let dev = match crate::fs::ext4::VirtioBlockDevice::new() {
             Some(d) => d,
-            None => return -19, // ENODEV — no virtio-blk disk attached
+            None => return -19,
         };
         match crate::fs::ext4::Ext4Fs::mount(dev) {
             Ok(fs) => fs.root_inode(),
-            Err(_) => return -22, // EINVAL — not a mountable ext4 image
+            Err(_) => return -22,
         }
     } else {
         crate::fs::tmpfs::TmpfsInode::new_dir()
     };
-    let new_prop = new_mount_propagation(&ctx, flags);
-    ctx.install_mount_propagating(&normalized, target_inode.inode_id(), new_root, new_prop);
+    m::install_new(
+        &ctx,
+        &normalized,
+        target_inode.inode_id(),
+        new_root,
+        flags,
+        &src_owned,
+        fst,
+    );
     0
 }
 
 pub(super) fn sys_umount2(target: u64, flags: u64) -> i64 {
-    if !sched::with_current_creds(|c| c.capable_host(crate::process::CAP_SYS_ADMIN)) {
+    if !crate::security::capable(crate::process::CAP_SYS_ADMIN) {
         return EPERM;
     }
-    const MNT_FORCE: u64 = 1;
-    const MNT_DETACH: u64 = 2;
-    const MNT_EXPIRE: u64 = 4;
-    const UMOUNT_NOFOLLOW: u64 = 8;
-    const EBUSY: i64 = -16;
-
-    if (flags & MNT_EXPIRE) != 0 {
+    if (flags & vfs::mount::MNT_EXPIRE) != 0 {
         return EINVAL;
     }
 
@@ -1874,26 +1780,7 @@ pub(super) fn sys_umount2(target: u64, flags: u64) -> i64 {
     };
 
     let ctx = vfs::path::Context::current();
-
-    if (flags & UMOUNT_NOFOLLOW) != 0 {
-        if let Err(e) = vfs::path::resolve_no_follow(&ctx, &ctx.root, &normalized) {
-            return e.errno();
-        }
-    }
-
-    let skip_busy_check = (flags & (MNT_DETACH | MNT_FORCE)) != 0;
-    if !skip_busy_check {
-        if let Some(entry) = ctx.lookup_mount_full(&normalized) {
-            if entry.in_use.refs() > 0 {
-                return EBUSY;
-            }
-        }
-    }
-
-    if ctx.remove_mount_propagating(&normalized).is_none() {
-        return -22;
-    }
-    0
+    vfs::mount::do_umount(&ctx, &normalized, flags)
 }
 
 pub(super) fn sys_readlinkat(dirfd: u64, pathname: u64, buf: u64, bufsize: u64) -> i64 {
@@ -2013,6 +1900,7 @@ pub(super) fn sys_statx(dirfd: u64, pathname: u64, flags: u64, _mask: u64, statx
         InodeKind::CharDevice => 0o020_000,
         InodeKind::Symlink => 0o120_000,
         InodeKind::Pipe => 0o010_000,
+        InodeKind::Socket => 0o140_000,
     };
     let mode = mode_bits | (st.mode & 0o7777);
     buf[28..30].copy_from_slice(&mode.to_le_bytes());
@@ -2048,11 +1936,7 @@ pub(super) fn sys_faccessat(dirfd: u64, pathname: u64, mode: u64, _flags: u64) -
         shadow.egid = c.rgid;
         shadow.can_access(st.uid, st.gid, st.mode, mode_req)
     });
-    if ok {
-        0
-    } else {
-        -13
-    }
+    if ok { 0 } else { -13 }
 }
 
 fn chmod_permitted(file_uid: u32) -> bool {
@@ -2319,8 +2203,7 @@ pub(super) fn sys_statfs(arg: u64, statfs_ptr: u64, fd: bool) -> i64 {
 }
 
 pub(super) fn sys_chroot(pathname: u64) -> i64 {
-    let allowed = sched::with_current_creds(|c| c.has_cap(crate::process::CAP_SYS_CHROOT));
-    if !allowed {
+    if !crate::security::has_cap(crate::process::CAP_SYS_CHROOT) {
         return -1;
     }
     let inode = match resolve_path(AT_FDCWD as u64, pathname, true) {
@@ -2727,11 +2610,22 @@ pub(super) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     } else {
         return EINVAL;
     };
+    let (old_source, old_fstype) = ctx
+        .lookup_mount_full("/")
+        .map(|e| (e.source, e.fstype))
+        .unwrap_or_else(|| {
+            (
+                alloc::string::String::from("rootfs"),
+                alloc::string::String::from("tmpfs"),
+            )
+        });
     ctx.install_mount(
         &install_path,
         put_old.inode_id(),
         old_root,
         vfs::MountPropagation::Private,
+        &old_source,
+        &old_fstype,
     );
     sched::set_current_fs_root(new_root.clone());
     sched::set_current_cwd(new_root, alloc::string::String::from("/"));
@@ -3044,9 +2938,7 @@ pub(super) fn sys_readahead(fd: u64, _offset: u64, _count: u64) -> i64 {
 }
 
 pub(super) fn sys_memfd_create(name_ptr: u64, flags: u64) -> i64 {
-    if sched::with_current_process(|p| p.did_memfd_exec.load(core::sync::atomic::Ordering::Acquire))
-        .unwrap_or(false)
-    {
+    if sched::with_current_lifecycle(|l| l.did_memfd_exec()).unwrap_or(false) {
         return -38;
     }
     const MFD_CLOEXEC: u64 = 0x0001;

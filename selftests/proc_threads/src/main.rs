@@ -153,8 +153,7 @@ pub extern "C" fn _start() -> ! {
 
     while futex_word.load(Ordering::SeqCst) == 0 {
         let r = sys_futex(futex_addr, FUTEX_WAIT, 0, 0, 0, 0);
-        if r < 0 && r != -11
-        {
+        if r < 0 && r != -11 {
             log("parent: futex_wait returned negative\n");
             sys_exit(1);
         }

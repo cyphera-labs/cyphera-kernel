@@ -729,10 +729,6 @@ impl Ext4Fs {
         }
 
         if sb.state & EXT4_VALID_FS == 0 {
-            // Either dirty without RECOVER (unclean unmount with
-            // no journal — risky but readable) or marked
-            // explicitly errored. We still mount; userspace can
-            // do its own consistency checks if it wants.
         }
 
         let block_size = sb.block_size;
@@ -1299,6 +1295,7 @@ fn ft_for_kind(kind: InodeKind) -> u8 {
         InodeKind::CharDevice => FT_CHR,
         InodeKind::Symlink => FT_LNK,
         InodeKind::Pipe => FT_FIFO,
+        InodeKind::Socket => FT_SOCK,
     }
 }
 
@@ -1493,6 +1490,7 @@ impl Inode for Ext4Inode {
             InodeKind::Symlink => I_MODE_LNK | 0o777,
             InodeKind::CharDevice => I_MODE_CHR | 0o666,
             InodeKind::Pipe => I_MODE_FIFO | 0o600,
+            InodeKind::Socket => 0xC000 | 0o600,
         };
         let now = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         let mut new_raw = RawInode {

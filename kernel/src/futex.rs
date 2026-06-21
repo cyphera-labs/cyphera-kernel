@@ -54,17 +54,17 @@ pub fn wait(vmspace_id: u64, uaddr: u64, expected: i32, deadline_nanos: Option<u
     if let Some(deadline) = deadline_nanos {
         crate::timeout::register(deadline, pid);
     }
-    let still_queued = || q.contains(pid);
-    crate::sched::park_self_at_guarded("futex_wait", &still_queued);
+    let still_queued = || {
+        q.contains(pid) && deadline_nanos.is_none_or(|d| frame::cpu::clock::nanos_since_boot() < d)
+    };
+    let outcome = crate::wait::wait_guarded("futex_wait", deadline_nanos, &still_queued);
     q.dequeue(pid);
-    let timed_out = deadline_nanos.is_some() && !crate::timeout::unregister(pid);
-    if crate::sched::current_signal_pending() {
-        return EINTR;
+    let _ = crate::timeout::unregister(pid);
+    match outcome {
+        crate::wait::WaitOutcome::Interrupted => EINTR,
+        crate::wait::WaitOutcome::TimedOut => ETIMEDOUT,
+        crate::wait::WaitOutcome::Woken => 0,
     }
-    if timed_out {
-        return ETIMEDOUT;
-    }
-    0
 }
 
 pub fn wait_bitset(
@@ -141,10 +141,7 @@ pub fn wake_bitset(vmspace_id: u64, uaddr: u64, n: u32, mask: u32) -> i64 {
     woken
 }
 
-pub fn wait_multi(
-    waiters: &[(u64, u64, u32, u32)],
-    deadline_nanos: Option<u64>,
-) -> i64 {
+pub fn wait_multi(waiters: &[(u64, u64, u32, u32)], deadline_nanos: Option<u64>) -> i64 {
     if waiters.is_empty() || waiters.len() > 128 {
         return EINVAL;
     }
@@ -186,20 +183,22 @@ pub fn wait_multi(
     if let Some(d) = deadline_nanos {
         crate::timeout::register(d, pid);
     }
-    let still_queued = || queues.iter().all(|q| q.contains(pid));
-    crate::sched::park_self_at_guarded("futex_wait", &still_queued);
+    let still_queued = || {
+        queues.iter().all(|q| q.contains(pid))
+            && deadline_nanos.is_none_or(|d| frame::cpu::clock::nanos_since_boot() < d)
+    };
+    let outcome = crate::wait::wait_guarded("futex_wait", deadline_nanos, &still_queued);
     for q in &queues {
         q.dequeue(pid);
     }
     if any_mask != 0 {
         BITSET_MASKS.lock().remove(&pid);
     }
-    let timed_out = deadline_nanos.is_some() && !crate::timeout::unregister(pid);
-    if crate::sched::current_signal_pending() {
-        return EINTR;
-    }
-    if timed_out {
-        return ETIMEDOUT;
+    let _ = crate::timeout::unregister(pid);
+    match outcome {
+        crate::wait::WaitOutcome::Interrupted => return EINTR,
+        crate::wait::WaitOutcome::TimedOut => return ETIMEDOUT,
+        crate::wait::WaitOutcome::Woken => {}
     }
     for (i, (_, uaddr, expected, _)) in waiters.iter().enumerate() {
         let mut buf = [0u8; 4];

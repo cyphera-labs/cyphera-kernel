@@ -6,9 +6,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+use frame::mm::{PhysFrame, Size4KiB, frame_alloc, read_from_frame, write_to_frame, zero_frame};
 use frame::sync::SpinIrq;
 
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, OpenFlags, Stat, TimeSpec};
+use crate::vfs::{DirEntry, FsError, Inode, InodeKind, OpenFlags, PollMask, Stat, TimeSpec};
 
 static NEXT_TMPFS_INODE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,11 +56,100 @@ pub struct TmpfsInode {
 }
 
 enum TmpfsData {
-    Regular(Vec<u8>),
+    Regular(PagedFile),
     Directory(BTreeMap<String, Arc<dyn Inode>>),
     Symlink(String),
     CharDevice,
     Fifo(alloc::collections::VecDeque<u8>),
+}
+
+const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
+
+struct PagedFile {
+    pages: BTreeMap<u64, PhysFrame<Size4KiB>>,
+    len: u64,
+}
+
+impl PagedFile {
+    fn new() -> Self {
+        PagedFile {
+            pages: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    fn read_into(&self, offset: u64, buf: &mut [u8]) -> usize {
+        if offset >= self.len {
+            return 0;
+        }
+        let n = ((self.len - offset) as usize).min(buf.len());
+        let mut done = 0;
+        while done < n {
+            let pos = offset + done as u64;
+            let in_page = (pos & 0xfff) as usize;
+            let take = (4096 - in_page).min(n - done);
+            match self.pages.get(&(pos >> 12)) {
+                Some(&frame) => read_from_frame(frame, in_page, &mut buf[done..done + take]),
+                None => buf[done..done + take].fill(0),
+            }
+            done += take;
+        }
+        n
+    }
+
+    fn write_from(&mut self, offset: u64, buf: &[u8]) -> usize {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let in_page = (pos & 0xfff) as usize;
+            let take = (4096 - in_page).min(buf.len() - done);
+            let frame = match self.pages.get(&(pos >> 12)) {
+                Some(&f) => f,
+                None => {
+                    let f = match frame_alloc::alloc_frame() {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    if in_page != 0 || take != 4096 {
+                        zero_frame(f);
+                    }
+                    self.pages.insert(pos >> 12, f);
+                    f
+                }
+            };
+            write_to_frame(frame, in_page, &buf[done..done + take]);
+            done += take;
+        }
+        let end = offset.saturating_add(done as u64);
+        if end > self.len {
+            self.len = end;
+        }
+        done
+    }
+
+    fn resize(&mut self, new_len: u64) {
+        if new_len < self.len {
+            let first_drop = new_len.div_ceil(4096);
+            for (_, frame) in self.pages.split_off(&first_drop) {
+                frame_alloc::free_frame(frame);
+            }
+            let tail = (new_len & 0xfff) as usize;
+            if tail != 0 {
+                if let Some(&frame) = self.pages.get(&(new_len >> 12)) {
+                    write_to_frame(frame, tail, &ZERO_PAGE[..4096 - tail]);
+                }
+            }
+        }
+        self.len = new_len;
+    }
+}
+
+impl Drop for PagedFile {
+    fn drop(&mut self) {
+        for (_, frame) in core::mem::take(&mut self.pages) {
+            frame_alloc::free_frame(frame);
+        }
+    }
 }
 
 const DEFAULT_FIFO_CAPACITY: usize = 4096;
@@ -71,6 +161,7 @@ fn default_mode_for(kind: InodeKind) -> u16 {
         InodeKind::CharDevice => 0o666,
         InodeKind::Symlink => 0o777,
         InodeKind::Pipe => 0o600,
+        InodeKind::Socket => 0o600,
     }
 }
 
@@ -98,7 +189,7 @@ impl TmpfsInode {
     }
 
     pub fn new_file() -> Arc<Self> {
-        Self::new_with(InodeKind::Regular, TmpfsData::Regular(Vec::new()))
+        Self::new_with(InodeKind::Regular, TmpfsData::Regular(PagedFile::new()))
     }
 
     pub fn new_symlink(target: String) -> Arc<Self> {
@@ -116,6 +207,10 @@ impl TmpfsInode {
             InodeKind::Pipe,
             TmpfsData::Fifo(alloc::collections::VecDeque::new()),
         )
+    }
+
+    pub fn new_socket() -> Arc<Self> {
+        Self::new_with(InodeKind::Socket, TmpfsData::CharDevice)
     }
 
     fn new_with(kind: InodeKind, data: TmpfsData) -> Arc<Self> {
@@ -198,7 +293,7 @@ impl Inode for TmpfsInode {
     fn stat(&self) -> Stat {
         let g = self.state.lock();
         let size = match &*g {
-            TmpfsData::Regular(v) => v.len() as u64,
+            TmpfsData::Regular(p) => p.len,
             TmpfsData::Directory(_) => 0,
             TmpfsData::Symlink(s) => s.len() as u64,
             TmpfsData::CharDevice => 0,
@@ -250,18 +345,39 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
+    fn poll(&self) -> PollMask {
+        let g = self.state.lock();
+        let TmpfsData::Fifo(ring) = &*g else {
+            return PollMask::IN | PollMask::OUT;
+        };
+        let buffered = !ring.is_empty();
+        let full = ring.len() >= DEFAULT_FIFO_CAPACITY;
+        drop(g);
+        let mut mask = PollMask::empty();
+        if buffered || self.fifo_writers.load(Ordering::Acquire) == 0 {
+            mask |= PollMask::IN;
+        }
+        if !full || self.fifo_readers.load(Ordering::Acquire) == 0 {
+            mask |= PollMask::OUT;
+        }
+        if self.fifo_writers.load(Ordering::Acquire) == 0 && !buffered {
+            mask |= PollMask::HUP;
+        }
+        mask
+    }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
+        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
+            f(&self.fifo_read_waiters);
+            f(&self.fifo_write_waiters);
+        }
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let g = self.state.lock();
         match &*g {
             TmpfsData::Regular(data) => {
-                if offset >= data.len() as u64 {
-                    drop(g);
-                    self.touch_atime();
-                    return Ok(0);
-                }
-                let start = offset as usize;
-                let n = (data.len() - start).min(buf.len());
-                buf[..n].copy_from_slice(&data[start..start + n]);
+                let n = data.read_into(offset, buf);
                 drop(g);
                 self.touch_atime();
                 Ok(n)
@@ -292,19 +408,18 @@ impl Inode for TmpfsInode {
         let mut g = self.state.lock();
         match &mut *g {
             TmpfsData::Regular(data) => {
-                let end = (offset as usize).saturating_add(buf.len());
-                if end > data.len() {
-                    data.resize(end, 0);
-                }
-                data[offset as usize..end].copy_from_slice(buf);
+                let written = data.write_from(offset, buf);
                 drop(g);
+                if written == 0 && !buf.is_empty() {
+                    return Err(FsError::NoSpace);
+                }
                 self.touch_mtime();
-                crate::fs::pagecache::write_through(self.id, offset, buf);
-                Ok(buf.len())
+                crate::fs::pagecache::write_through(self.id, offset, &buf[..written]);
+                Ok(written)
             }
             TmpfsData::Fifo(_) => {
                 drop(g);
-                self.fifo_write(buf)
+                self.fifo_write(buf, false)
             }
             TmpfsData::Symlink(_) | TmpfsData::Directory(_) | TmpfsData::CharDevice => {
                 Err(FsError::NotFile)
@@ -312,16 +427,28 @@ impl Inode for TmpfsInode {
         }
     }
 
+    fn write_at_with_flags(
+        &self,
+        offset: u64,
+        buf: &[u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
+        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
+            return self.fifo_write(buf, flags.contains(OpenFlags::NONBLOCK));
+        }
+        self.write_at(offset, buf)
+    }
+
     fn truncate(&self, len: u64) -> Result<(), FsError> {
         let mut g = self.state.lock();
         let TmpfsData::Regular(data) = &mut *g else {
             return Err(FsError::NotFile);
         };
-        let old_len = data.len();
-        data.resize(len as usize, 0);
+        let old_len = data.len;
+        data.resize(len);
         drop(g);
         self.touch_mtime();
-        if (len as usize) < old_len {
+        if len < old_len {
             crate::fs::pagecache::invalidate_range(self.id, len, u64::MAX);
         }
         Ok(())
@@ -344,6 +471,7 @@ impl Inode for TmpfsInode {
             }
             InodeKind::CharDevice => Self::new_char_device(0),
             InodeKind::Pipe => Self::new_fifo(),
+            InodeKind::Socket => Self::new_socket(),
         };
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
@@ -670,9 +798,11 @@ impl Inode for TmpfsInode {
                     self.fifo_open_read_waiters.dequeue(cur);
                     return;
                 }
-                crate::sched::park_on_pre_enqueued(&self.fifo_open_read_waiters);
+                let outcome = crate::wait::wait_guarded("fifo_open_read", None, &|| {
+                    self.fifo_open_read_waiters.contains(cur)
+                });
                 self.fifo_open_read_waiters.dequeue(cur);
-                if crate::sched::current_signal_pending() {
+                if outcome == crate::wait::WaitOutcome::Interrupted {
                     return;
                 }
             }
@@ -683,9 +813,11 @@ impl Inode for TmpfsInode {
                     self.fifo_open_write_waiters.dequeue(cur);
                     return;
                 }
-                crate::sched::park_on_pre_enqueued(&self.fifo_open_write_waiters);
+                let outcome = crate::wait::wait_guarded("fifo_open_write", None, &|| {
+                    self.fifo_open_write_waiters.contains(cur)
+                });
                 self.fifo_open_write_waiters.dequeue(cur);
-                if crate::sched::current_signal_pending() {
+                if outcome == crate::wait::WaitOutcome::Interrupted {
                     return;
                 }
             }
@@ -773,45 +905,43 @@ impl Inode for TmpfsInode {
 
 impl TmpfsInode {
     fn fifo_read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, FsError> {
-        loop {
-            {
-                let mut g = self.state.lock();
-                let TmpfsData::Fifo(ring) = &mut *g else {
-                    return Err(FsError::NotSupported);
-                };
-                if !ring.is_empty() {
-                    let n = buf.len().min(ring.len());
-                    for slot in &mut buf[..n] {
-                        *slot = ring.pop_front().unwrap();
-                    }
-                    drop(g);
-                    self.fifo_write_waiters.wake_all();
-                    self.touch_atime();
-                    return Ok(n);
+        use crate::vfs::blocking::IoAttempt;
+        crate::vfs::blocking::block_io("fifo_read", &self.fifo_read_waiters, nonblock, None, || {
+            let mut g = self.state.lock();
+            let TmpfsData::Fifo(ring) = &mut *g else {
+                return IoAttempt::Err(FsError::NotSupported);
+            };
+            if !ring.is_empty() {
+                let n = buf.len().min(ring.len());
+                for slot in &mut buf[..n] {
+                    *slot = ring.pop_front().unwrap();
                 }
-                if self.fifo_writers.load(Ordering::Acquire) == 0 {
-                    return Ok(0);
-                }
-                if nonblock {
-                    return Err(FsError::WouldBlock);
-                }
+                drop(g);
+                self.fifo_write_waiters.wake_all();
+                self.touch_atime();
+                IoAttempt::Ready(n)
+            } else if self.fifo_writers.load(Ordering::Acquire) == 0 {
+                IoAttempt::Ready(0)
+            } else {
+                IoAttempt::WouldBlock
             }
-            self.fifo_read_waiters.park();
-            if crate::sched::current_signal_pending() {
-                return Err(FsError::Interrupted);
-            }
-        }
+        })
     }
 
-    fn fifo_write(&self, buf: &[u8]) -> Result<usize, FsError> {
-        loop {
-            {
+    fn fifo_write(&self, buf: &[u8], nonblock: bool) -> Result<usize, FsError> {
+        use crate::vfs::blocking::IoAttempt;
+        crate::vfs::blocking::block_io(
+            "fifo_write",
+            &self.fifo_write_waiters,
+            nonblock,
+            None,
+            || {
                 let mut g = self.state.lock();
                 let TmpfsData::Fifo(ring) = &mut *g else {
-                    return Err(FsError::NotSupported);
+                    return IoAttempt::Err(FsError::NotSupported);
                 };
                 if self.fifo_readers.load(Ordering::Acquire) == 0 {
-                    return Err(FsError::BrokenPipe);
+                    return IoAttempt::Err(FsError::BrokenPipe);
                 }
                 let room = DEFAULT_FIFO_CAPACITY.saturating_sub(ring.len());
                 if room > 0 {
@@ -820,13 +950,11 @@ impl TmpfsInode {
                     drop(g);
                     self.fifo_read_waiters.wake_all();
                     self.touch_mtime();
-                    return Ok(n);
+                    IoAttempt::Ready(n)
+                } else {
+                    IoAttempt::WouldBlock
                 }
-            }
-            self.fifo_write_waiters.park();
-            if crate::sched::current_signal_pending() {
-                return Err(FsError::Interrupted);
-            }
-        }
+            },
+        )
     }
 }

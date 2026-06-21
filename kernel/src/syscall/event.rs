@@ -26,14 +26,15 @@ fn lookup_timerfd(fd: i32) -> Option<Arc<crate::fdtypes::TimerFdInode>> {
     TIMERFD_FD_INDEX.lock().get(&key).cloned()
 }
 
+pub(super) const FD_SETSIZE: usize = 1024;
+
 pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
-    const POLL_MAX: usize = 64;
-    if nfds as usize > POLL_MAX {
+    if nfds as usize > FD_SETSIZE {
         return EINVAL;
     }
     let total = (nfds as usize).saturating_mul(8);
-    let mut buf = [0u8; POLL_MAX * 8];
-    if total > 0 && frame::user::copy_from_user(fds, &mut buf[..total]).is_err() {
+    let mut buf = alloc::vec![0u8; total];
+    if total > 0 && frame::user::copy_from_user(fds, &mut buf).is_err() {
         return EFAULT;
     }
 
@@ -47,14 +48,22 @@ pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
         None
     };
 
+    let r = poll_wait(&mut buf, nfds as usize, deadline, timeout == 0);
+    if r >= 0 && total > 0 {
+        let _ = frame::user::copy_to_user(fds, &buf[..total]);
+    }
+    r
+}
+
+fn poll_wait(buf: &mut [u8], nfds: usize, deadline: Option<u64>, immediate: bool) -> i64 {
     let pid = sched::current_pid();
     if let Some(d) = deadline {
         crate::timeout::register(d, pid);
     }
 
     let mut files: alloc::vec::Vec<Option<alloc::sync::Arc<crate::vfs::OpenFile>>> =
-        alloc::vec::Vec::with_capacity(nfds as usize);
-    for i in 0..nfds as usize {
+        alloc::vec::Vec::with_capacity(nfds);
+    for i in 0..nfds {
         let off = i * 8;
         let fd = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         files.push(sched::with_current_fds(|t| t.get(fd)));
@@ -84,15 +93,12 @@ pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
             }
         }
 
-        let should_return = ready > 0 || timeout == 0;
+        let should_return = ready > 0 || immediate;
         if should_return {
             for file in files.iter().flatten() {
                 file.inode
                     .clone()
                     .for_each_wait_queue(&mut |wq| wq.dequeue(pid));
-            }
-            if total > 0 {
-                let _ = frame::user::copy_to_user(fds, &buf[..total]);
             }
             if deadline.is_some() {
                 let _ = crate::timeout::unregister(pid);
@@ -119,7 +125,7 @@ pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
             }
             true
         };
-        sched::park_self_at_guarded("poll/select", &still_queued);
+        let outcome = crate::wait::wait_guarded("poll/select", deadline, &still_queued);
 
         for file in files.iter().flatten() {
             file.inode
@@ -127,22 +133,273 @@ pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
                 .for_each_wait_queue(&mut |wq| wq.dequeue(pid));
         }
 
-        if sched::current_signal_pending() {
-            if deadline.is_some() {
-                let _ = crate::timeout::unregister(pid);
-            }
-            return EINTR;
-        }
-        if let Some(d) = deadline {
-            if frame::cpu::clock::nanos_since_boot() >= d {
-                if total > 0 {
-                    let _ = frame::user::copy_to_user(fds, &buf[..total]);
+        match outcome {
+            crate::wait::WaitOutcome::Interrupted => {
+                if deadline.is_some() {
+                    let _ = crate::timeout::unregister(pid);
                 }
-                let _ = crate::timeout::unregister(pid);
+                return EINTR;
+            }
+            crate::wait::WaitOutcome::TimedOut => {
+                if deadline.is_some() {
+                    let _ = crate::timeout::unregister(pid);
+                }
                 return 0;
             }
+            crate::wait::WaitOutcome::Woken => {}
         }
     }
+}
+
+const POLLIN: u16 = 0x1;
+const POLLPRI: u16 = 0x2;
+const POLLOUT: u16 = 0x4;
+const POLLERR: u16 = 0x8;
+const POLLHUP: u16 = 0x10;
+const POLLNVAL: u16 = 0x20;
+
+fn timeout_deadline(ptr: u64, is_timeval: bool) -> Result<(Option<u64>, bool), i64> {
+    if ptr == 0 {
+        return Ok((None, false));
+    }
+    let mut b = [0u8; 16];
+    if frame::user::copy_from_user(ptr, &mut b).is_err() {
+        return Err(EFAULT);
+    }
+    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap());
+    let frac = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    let frac_max: i64 = if is_timeval { 1_000_000 } else { 1_000_000_000 };
+    if sec < 0 || frac < 0 || frac >= frac_max {
+        return Err(EINVAL);
+    }
+    let ns = (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(if is_timeval {
+            (frac as u64).saturating_mul(1000)
+        } else {
+            frac as u64
+        });
+    if ns == 0 {
+        Ok((None, true))
+    } else {
+        Ok((
+            Some(frame::cpu::clock::nanos_since_boot().saturating_add(ns)),
+            false,
+        ))
+    }
+}
+
+fn do_select(
+    nfds: i64,
+    rptr: u64,
+    wptr: u64,
+    eptr: u64,
+    deadline: Option<u64>,
+    immediate: bool,
+) -> i64 {
+    if nfds < 0 || nfds as usize > FD_SETSIZE {
+        return EINVAL;
+    }
+    let n = nfds as usize;
+    let setbytes = n.div_ceil(8);
+    let (mut rin, mut win, mut ein) = (
+        [0u8; FD_SETSIZE / 8],
+        [0u8; FD_SETSIZE / 8],
+        [0u8; FD_SETSIZE / 8],
+    );
+    if rptr != 0 && frame::user::copy_from_user(rptr, &mut rin[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    if wptr != 0 && frame::user::copy_from_user(wptr, &mut win[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    if eptr != 0 && frame::user::copy_from_user(eptr, &mut ein[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    let isset = |set: &[u8; FD_SETSIZE / 8], fd: usize| (set[fd / 8] >> (fd % 8)) & 1 != 0;
+
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut fdmap: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    for fd in 0..n {
+        let mut events = 0u16;
+        if rptr != 0 && isset(&rin, fd) {
+            events |= POLLIN;
+        }
+        if wptr != 0 && isset(&win, fd) {
+            events |= POLLOUT;
+        }
+        if eptr != 0 && isset(&ein, fd) {
+            events |= POLLPRI;
+        }
+        if events == 0 {
+            continue;
+        }
+        buf.extend_from_slice(&(fd as i32).to_le_bytes());
+        buf.extend_from_slice(&events.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        fdmap.push(fd);
+    }
+    let count = fdmap.len();
+
+    let r = poll_wait(&mut buf, count, deadline, immediate);
+    if r < 0 {
+        return r;
+    }
+
+    let (mut rout, mut wout, mut eout) = (
+        [0u8; FD_SETSIZE / 8],
+        [0u8; FD_SETSIZE / 8],
+        [0u8; FD_SETSIZE / 8],
+    );
+    let mut nset = 0i64;
+    for (i, &fd) in fdmap.iter().enumerate() {
+        let off = i * 8;
+        let revents = u16::from_le_bytes(buf[off + 6..off + 8].try_into().unwrap());
+        if revents & POLLNVAL != 0 {
+            return EBADF;
+        }
+        if rptr != 0 && revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            rout[fd / 8] |= 1 << (fd % 8);
+            nset += 1;
+        }
+        if wptr != 0 && revents & (POLLOUT | POLLERR) != 0 {
+            wout[fd / 8] |= 1 << (fd % 8);
+            nset += 1;
+        }
+        if eptr != 0 && revents & POLLPRI != 0 {
+            eout[fd / 8] |= 1 << (fd % 8);
+            nset += 1;
+        }
+    }
+    if rptr != 0 && frame::user::copy_to_user(rptr, &rout[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    if wptr != 0 && frame::user::copy_to_user(wptr, &wout[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    if eptr != 0 && frame::user::copy_to_user(eptr, &eout[..setbytes]).is_err() {
+        return EFAULT;
+    }
+    nset
+}
+
+fn run_with_sigmask<F: FnOnce() -> i64>(mask: Option<u64>, f: F) -> i64 {
+    let saved = mask.map(|m| {
+        let prev = sched::with_signal(sched::current_pid(), |s| s.blocked()).unwrap_or(0);
+        sched::with_signal_mut(sched::current_pid(), |s| s.set_blocked(m));
+        prev
+    });
+    let r = f();
+    if let Some(prev) = saved {
+        sched::with_signal_mut(sched::current_pid(), |s| s.set_blocked(prev));
+    }
+    r
+}
+
+fn read_sigmask(ptr: u64, sigsetsize: u64) -> Result<Option<u64>, i64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    if sigsetsize != 8 {
+        return Err(EINVAL);
+    }
+    let mut b = [0u8; 8];
+    if frame::user::copy_from_user(ptr, &mut b).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(Some(u64::from_le_bytes(b)))
+}
+
+fn read_pselect_sigmask(arg: u64) -> Result<Option<u64>, i64> {
+    if arg == 0 {
+        return Ok(None);
+    }
+    let mut s = [0u8; 16];
+    if frame::user::copy_from_user(arg, &mut s).is_err() {
+        return Err(EFAULT);
+    }
+    let ss = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let ss_len = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    read_sigmask(ss, ss_len)
+}
+
+pub(super) fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, tv: u64) -> i64 {
+    let (deadline, immediate) = match timeout_deadline(tv, true) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let r = do_select(
+        nfds as i64,
+        readfds,
+        writefds,
+        exceptfds,
+        deadline,
+        immediate,
+    );
+    if tv != 0 && r >= 0 {
+        let remaining = deadline
+            .map(|d| d.saturating_sub(frame::cpu::clock::nanos_since_boot()))
+            .unwrap_or(0);
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&((remaining / 1_000_000_000) as i64).to_le_bytes());
+        b[8..16].copy_from_slice(&(((remaining % 1_000_000_000) / 1000) as i64).to_le_bytes());
+        let _ = frame::user::copy_to_user(tv, &b);
+    }
+    r
+}
+
+pub(super) fn sys_pselect6(
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
+    exceptfds: u64,
+    ts: u64,
+    sig: u64,
+) -> i64 {
+    let (deadline, immediate) = match timeout_deadline(ts, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let mask = match read_pselect_sigmask(sig) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    run_with_sigmask(mask, || {
+        do_select(
+            nfds as i64,
+            readfds,
+            writefds,
+            exceptfds,
+            deadline,
+            immediate,
+        )
+    })
+}
+
+pub(super) fn sys_ppoll(fds: u64, nfds: u64, ts: u64, sigmask: u64, sigsetsize: u64) -> i64 {
+    if nfds as usize > FD_SETSIZE {
+        return EINVAL;
+    }
+    let total = (nfds as usize).saturating_mul(8);
+    let mut buf = alloc::vec![0u8; total];
+    if total > 0 && frame::user::copy_from_user(fds, &mut buf).is_err() {
+        return EFAULT;
+    }
+    let (deadline, immediate) = match timeout_deadline(ts, false) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let mask = match read_sigmask(sigmask, sigsetsize) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let rc = run_with_sigmask(mask, || {
+        poll_wait(&mut buf, nfds as usize, deadline, immediate)
+    });
+    if rc >= 0 && total > 0 {
+        let _ = frame::user::copy_to_user(fds, &buf);
+    }
+    rc
 }
 
 const EPOLL_CTL_ADD: u64 = 1;
@@ -272,10 +529,9 @@ fn epoll_wait_common(
     let max = (maxevents as usize).min(64);
 
     let saved_mask = if let Some(new_mask) = sigmask_override {
-        let prev =
-            sched::with_target_process(sched::current_pid(), |p| p.blocked_signals).unwrap_or(0);
-        sched::with_target_process_mut(sched::current_pid(), |p| {
-            p.blocked_signals = new_mask;
+        let prev = sched::with_signal(sched::current_pid(), |s| s.blocked()).unwrap_or(0);
+        sched::with_signal_mut(sched::current_pid(), |s| {
+            s.set_blocked(new_mask);
         });
         Some(prev)
     } else {
@@ -289,8 +545,8 @@ fn epoll_wait_common(
     );
 
     if let Some(prev) = saved_mask {
-        sched::with_target_process_mut(sched::current_pid(), |p| {
-            p.blocked_signals = prev;
+        sched::with_signal_mut(sched::current_pid(), |s| {
+            s.set_blocked(prev);
         });
     }
 

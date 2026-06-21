@@ -72,6 +72,28 @@ impl WaitQueue {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Woken,
+    TimedOut,
+    Interrupted,
+}
+
+pub fn wait_guarded(
+    site: &'static str,
+    deadline_nanos: Option<u64>,
+    still_parked: &dyn Fn() -> bool,
+) -> WaitOutcome {
+    crate::sched::park_self_at_guarded(site, still_parked);
+    if crate::sched::current_signal_pending() {
+        return WaitOutcome::Interrupted;
+    }
+    if deadline_nanos.is_some_and(|d| frame::cpu::clock::nanos_since_boot() >= d) {
+        return WaitOutcome::TimedOut;
+    }
+    WaitOutcome::Woken
+}
+
 #[cfg(host_test)]
 #[cfg(test)]
 mod host_tests {

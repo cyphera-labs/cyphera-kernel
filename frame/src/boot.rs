@@ -308,8 +308,7 @@ pub unsafe fn parse_multiboot2_info(boot_info_ptr: u32) -> BootInfo {
                 let rsdp_addr = (cur + core::mem::size_of::<Mb2TagHeader>()) as u64;
                 rsdp_paddr = Some(rsdp_addr);
             }
-            _ => {
-            }
+            _ => {}
         }
 
         let advance = ((tag.size as usize) + 7) & !7;
@@ -361,16 +360,11 @@ pub fn modules() -> &'static [Module] {
 }
 
 pub fn module_bytes(module: &Module) -> Option<&'static [u8]> {
-    let end = module.paddr.checked_add(module.size)?;
-    if end > 0x4000_0000 {
-        return None;
-    }
-    let kva = module.paddr | KERNEL_VMA_OFFSET;
-    // SAFETY: `kva` is the high-half VA for a bootloader-reserved
-    // memory range; the boot stub mapped phys [0, 1 GiB) at this
-    // VA window. The kernel never writes to bootloader-reserved
-    // memory, so the bytes are immutable for the kernel's
-    // lifetime. The range fits within 1 GiB per the check above.
+    module.paddr.checked_add(module.size)?;
+    let kva = crate::mm::direct_map::phys_to_virt(module.paddr);
+    // SAFETY: the module's frames are RAM aliased by the direct map at
+    // phys_to_virt(paddr); the kernel never writes bootloader-reserved
+    // memory, so the bytes are immutable for the kernel's lifetime.
     let bytes = unsafe { core::slice::from_raw_parts(kva as *const u8, module.size as usize) };
     Some(bytes)
 }

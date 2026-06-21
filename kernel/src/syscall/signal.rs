@@ -196,9 +196,7 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
             Ok(o) => o,
             Err(_) => return EINVAL,
         },
-        None => {
-            sched::current_blocked()
-        }
+        None => sched::current_blocked(),
     };
     if oldset != 0 && frame::user::copy_to_user(oldset, &old.to_le_bytes()).is_err() {
         return EFAULT;
@@ -363,14 +361,15 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     }
     let new_mask = u64::from_ne_bytes(buf);
     let cur = sched::current_pid();
-    let old_mask = sched::with_target_process(cur, |p| p.blocked_signals).unwrap_or(0);
-    sched::with_target_process_mut(cur, |p| {
-        p.blocked_signals =
-            new_mask & !((1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP));
+    let old_mask = sched::with_signal(cur, |s| s.blocked()).unwrap_or(0);
+    sched::with_signal_mut(cur, |s| {
+        s.set_blocked(
+            new_mask & !((1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP)),
+        );
     });
     sched::sleep_until_signal();
-    sched::with_target_process_mut(cur, |p| {
-        p.blocked_signals = old_mask;
+    sched::with_signal_mut(cur, |s| {
+        s.set_blocked(old_mask);
     });
     EINTR
 }
@@ -382,8 +381,7 @@ pub(super) fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
     if set_ptr == 0 {
         return EFAULT;
     }
-    let pending: u64 =
-        sched::with_target_process(sched::current_pid(), |p| p.pending_signals).unwrap_or(0);
+    let pending: u64 = sched::with_signal(sched::current_pid(), |s| s.pending()).unwrap_or(0);
     if frame::user::copy_to_user(set_ptr, &pending.to_ne_bytes()).is_err() {
         return EFAULT;
     }
@@ -406,8 +404,7 @@ pub(super) fn sys_rt_sigqueueinfo(local_pid: u64, sig: u64, info_ptr: u64) -> i6
     si_code_bytes.copy_from_slice(&buf[8..12]);
     let si_code = i32::from_ne_bytes(si_code_bytes);
     if si_code >= 0 {
-        let euid =
-            sched::with_target_process(sched::current_pid(), |p| p.creds.lock().euid).unwrap_or(0);
+        let euid = sched::with_target_creds(sched::current_pid(), |c| c.euid).unwrap_or(0);
         if euid != 0 {
             return EPERM;
         }
@@ -438,7 +435,7 @@ pub(super) fn sys_rt_tgsigqueueinfo(
         Some(p) => p,
         None => return ESRCH,
     };
-    let actual_tgid = sched::with_target_process(target_tid, |p| p.tgid).map(|p| p.0);
+    let actual_tgid = sched::process_tgid(target_tid).map(|p| p.0);
     if actual_tgid != Some(target_tgid_host.0) {
         return ESRCH;
     }
@@ -450,8 +447,7 @@ pub(super) fn sys_rt_tgsigqueueinfo(
     si_code_bytes.copy_from_slice(&buf[8..12]);
     let si_code = i32::from_ne_bytes(si_code_bytes);
     if si_code >= 0 {
-        let euid =
-            sched::with_target_process(sched::current_pid(), |p| p.creds.lock().euid).unwrap_or(0);
+        let euid = sched::with_target_creds(sched::current_pid(), |c| c.euid).unwrap_or(0);
         if euid != 0 {
             return EPERM;
         }

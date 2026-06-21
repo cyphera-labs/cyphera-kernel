@@ -29,6 +29,11 @@ path = "tests/smoke/frame_api.rs"
 harness = false
 
 [[test]]
+name = "direct_map_alias"
+path = "tests/smoke/direct_map_alias.rs"
+harness = false
+
+[[test]]
 name = "ex_table"
 path = "tests/smoke/ex_table.rs"
 harness = false
@@ -189,6 +194,11 @@ path = "tests/subsystem/signal.rs"
 harness = false
 
 [[test]]
+name = "select"
+path = "tests/subsystem/select.rs"
+harness = false
+
+[[test]]
 name = "argv"
 path = "tests/subsystem/argv.rs"
 harness = false
@@ -246,6 +256,11 @@ harness = false
 [[test]]
 name = "sigsuspend_race"
 path = "tests/subsystem/sigsuspend_race.rs"
+harness = false
+
+[[test]]
+name = "epoll_signal_eintr"
+path = "tests/subsystem/epoll_signal_eintr.rs"
 harness = false
 
 [[test]]
@@ -389,6 +404,11 @@ path = "tests/subsystem/ptrace.rs"
 harness = false
 
 [[test]]
+name = "ptrace_attach_run"
+path = "tests/subsystem/ptrace_attach_run.rs"
+harness = false
+
+[[test]]
 name = "clock_settime"
 path = "tests/subsystem/clock_settime.rs"
 harness = false
@@ -404,6 +424,16 @@ path = "tests/subsystem/ptrace_tracefork.rs"
 harness = false
 
 [[test]]
+name = "ptrace_traceexec"
+path = "tests/subsystem/ptrace_traceexec.rs"
+harness = false
+
+[[test]]
+name = "ptrace_traceexit"
+path = "tests/subsystem/ptrace_traceexit.rs"
+harness = false
+
+[[test]]
 name = "process_vm"
 path = "tests/subsystem/process_vm.rs"
 harness = false
@@ -414,8 +444,83 @@ path = "tests/subsystem/ptrace_signal.rs"
 harness = false
 
 [[test]]
+name = "ptrace_orphan"
+path = "tests/subsystem/ptrace_orphan.rs"
+harness = false
+
+[[test]]
 name = "misc_quickwins"
 path = "tests/subsystem/misc_quickwins.rs"
+harness = false
+
+[[test]]
+name = "fault_race"
+path = "tests/subsystem/fault_race.rs"
+harness = false
+
+[[test]]
+name = "tmpfs_leak"
+path = "tests/subsystem/tmpfs_leak.rs"
+harness = false
+
+[[test]]
+name = "sched_churn"
+path = "tests/subsystem/sched_churn.rs"
+harness = false
+
+[[test]]
+name = "timer_storm"
+path = "tests/subsystem/timer_storm.rs"
+harness = false
+
+[[test]]
+name = "futex_timeout"
+path = "tests/subsystem/futex_timeout.rs"
+harness = false
+
+[[test]]
+name = "sigwait_kill"
+path = "tests/subsystem/sigwait_kill.rs"
+harness = false
+
+[[test]]
+name = "spin_kill"
+path = "tests/subsystem/spin_kill.rs"
+harness = false
+
+[[test]]
+name = "pidfd_reap"
+path = "tests/subsystem/pidfd_reap.rs"
+harness = false
+
+[[test]]
+name = "timerfd_race"
+path = "tests/subsystem/timerfd_race.rs"
+harness = false
+
+[[test]]
+name = "cow_fork"
+path = "tests/subsystem/cow_fork.rs"
+harness = false
+
+[[test]]
+name = "cow_futex"
+path = "tests/subsystem/cow_futex.rs"
+harness = false
+
+[[test]]
+name = "cow_ptrace"
+path = "tests/subsystem/cow_ptrace.rs"
+harness = false
+
+[[test]]
+name = "cow_threads"
+path = "tests/subsystem/cow_threads.rs"
+harness = false
+
+[[test]]
+name = "cow_forkrace"
+path = "tests/subsystem/cow_forkrace.rs"
 harness = false
 
 [dependencies]

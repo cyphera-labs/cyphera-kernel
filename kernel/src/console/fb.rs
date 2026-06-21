@@ -1,6 +1,14 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use frame::sync::SpinIrq;
 
 use super::font::{self, CELL_H, CELL_W};
+
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_suspended(on: bool) {
+    SUSPENDED.store(on, Ordering::Relaxed);
+}
 
 const FG: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
 const BG: [u8; 4] = [0x00, 0x00, 0x00, 0xff];
@@ -76,6 +84,9 @@ fn newline(s: &mut Screen) {
 }
 
 pub(crate) fn putbytes(bytes: &[u8]) {
+    if SUSPENDED.load(Ordering::Relaxed) {
+        return;
+    }
     let mut s = match SCREEN.try_lock() {
         Some(g) => g,
         None => return,

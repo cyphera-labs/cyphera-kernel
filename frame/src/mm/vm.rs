@@ -12,6 +12,12 @@ use crate::mm::frame_alloc;
 
 static PT_MUTATION_LOCK: crate::sync::SpinIrq<()> = crate::sync::SpinIrq::new(());
 
+const COW_PTE: PageTableFlags = PageTableFlags::BIT_9;
+
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_HUGE: u64 = 1 << 7;
+const PTE_FRAME_MASK: u64 = 0x000f_ffff_ffff_f000;
+
 bitflags! {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct Perms: u32 {
@@ -54,17 +60,12 @@ struct PhysFrameAdapter;
 // bogus frame when exhausted.
 unsafe impl FrameAllocator<Size4KiB> for PhysFrameAdapter {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        use crate::boot::KERNEL_VMA_OFFSET;
         let f = frame_alloc::alloc_frame()?;
-        let kva = f.start_address().as_u64() | KERNEL_VMA_OFFSET;
-        // SAFETY: `f` is a freshly-allocated 4 KiB frame. `frame_alloc`
-        // hands out frames in low DRAM (< 1 GiB), the range PDPT_high
-        // [510] maps writable/write-back, so ORing the kernel
-        // high-mapping offset yields a writable VA into that frame; the
-        // kernel-half PML4 entry is shared by every address space, so
-        // the VA resolves under any CR3. We own the frame exclusively
-        // (just allocated), and the full 4096-byte span is exactly one
-        // page, so the write stays in bounds.
+        let kva = crate::mm::direct_map::phys_to_virt(f.start_address().as_u64());
+        // SAFETY: `f` is a freshly-allocated 4 KiB frame; the direct map
+        // aliases all RAM writable at phys_to_virt(pa) and is shared into
+        // every address space, so this is a valid writable VA for the
+        // frame. We own it exclusively and the 4096-byte write stays in it.
         unsafe {
             core::ptr::write_bytes(kva as *mut u8, 0, 4096);
         }
@@ -102,9 +103,8 @@ impl VmSpace {
     }
 
     pub fn new() -> Result<Self, MapError> {
-        use crate::boot::KERNEL_VMA_OFFSET;
         let root = frame_alloc::alloc_frame().ok_or(MapError::OutOfFrames)?;
-        let kva = root.start_address().as_u64() | KERNEL_VMA_OFFSET;
+        let kva = crate::mm::direct_map::phys_to_virt(root.start_address().as_u64());
         // SAFETY: `root` was just allocated and is owned solely by this
         // VmSpace; its high-mapping VA is a writable single-page region
         // reachable under any CR3. Zeroing all 4096 bytes stays within
@@ -117,11 +117,11 @@ impl VmSpace {
     }
 
     pub fn new_user() -> Result<Self, MapError> {
-        use crate::boot::KERNEL_VMA_OFFSET;
         let new = Self::new()?;
-        let parent_kva = Cr3::read().0.start_address().as_u64() | KERNEL_VMA_OFFSET;
-        let child_kva = new.root.start_address().as_u64() | KERNEL_VMA_OFFSET;
-        // SAFETY: `parent_kva`/`child_kva` are the high-mapping VAs of
+        let parent_kva =
+            crate::mm::direct_map::phys_to_virt(Cr3::read().0.start_address().as_u64());
+        let child_kva = crate::mm::direct_map::phys_to_virt(new.root.start_address().as_u64());
+        // SAFETY: `parent_kva`/`child_kva` are the direct-map VAs of
         // two distinct 4 KiB PML4 frames (the child was just allocated
         // by `Self::new()`, so it does not alias the active root). `i`
         // ranges over 256..512, so each access is at byte offset
@@ -145,8 +145,7 @@ impl VmSpace {
     }
 
     fn mapper(&mut self) -> OffsetPageTable<'static> {
-        use crate::boot::KERNEL_VMA_OFFSET;
-        let pml4_va = self.root.start_address().as_u64() | KERNEL_VMA_OFFSET;
+        let pml4_va = crate::mm::direct_map::phys_to_virt(self.root.start_address().as_u64());
         // SAFETY: `pml4_va` is the kernel-high-mapping VA of this
         // VmSpace's root frame — a live, page-aligned `PageTable`
         // reachable under any CR3. `&mut self` excludes only other Rust
@@ -162,13 +161,11 @@ impl VmSpace {
         // convenience, sound only because each caller drops the mapper
         // before returning.
         let l4 = unsafe { &mut *(pml4_va as *mut PageTable) };
-        // SAFETY: `KERNEL_VMA_OFFSET` is the constant physical-to-virtual
-        // offset of the identity-style kernel high mapping, so every
-        // frame referenced from `l4` (intermediate tables and leaves in
-        // low DRAM) is reachable at `PA | offset` — exactly the
-        // contract `OffsetPageTable::new` requires of its physical
-        // memory offset.
-        unsafe { OffsetPageTable::new(l4, VirtAddr::new(KERNEL_VMA_OFFSET)) }
+        // SAFETY: the direct map aliases all physical RAM at a constant
+        // offset (DIRECT_MAP_BASE), so every page-table frame reachable
+        // from `l4` is addressable at `pa + DIRECT_MAP_BASE` — exactly the
+        // physical-memory-offset contract `OffsetPageTable::new` requires.
+        unsafe { OffsetPageTable::new(l4, VirtAddr::new(crate::mm::direct_map::DIRECT_MAP_BASE)) }
     }
 
     pub fn map(
@@ -266,6 +263,65 @@ impl VmSpace {
         Ok(())
     }
 
+    pub fn map_one_frame_fork_anon(
+        &mut self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame<Size4KiB>,
+        perms: Perms,
+        cow: bool,
+    ) -> Result<(), MapError> {
+        let mut alloc = PhysFrameAdapter;
+        let leaf_flags = if cow {
+            (perms.to_pte_flags() & !PageTableFlags::WRITABLE) | COW_PTE
+        } else {
+            perms.to_pte_flags()
+        };
+        let parent_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let _g = PT_MUTATION_LOCK.lock();
+        let mut mapper = self.mapper();
+        // SAFETY: `PT_MUTATION_LOCK` is held, serializing this single mapping
+        // against peer-CPU table mutation. `page` is caller-provided and
+        // `frame` is the parent's existing leaf frame being shared into the
+        // child; `alloc` zeroes any intermediate table. The frame stays owned
+        // by the refcount layer, not this mapping — the caller bumps its
+        // refcount.
+        unsafe {
+            mapper
+                .map_to_with_table_flags(page, frame, leaf_flags, parent_flags, &mut alloc)
+                .map_err(MapError::from_x86_64)?
+                .flush();
+        }
+        Ok(())
+    }
+
+    fn downgrade_leaf_to_cow_and_inc(
+        &mut self,
+        vaddr: u64,
+        parent_frame: PhysFrame<Size4KiB>,
+    ) -> bool {
+        let _g = PT_MUTATION_LOCK.lock();
+        match self.leaf_pte_ptr(vaddr) {
+            Some(p) => {
+                frame_alloc::frame_ref_inc(parent_frame);
+                // SAFETY: `p` is the direct-map VA of a present leaf PTE; the
+                // lock is held, so this is the only writer. Clearing WRITABLE
+                // and setting the COW bit downgrades the parent's own mapping
+                // to read-only-COW so its next write also copies. The refcount
+                // was bumped above, under this same lock, before the leaf
+                // becomes observably read-only-COW.
+                unsafe {
+                    let e = p.read();
+                    p.write((e & !PageTableFlags::WRITABLE.bits()) | COW_PTE.bits());
+                }
+                true
+            }
+            None => {
+                false
+            }
+        }
+    }
+
     pub fn map_anon(
         &mut self,
         vaddr: VirtAddr,
@@ -292,6 +348,7 @@ impl VmSpace {
                         break;
                     }
                 };
+                crate::mm::zero_frame(frame);
                 // SAFETY: `PT_MUTATION_LOCK` is held for the whole alloc
                 // loop, so no peer CPU mutates this tree concurrently.
                 // `page` is `start_page + i` (in bounds of the request)
@@ -357,6 +414,133 @@ impl VmSpace {
         }
     }
 
+    fn leaf_pte_ptr(&mut self, vaddr: u64) -> Option<*mut u64> {
+        let mut table_pa = self.root.start_address().as_u64();
+        let shifts = [39u32, 30, 21, 12];
+        for (level, shift) in shifts.iter().enumerate() {
+            let idx = ((vaddr >> shift) & 0x1ff) as usize;
+            let entry_va = crate::mm::direct_map::phys_to_virt(table_pa) + (idx as u64) * 8;
+            // SAFETY: `table_pa` starts at this VmSpace's root frame and is
+            // replaced each level by the next table's frame number masked out
+            // of a present (checked below) non-huge entry; every such frame is
+            // RAM aliased by the direct map. `idx < 512` keeps the aligned
+            // `u64` read inside the 512-entry table. The caller holds
+            // PT_MUTATION_LOCK, serializing this walk against peer-CPU
+            // structure mutation.
+            let entry = unsafe { (entry_va as *const u64).read() };
+            if entry & PTE_PRESENT == 0 {
+                return None;
+            }
+            if level == 3 {
+                return Some(entry_va as *mut u64);
+            }
+            if entry & PTE_HUGE != 0 {
+                return None;
+            }
+            table_pa = entry & PTE_FRAME_MASK;
+        }
+        None
+    }
+
+    pub fn page_is_cow(&mut self, vaddr: VirtAddr) -> bool {
+        let _g = PT_MUTATION_LOCK.lock();
+        match self.leaf_pte_ptr(vaddr.as_u64() & !0xfff) {
+            // SAFETY: `leaf_pte_ptr` returned the direct-map VA of a present
+            // leaf PTE; reading the `u64` is in-bounds and the lock is held.
+            Some(p) => (unsafe { p.read() } & COW_PTE.bits()) != 0,
+            None => false,
+        }
+    }
+
+    pub fn break_cow(
+        &mut self,
+        vaddr: VirtAddr,
+        new_perms: Option<Perms>,
+    ) -> Result<CowBreak, MapError> {
+        let page_va = vaddr.as_u64() & !0xfff;
+        let _g = PT_MUTATION_LOCK.lock();
+        let pte_ptr = match self.leaf_pte_ptr(page_va) {
+            Some(p) => p,
+            None => return Ok(CowBreak::NotPresent),
+        };
+        // SAFETY: `pte_ptr` is the direct-map VA of a present leaf PTE; under
+        // PT_MUTATION_LOCK (held here, the lock every PTE mutation takes) no
+        // one else mutates it, so this read observes the live entry.
+        let entry = unsafe { pte_ptr.read() };
+        if entry & PageTableFlags::WRITABLE.bits() != 0 {
+            return Ok(CowBreak::AlreadyWritable);
+        }
+        if entry & COW_PTE.bits() == 0 {
+            return Ok(CowBreak::NotCow);
+        }
+        let old_pa = entry & PTE_FRAME_MASK;
+        let old_frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(old_pa))
+            .map_err(|_| MapError::Misaligned)?;
+        if frame_alloc::frame_ref_count(old_frame) == 0 {
+            return Ok(CowBreak::NotCow);
+        }
+        let perm_bits = match new_perms {
+            Some(p) => p.to_pte_flags().bits() & !PTE_FRAME_MASK & !COW_PTE.bits(),
+            None => entry & !PTE_FRAME_MASK & !COW_PTE.bits(),
+        };
+        if frame_alloc::frame_ref_count(old_frame) == 1 {
+            let new_flags = perm_bits | PageTableFlags::WRITABLE.bits();
+            // SAFETY: same present leaf PTE read above; PT_MUTATION_LOCK is
+            // held, so this is the only writer. Keeping the frame and clearing
+            // COW + setting WRITABLE upgrades the sole owner's mapping in place.
+            unsafe {
+                pte_ptr.write((entry & PTE_FRAME_MASK) | new_flags);
+            }
+            crate::cpu::tlb::flush_local_page(page_va);
+            Ok(CowBreak::BrokenInPlace)
+        } else {
+            let new_frame = frame_alloc::alloc_frame().ok_or(MapError::OutOfFrames)?;
+            let new_pa = new_frame.start_address().as_u64();
+            // SAFETY: `old_pa`/`new_pa` are page-aligned 4 KiB frames, both
+            // aliased writable by the direct map; the copy is non-overlapping
+            // (`new_frame` was just freshly allocated, so it does not alias
+            // `old_frame`).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    crate::mm::direct_map::phys_to_virt(old_pa) as *const u8,
+                    crate::mm::direct_map::phys_to_virt(new_pa) as *mut u8,
+                    4096,
+                );
+            }
+            let new_flags = perm_bits | PageTableFlags::WRITABLE.bits();
+            // SAFETY: same present leaf PTE read above; PT_MUTATION_LOCK is
+            // held, so this is the only writer. Pointing the entry at `new_pa`
+            // (the just-copied private frame) with WRITABLE set and the COW bit
+            // cleared is remap-then-free: the mapping is swapped here; the
+            // caller frees `old_frame` only after its post-lock shootdown.
+            unsafe {
+                pte_ptr.write(new_pa | new_flags);
+            }
+            crate::cpu::tlb::flush_local_page(page_va);
+            Ok(CowBreak::Broken { old_frame })
+        }
+    }
+
+    fn restamp_perms(&mut self, page_va: u64, perms: Perms) -> bool {
+        let _g = PT_MUTATION_LOCK.lock();
+        let pte_ptr = match self.leaf_pte_ptr(page_va) {
+            Some(p) => p,
+            None => return false,
+        };
+        let perm_bits = perms.to_pte_flags().bits() & !PTE_FRAME_MASK & !COW_PTE.bits();
+        // SAFETY: `pte_ptr` is the direct-map VA of a present leaf PTE;
+        // PT_MUTATION_LOCK is held, so this is the only writer. The new entry
+        // reuses the existing frame number (read out verbatim) and keeps it
+        // writable, rewriting only the perm/NX flags and clearing COW.
+        unsafe {
+            let entry = pte_ptr.read();
+            let new_flags = perm_bits | PageTableFlags::WRITABLE.bits();
+            pte_ptr.write((entry & PTE_FRAME_MASK) | new_flags);
+        }
+        crate::cpu::tlb::flush_local_page(page_va);
+        true
+    }
+
     pub fn unmap(&mut self, region: MappedRegion) {
         let start = Page::<Size4KiB>::from_start_address(region.start).unwrap();
         let range = PageRange {
@@ -388,37 +572,89 @@ impl VmSpace {
         vaddr: VirtAddr,
         pages: usize,
         perms: Perms,
-    ) -> Result<usize, MapError> {
+    ) -> Result<ProtectResult, MapError> {
         let start = match Page::<Size4KiB>::from_start_address(vaddr) {
             Ok(p) => p,
             Err(_) => return Err(MapError::Misaligned),
         };
         let new_flags = perms.to_pte_flags();
+        let want_write = perms.contains(Perms::WRITE);
         let mut any_changed = false;
         let mut not_present = 0usize;
+        let mut cow_break_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
         {
             let _g = PT_MUTATION_LOCK.lock();
-            let mut mapper = self.mapper();
             for i in 0..pages {
                 let page = start + i as u64;
-                // SAFETY: `PT_MUTATION_LOCK` is held (above) for the whole
-                // loop, so no peer CPU mutates this table tree concurrently.
-                // `update_flags` only rewrites an existing leaf PTE — it
-                // doesn't re-map or free anything. Failure (page not present)
-                // is non-destructive; we count and continue.
-                let res = unsafe { mapper.update_flags(page, new_flags) };
-                if let Ok(flush) = res {
-                    flush.flush();
-                    any_changed = true;
-                } else {
-                    not_present += 1;
+                let page_va = page.start_address().as_u64();
+                let pte = match self.leaf_pte_ptr(page_va) {
+                    Some(p) => p,
+                    None => {
+                        not_present += 1;
+                        continue;
+                    }
+                };
+                // SAFETY: `pte` is the direct-map VA of a present leaf PTE;
+                // PT_MUTATION_LOCK is held, so this is the only writer. The new
+                // entry reuses the existing frame number (preserved verbatim
+                // out of the read), so this rewrites only the permission flags.
+                unsafe {
+                    let entry = pte.read();
+                    let is_cow = entry & COW_PTE.bits() != 0;
+                    if is_cow && want_write {
+                        if frame_alloc::frame_ref_count(PhysFrame::<Size4KiB>::containing_address(
+                            PhysAddr::new(entry & PTE_FRAME_MASK),
+                        )) > 1
+                        {
+                            let ro = (entry & !PTE_FRAME_MASK & !PageTableFlags::WRITABLE.bits())
+                                | COW_PTE.bits();
+                            pte.write((entry & PTE_FRAME_MASK) | ro);
+                            cow_break_pages.push(page_va);
+                        } else {
+                            let flags = new_flags.bits() & !COW_PTE.bits();
+                            pte.write((entry & PTE_FRAME_MASK) | flags);
+                        }
+                    } else {
+                        let mut flags = new_flags.bits();
+                        if is_cow {
+                            flags = (flags & !PageTableFlags::WRITABLE.bits()) | COW_PTE.bits();
+                        }
+                        pte.write((entry & PTE_FRAME_MASK) | flags);
+                    }
                 }
+                any_changed = true;
             }
         }
         if any_changed {
             crate::cpu::tlb::shootdown_all();
         }
-        Ok(not_present)
+        let mut copied = 0usize;
+        let mut any_broken = false;
+        let mut freed: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
+        for page_va in cow_break_pages {
+            match self.break_cow(VirtAddr::new(page_va), Some(perms)) {
+                Ok(CowBreak::Broken { old_frame }) => {
+                    copied += 1;
+                    any_broken = true;
+                    freed.push(old_frame);
+                }
+                Ok(CowBreak::BrokenInPlace) => any_broken = true,
+                Ok(CowBreak::AlreadyWritable) => {
+                    any_broken |= self.restamp_perms(page_va, perms);
+                }
+                _ => {}
+            }
+        }
+        if any_broken {
+            crate::cpu::tlb::shootdown_all();
+            for f in freed {
+                frame_alloc::free_frame(f);
+            }
+        }
+        Ok(ProtectResult {
+            not_present,
+            copied,
+        })
     }
 
     pub fn unmap_keep_frame(&mut self, vaddr: VirtAddr) {
@@ -442,9 +678,23 @@ impl VmSpace {
     }
 
     pub fn unmap_pages(&mut self, vaddr: VirtAddr, pages: usize) {
+        let freed = self.unmap_pages_collect(vaddr, pages);
+        if !freed.is_empty() {
+            crate::cpu::tlb::shootdown_all();
+            for frame in freed {
+                frame_alloc::free_frame(frame);
+            }
+        }
+    }
+
+    pub fn unmap_pages_collect(
+        &mut self,
+        vaddr: VirtAddr,
+        pages: usize,
+    ) -> alloc::vec::Vec<PhysFrame<Size4KiB>> {
         let start = match Page::<Size4KiB>::from_start_address(vaddr) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => return alloc::vec::Vec::new(),
         };
         let mut freed: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
         {
@@ -458,12 +708,7 @@ impl VmSpace {
                 }
             }
         }
-        if !freed.is_empty() {
-            crate::cpu::tlb::shootdown_all();
-            for frame in freed {
-                frame_alloc::free_frame(frame);
-            }
-        }
+        freed
     }
 
     /// # Safety
@@ -504,38 +749,38 @@ impl VmSpace {
         Cr3::read().0 == self.root
     }
 
-    pub fn clone_user_half(&mut self) -> Result<VmSpace, MapError> {
-        self.clone_user_half_with_shared(&[]).map(|(vm, _)| vm)
-    }
-
-    pub fn clone_user_half_with_shared(
+    pub fn clone_user_half_phase1(
         &mut self,
         shared_ranges: &[(u64, u64)],
-    ) -> Result<(VmSpace, alloc::vec::Vec<u64>), MapError> {
-        use crate::boot::KERNEL_VMA_OFFSET;
+    ) -> Result<CowClone, MapError> {
         const PRESENT: u64 = 1 << 0;
         const WRITABLE: u64 = 1 << 1;
         const USER: u64 = 1 << 2;
         const HUGE: u64 = 1 << 7;
         const NX: u64 = 1 << 63;
         const FRAME_MASK: u64 = 0x000f_ffff_ffff_f000;
+        let cow_bit = COW_PTE.bits();
 
         let mut child = Self::new_user()?;
         let mut shared_vaddrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut cow_vaddrs: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, Perms)> =
+            alloc::vec::Vec::new();
+        let mut child_installed: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, bool)> =
+            alloc::vec::Vec::new();
 
         let parent_pml4_pa = self.root.start_address().as_u64();
-        // SAFETY: page-table frames live in low DRAM (< 1 GiB); the
-        // kernel high mapping covers that range, and the kernel-half
-        // PML4 entry is shared across every per-process VmSpace, so
-        // the high VA is reachable regardless of CR3.
-        let parent_pml4 = (parent_pml4_pa | KERNEL_VMA_OFFSET) as *const u64;
+        // SAFETY: page-table frames live in RAM, which the direct map
+        // aliases at phys_to_virt(pa); the kernel-half PML4 entry is
+        // shared across every per-process VmSpace, so the VA is
+        // reachable regardless of CR3.
+        let parent_pml4 = (crate::mm::direct_map::phys_to_virt(parent_pml4_pa)) as *const u64;
 
         let mut walk_err: Option<MapError> = None;
         'walk: for i4 in 0usize..256 {
-            // SAFETY: `parent_pml4` points at the parent's PML4 frame via
-            // the kernel high mapping; `i4 < 256` keeps the offset inside
-            // the 512-entry table, and each slot is an aligned `u64`, so
-            // this read is in-bounds and well-aligned.
+            // SAFETY: `parent_pml4` is the parent PML4 frame's direct-map
+            // alias; `i4 < 256` keeps the offset inside the 512-entry table,
+            // and each slot is an aligned `u64`, so this read is in-bounds
+            // and well-aligned.
             //
             // CONCURRENCY (NOT fully serialized — see flag): this raw
             // walk does NOT hold `PT_MUTATION_LOCK`. The fork caller
@@ -543,19 +788,19 @@ impl VmSpace {
             // syscalls (mmap/munmap/mprotect on a CLONE_VM peer) take
             // only `PT_MUTATION_LOCK`, a disjoint lock — so a peer CPU
             // sharing this root can mutate these entries (and free the
-            // intermediate frames whose `pa | KERNEL_VMA_OFFSET` aliases
-            // the l3/l2/l1 reads below) mid-walk. Soundness today rests
+            // intermediate frames whose direct-map alias backs the
+            // l3/l2/l1 reads below) mid-walk. Soundness today rests
             // on no CLONE_VM-peer mmap/munmap running concurrently with
             // this fork; that is not enforced here.
             let l4_e = unsafe { parent_pml4.add(i4).read() };
             if l4_e & PRESENT == 0 {
                 continue;
             }
-            let l3 = ((l4_e & FRAME_MASK) | KERNEL_VMA_OFFSET) as *const u64;
+            let l3 = (crate::mm::direct_map::phys_to_virt(l4_e & FRAME_MASK)) as *const u64;
             for i3 in 0usize..512 {
-                // SAFETY: `l3` is the high-mapping VA of the PDPT frame
+                // SAFETY: `l3` is the direct-map VA of the PDPT frame
                 // named by the present (checked above) L4 entry; the
-                // frame lives in low DRAM covered by the kernel high
+                // frame lives in RAM aliased by the direct
                 // mapping. `i3 < 512` keeps the aligned `u64` read inside
                 // the table. (Same unserialized-peer-mutation caveat as
                 // the L4 read above: a concurrent peer munmap could free
@@ -564,21 +809,21 @@ impl VmSpace {
                 if l3_e & PRESENT == 0 || l3_e & HUGE != 0 {
                     continue;
                 }
-                let l2 = ((l3_e & FRAME_MASK) | KERNEL_VMA_OFFSET) as *const u64;
+                let l2 = (crate::mm::direct_map::phys_to_virt(l3_e & FRAME_MASK)) as *const u64;
                 for i2 in 0usize..512 {
-                    // SAFETY: `l2` is the high-mapping VA of the PD frame
+                    // SAFETY: `l2` is the direct-map VA of the PD frame
                     // named by the present, non-huge (checked above) L3
-                    // entry, in kernel-mapped low DRAM. `i2 < 512` keeps
+                    // entry, in RAM (direct-mapped). `i2 < 512` keeps
                     // the aligned `u64` read in bounds.
                     let l2_e = unsafe { l2.add(i2).read() };
                     if l2_e & PRESENT == 0 || l2_e & HUGE != 0 {
                         continue;
                     }
-                    let l1 = ((l2_e & FRAME_MASK) | KERNEL_VMA_OFFSET) as *const u64;
+                    let l1 = (crate::mm::direct_map::phys_to_virt(l2_e & FRAME_MASK)) as *const u64;
                     for i1 in 0usize..512 {
-                        // SAFETY: `l1` is the high-mapping VA of the PT
+                        // SAFETY: `l1` is the direct-map VA of the PT
                         // frame named by the present, non-huge (checked
-                        // above) L2 entry, in kernel-mapped low DRAM.
+                        // above) L2 entry, in RAM (direct-mapped).
                         // `i1 < 512` keeps the aligned `u64` leaf read in
                         // bounds.
                         let l1_e = unsafe { l1.add(i1).read() };
@@ -592,8 +837,9 @@ impl VmSpace {
                             | ((i2 as u64) << 21)
                             | ((i1 as u64) << 12);
 
+                        let parent_is_cow = l1_e & cow_bit != 0;
                         let mut perms = Perms::READ;
-                        if l1_e & WRITABLE != 0 {
+                        if l1_e & WRITABLE != 0 || parent_is_cow {
                             perms |= Perms::WRITE;
                         }
                         if l1_e & USER != 0 {
@@ -632,29 +878,58 @@ impl VmSpace {
                             }
                             shared_vaddrs.push(vaddr);
                         } else {
-                            let child_frame = match frame_alloc::alloc_frame() {
-                                Some(f) => f,
-                                None => {
-                                    walk_err = Some(MapError::OutOfFrames);
+                            let parent_frame = match PhysFrame::<Size4KiB>::from_start_address(
+                                PhysAddr::new(parent_frame_pa),
+                            ) {
+                                Ok(f) => f,
+                                Err(_) => {
+                                    walk_err = Some(MapError::Misaligned);
                                     break 'walk;
                                 }
                             };
-                            let child_frame_pa = child_frame.start_address().as_u64();
-                            // SAFETY: source and dest are valid page-aligned
-                            // 4 KiB frames in low DRAM, both reachable via the
-                            // kernel high mapping. Non-overlapping by
-                            // construction (alloc_frame returned a fresh frame).
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    (parent_frame_pa | KERNEL_VMA_OFFSET) as *const u8,
-                                    (child_frame_pa | KERNEL_VMA_OFFSET) as *mut u8,
-                                    4096,
-                                );
-                            }
-                            if let Err(e) = child.map(VirtAddr::new(vaddr), child_frame, perms) {
-                                frame_alloc::free_frame(child_frame);
-                                walk_err = Some(e);
-                                break 'walk;
+                            let is_writable = perms.contains(Perms::WRITE);
+                            let tracked = frame_alloc::frame_ref_count(parent_frame) != 0;
+                            if is_writable && tracked {
+                                if self.downgrade_leaf_to_cow_and_inc(vaddr, parent_frame) {
+                                    cow_vaddrs.push((vaddr, parent_frame, perms));
+                                }
+                            } else if !is_writable && tracked {
+                                if let Err(e) =
+                                    child.map_one_frame_fork_anon(page, parent_frame, perms, false)
+                                {
+                                    walk_err = Some(e);
+                                    break 'walk;
+                                }
+                                frame_alloc::frame_ref_inc(parent_frame);
+                                child_installed.push((vaddr, parent_frame, false));
+                            } else {
+                                let new_frame = match frame_alloc::alloc_frame() {
+                                    Some(f) => f,
+                                    None => {
+                                        walk_err = Some(MapError::OutOfFrames);
+                                        break 'walk;
+                                    }
+                                };
+                                let src = parent_frame.start_address().as_u64();
+                                let dst = new_frame.start_address().as_u64();
+                                // SAFETY: `src`/`dst` are page-aligned 4 KiB
+                                // frames both aliased writable by the direct
+                                // map; `new_frame` was just freshly allocated so
+                                // it does not alias `parent_frame`, making the
+                                // 4096-byte copy non-overlapping.
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        crate::mm::direct_map::phys_to_virt(src) as *const u8,
+                                        crate::mm::direct_map::phys_to_virt(dst) as *mut u8,
+                                        4096,
+                                    );
+                                }
+                                if let Err(e) = child.map_one_frame(page, new_frame, perms) {
+                                    frame_alloc::free_frame(new_frame);
+                                    walk_err = Some(e);
+                                    break 'walk;
+                                }
+                                child_installed.push((vaddr, new_frame, true));
                             }
                         }
                     }
@@ -663,28 +938,123 @@ impl VmSpace {
         }
 
         if let Some(e) = walk_err {
-            for &v in &shared_vaddrs {
-                child.unmap_keep_frame(VirtAddr::new(v));
-            }
+            self.unwind_cow_share(&mut child, &shared_vaddrs, &child_installed, &cow_vaddrs, 0);
             return Err(e);
+        }
+
+        let needs_shootdown = !cow_vaddrs.is_empty();
+        Ok(CowClone {
+            child,
+            shared_vaddrs,
+            child_installed,
+            cow_vaddrs,
+            needs_shootdown,
+        })
+    }
+
+    pub fn finish_cow_clone(
+        &mut self,
+        clone: CowClone,
+    ) -> Result<(VmSpace, alloc::vec::Vec<u64>), MapError> {
+        let CowClone {
+            mut child,
+            shared_vaddrs,
+            child_installed,
+            cow_vaddrs,
+            needs_shootdown: _,
+        } = clone;
+        for idx in 0..cow_vaddrs.len() {
+            let (vaddr, parent_frame, perms) = cow_vaddrs[idx];
+            let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.unwind_cow_share(
+                        &mut child,
+                        &shared_vaddrs,
+                        &child_installed,
+                        &cow_vaddrs,
+                        idx,
+                    );
+                    return Err(MapError::Misaligned);
+                }
+            };
+            if let Err(e) = child.map_one_frame_fork_anon(page, parent_frame, perms, true) {
+                self.unwind_cow_share(
+                    &mut child,
+                    &shared_vaddrs,
+                    &child_installed,
+                    &cow_vaddrs,
+                    idx,
+                );
+                return Err(e);
+            }
         }
 
         Ok((child, shared_vaddrs))
     }
 
+    fn detach_child_leaf(&mut self, vaddr: VirtAddr) {
+        let page = match Page::<Size4KiB>::from_start_address(vaddr) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let _g = PT_MUTATION_LOCK.lock();
+        let mut mapper = self.mapper();
+        if let Ok((_frame, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+    }
+
+    fn unwind_cow_share(
+        &mut self,
+        child: &mut VmSpace,
+        shared_vaddrs: &[u64],
+        child_installed: &[(u64, PhysFrame<Size4KiB>, bool)],
+        cow_vaddrs: &[(u64, PhysFrame<Size4KiB>, Perms)],
+        done: usize,
+    ) {
+        for &v in shared_vaddrs {
+            child.detach_child_leaf(VirtAddr::new(v));
+        }
+        for &(v, frame, _eager) in child_installed {
+            child.detach_child_leaf(VirtAddr::new(v));
+            frame_alloc::free_frame(frame);
+        }
+        for (i, &(v, frame, _p)) in cow_vaddrs.iter().enumerate() {
+            if i < done {
+                child.detach_child_leaf(VirtAddr::new(v));
+            }
+            frame_alloc::free_frame(frame);
+            self.upgrade_leaf_from_cow(v);
+        }
+    }
+
+    fn upgrade_leaf_from_cow(&mut self, vaddr: u64) {
+        let _g = PT_MUTATION_LOCK.lock();
+        if let Some(p) = self.leaf_pte_ptr(vaddr) {
+            // SAFETY: `p` is the direct-map VA of a present leaf PTE; the lock
+            // is held, so this is the only writer. Setting WRITABLE and
+            // clearing the COW bit restores the parent's own mapping to its
+            // pre-fork writable state when the clone unwinds.
+            unsafe {
+                let e = p.read();
+                p.write((e | PageTableFlags::WRITABLE.bits()) & !COW_PTE.bits());
+            }
+        }
+    }
+
     pub fn clear_user(&mut self) {
-        use crate::boot::KERNEL_VMA_OFFSET;
         const PRESENT: u64 = 1 << 0;
         const HUGE: u64 = 1 << 7;
         const FRAME_MASK: u64 = 0x000f_ffff_ffff_f000;
 
         let pml4_pa = self.root.start_address().as_u64();
-        let pml4 = (pml4_pa | KERNEL_VMA_OFFSET) as *mut u64;
+        let pml4 = (crate::mm::direct_map::phys_to_virt(pml4_pa)) as *mut u64;
 
         let mut any_unmapped = false;
         for i4 in 0usize..256 {
-            // SAFETY: `pml4` is the high-mapping VA of this VmSpace's root
-            // frame (kernel-mapped low DRAM); `i4 < 256` keeps the aligned
+            // SAFETY: `pml4` is the direct-map VA of this VmSpace's root
+            // frame (RAM (direct-mapped)); `i4 < 256` keeps the aligned
             // `u64` read in the user half of the 512-entry table. clear_user
             // runs only at terminal teardown — VmSpace `Drop`, or `execve`
             // after the caller has SIGKILL'd/reaped every CLONE_VM peer — so
@@ -706,33 +1076,33 @@ impl VmSpace {
                 continue;
             }
             let l3_pa = l4_e & FRAME_MASK;
-            let l3 = (l3_pa | KERNEL_VMA_OFFSET) as *mut u64;
+            let l3 = (crate::mm::direct_map::phys_to_virt(l3_pa)) as *mut u64;
             for i3 in 0usize..512 {
-                // SAFETY: `l3` is the high-mapping VA of the PDPT frame
+                // SAFETY: `l3` is the direct-map VA of the PDPT frame
                 // named by the present, non-huge L4 entry above, in
-                // kernel-mapped low DRAM. `i3 < 512` keeps the aligned
+                // RAM (direct-mapped). `i3 < 512` keeps the aligned
                 // `u64` read in bounds.
                 let l3_e = unsafe { l3.add(i3).read() };
                 if l3_e & PRESENT == 0 || l3_e & HUGE != 0 {
                     continue;
                 }
                 let l2_pa = l3_e & FRAME_MASK;
-                let l2 = (l2_pa | KERNEL_VMA_OFFSET) as *mut u64;
+                let l2 = (crate::mm::direct_map::phys_to_virt(l2_pa)) as *mut u64;
                 for i2 in 0usize..512 {
-                    // SAFETY: `l2` is the high-mapping VA of the PD frame
+                    // SAFETY: `l2` is the direct-map VA of the PD frame
                     // named by the present, non-huge L3 entry above, in
-                    // kernel-mapped low DRAM. `i2 < 512` keeps the
+                    // RAM (direct-mapped). `i2 < 512` keeps the
                     // aligned `u64` read in bounds.
                     let l2_e = unsafe { l2.add(i2).read() };
                     if l2_e & PRESENT == 0 || l2_e & HUGE != 0 {
                         continue;
                     }
                     let l1_pa = l2_e & FRAME_MASK;
-                    let l1 = (l1_pa | KERNEL_VMA_OFFSET) as *mut u64;
+                    let l1 = (crate::mm::direct_map::phys_to_virt(l1_pa)) as *mut u64;
                     for i1 in 0usize..512 {
-                        // SAFETY: `l1` is the high-mapping VA of the PT
+                        // SAFETY: `l1` is the direct-map VA of the PT
                         // frame named by the present, non-huge L2 entry
-                        // above, in kernel-mapped low DRAM. `i1 < 512`
+                        // above, in RAM (direct-mapped). `i1 < 512`
                         // keeps the aligned `u64` leaf read in bounds.
                         let l1_e = unsafe { l1.add(i1).read() };
                         if l1_e & PRESENT == 0 {
@@ -826,6 +1196,37 @@ pub enum MapError {
     Misaligned,
     AlreadyMapped,
     ParentTableHugePage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CowBreak {
+    Broken {
+        old_frame: PhysFrame<Size4KiB>,
+    },
+    BrokenInPlace,
+    AlreadyWritable,
+    NotCow,
+    NotPresent,
+}
+
+pub struct CowClone {
+    child: VmSpace,
+    shared_vaddrs: alloc::vec::Vec<u64>,
+    child_installed: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, bool)>,
+    cow_vaddrs: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, Perms)>,
+    needs_shootdown: bool,
+}
+
+impl CowClone {
+    pub fn needs_shootdown(&self) -> bool {
+        self.needs_shootdown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectResult {
+    pub not_present: usize,
+    pub copied: usize,
 }
 
 impl MapError {

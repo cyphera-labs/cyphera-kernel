@@ -2,21 +2,79 @@ extern crate alloc;
 
 pub mod device;
 pub mod epoll;
+pub mod icmp;
 pub mod inet;
 pub mod netlink;
 pub mod unix;
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use frame::sync::SpinIrq;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address,
+};
 
 use device::VirtioNetDevice;
 
 use crate::wait::WaitQueue;
+
+pub trait Socket {
+    fn bind(&self, addr: &[u8]) -> i64 {
+        let _ = addr;
+        crate::errno::EOPNOTSUPP
+    }
+    fn listen(&self, backlog: i32) -> i64 {
+        let _ = backlog;
+        crate::errno::EOPNOTSUPP
+    }
+    fn accept(
+        &self,
+        peer_out: Option<(u64, u64)>,
+        nonblock: bool,
+    ) -> Result<alloc::sync::Arc<dyn crate::vfs::Inode>, i64> {
+        let _ = (peer_out, nonblock);
+        Err(crate::errno::EOPNOTSUPP)
+    }
+    fn connect(&self, addr: &[u8], nonblock: bool) -> i64 {
+        let _ = (addr, nonblock);
+        crate::errno::EOPNOTSUPP
+    }
+    fn send_to(&self, buf: &[u8], addr: Option<&[u8]>, nonblock: bool) -> i64 {
+        let _ = (buf, addr, nonblock);
+        crate::errno::EOPNOTSUPP
+    }
+    fn recv_from(&self, buf: &mut [u8], peer_out: Option<(u64, u64)>, nonblock: bool) -> i64 {
+        let _ = (buf, peer_out, nonblock);
+        crate::errno::EOPNOTSUPP
+    }
+    fn shutdown(&self, how: i32) -> i64 {
+        let _ = how;
+        crate::errno::EOPNOTSUPP
+    }
+    fn setsockopt(&self, level: i32, opt: i32, optval: u64, optlen: u64) -> i64 {
+        let _ = (level, opt, optval, optlen);
+        crate::errno::EOPNOTSUPP
+    }
+    fn getsockopt(&self, level: i32, opt: i32, val_out: u64, len_out: u64) -> i64 {
+        let _ = (level, opt, val_out, len_out);
+        crate::errno::EOPNOTSUPP
+    }
+    fn getsockname(&self, addr_out: u64, len_out: u64) -> i64 {
+        let _ = (addr_out, len_out);
+        crate::errno::EOPNOTSUPP
+    }
+    fn getpeername(&self, addr_out: u64, len_out: u64) -> i64 {
+        let _ = (addr_out, len_out);
+        crate::errno::EOPNOTSUPP
+    }
+}
 
 pub struct NetStack {
     pub device: Option<VirtioNetDevice>,
@@ -26,11 +84,127 @@ pub struct NetStack {
     pub sockets: SocketSet<'static>,
 }
 
-static NET: SpinIrq<Option<NetStack>> = SpinIrq::new(None);
+pub struct NetNamespace {
+    stack: SpinIrq<NetStack>,
+    inet_registry: SpinIrq<BTreeMap<usize, Arc<inet::InetSocket>>>,
+    icmp_registry: SpinIrq<BTreeMap<usize, Arc<icmp::IcmpSocket>>>,
+    abstract_bound: SpinIrq<BTreeMap<String, Weak<unix::UnixSocket>>>,
+    ephemeral_next: AtomicU16,
+}
 
+impl NetNamespace {
+    fn new(stack: NetStack) -> Arc<Self> {
+        Arc::new(Self {
+            stack: SpinIrq::new(stack),
+            inet_registry: SpinIrq::new(BTreeMap::new()),
+            icmp_registry: SpinIrq::new(BTreeMap::new()),
+            abstract_bound: SpinIrq::new(BTreeMap::new()),
+            ephemeral_next: AtomicU16::new(32768),
+        })
+    }
+
+    pub fn with_stack<R>(&self, f: impl FnOnce(&mut NetStack) -> R) -> R {
+        let (r, changed) = {
+            let mut guard = self.stack.lock();
+            let stack: &mut NetStack = &mut guard;
+            let r = f(stack);
+            let now = smoltcp_now();
+            let mut changed = false;
+            if let (Some(iface), Some(device)) = (stack.iface.as_mut(), stack.device.as_mut()) {
+                changed |= iface.poll(now, device, &mut stack.sockets);
+            }
+            changed |= stack
+                .loop_iface
+                .poll(now, &mut stack.loop_device, &mut stack.sockets);
+            (r, changed)
+        };
+        if changed {
+            self.wake_inet();
+            self.wake_icmp();
+        }
+        r
+    }
+
+    pub fn register_inet(&self, s: &Arc<inet::InetSocket>) {
+        let key = Arc::as_ptr(s) as *const () as usize;
+        self.inet_registry.lock().insert(key, s.clone());
+    }
+
+    pub fn unregister_inet(&self, s: &inet::InetSocket) {
+        let key = (s as *const inet::InetSocket) as *const () as usize;
+        self.inet_registry.lock().remove(&key);
+    }
+
+    fn wake_inet(&self) {
+        let socks: Vec<Arc<inet::InetSocket>> =
+            self.inet_registry.lock().values().cloned().collect();
+        for s in socks {
+            s.wake();
+        }
+    }
+
+    pub fn register_icmp(&self, s: &Arc<icmp::IcmpSocket>) {
+        let key = Arc::as_ptr(s) as *const () as usize;
+        self.icmp_registry.lock().insert(key, s.clone());
+    }
+
+    pub fn unregister_icmp(&self, s: &icmp::IcmpSocket) {
+        let key = (s as *const icmp::IcmpSocket) as *const () as usize;
+        self.icmp_registry.lock().remove(&key);
+    }
+
+    fn wake_icmp(&self) {
+        let socks: Vec<Arc<icmp::IcmpSocket>> =
+            self.icmp_registry.lock().values().cloned().collect();
+        for s in socks {
+            s.wake();
+        }
+    }
+
+    pub fn try_bind_abstract(&self, name: String, sock: Weak<unix::UnixSocket>) -> bool {
+        let mut t = self.abstract_bound.lock();
+        if t.get(&name).and_then(|w| w.upgrade()).is_some() {
+            return false;
+        }
+        t.insert(name, sock);
+        true
+    }
+
+    pub fn lookup_abstract(&self, name: &str) -> Option<Arc<unix::UnixSocket>> {
+        self.abstract_bound
+            .lock()
+            .get(name)
+            .and_then(|w| w.upgrade())
+    }
+
+    pub fn unbind_abstract(&self, name: &str) {
+        self.abstract_bound.lock().remove(name);
+    }
+
+    pub fn next_ephemeral_port(&self) -> u16 {
+        let p = self.ephemeral_next.fetch_add(1, Ordering::Relaxed);
+        if p < 32768 {
+            self.ephemeral_next.store(32768, Ordering::Relaxed);
+            return 32768;
+        }
+        p
+    }
+
+    pub fn has_iface(&self) -> bool {
+        self.stack.lock().iface.is_some()
+    }
+}
+
+static HOST_NS: SpinIrq<Option<Arc<NetNamespace>>> = SpinIrq::new(None);
+static NET_NS_LIST: SpinIrq<Vec<Weak<NetNamespace>>> = SpinIrq::new(Vec::new());
 static PUMP_WAIT: WaitQueue = WaitQueue::new();
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-pub fn init() {
+fn register_ns(ns: &Arc<NetNamespace>) {
+    NET_NS_LIST.lock().push(Arc::downgrade(ns));
+}
+
+fn build_loopback() -> (Loopback, Interface) {
     let mut loop_device = Loopback::new(Medium::Ip);
     let loop_config = Config::new(HardwareAddress::Ip);
     let mut loop_iface = Interface::new(loop_config, &mut loop_device, smoltcp_now());
@@ -41,7 +215,21 @@ pub fn init() {
                 8,
             ))
             .ok();
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 128))
+            .ok();
+        addrs
+            .push(IpCidr::new(
+                IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                64,
+            ))
+            .ok();
     });
+    (loop_device, loop_iface)
+}
+
+pub fn init() {
+    let (loop_device, loop_iface) = build_loopback();
 
     let (device, iface) = match virtio::net_mac() {
         Some(mac) => {
@@ -56,73 +244,89 @@ pub fn init() {
                         24,
                     ))
                     .ok();
+                addrs
+                    .push(IpCidr::new(
+                        IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x15)),
+                        64,
+                    ))
+                    .ok();
             });
             iface
                 .routes_mut()
                 .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
                 .ok();
             frame::println!(
-                "net: smoltcp up; ip 10.0.2.15/24 via 10.0.2.2 (mac {:02x?}) + lo 127.0.0.1/8",
+                "net: smoltcp up; ip 10.0.2.15/24 via 10.0.2.2 (mac {:02x?}) + lo 127.0.0.1/8 + ::1/128",
                 mac
             );
             (Some(device), Some(iface))
         }
         None => {
-            frame::println!("net: smoltcp up; lo 127.0.0.1/8 only (no virtio-net)");
+            frame::println!("net: smoltcp up; lo 127.0.0.1/8 + ::1/128 only (no virtio-net)");
             (None, None)
         }
     };
 
-    *NET.lock() = Some(NetStack {
+    let stack = NetStack {
         device,
         iface,
         loop_device,
         loop_iface,
         sockets: SocketSet::new(Vec::new()),
-    });
-}
-
-pub fn with_stack<R>(f: impl FnOnce(&mut NetStack) -> R) -> Option<R> {
-    let r = {
-        let mut g = NET.lock();
-        let stack = g.as_mut()?;
-        let r = f(stack);
-        let now = smoltcp_now();
-        if let (Some(iface), Some(device)) = (stack.iface.as_mut(), stack.device.as_mut()) {
-            iface.poll(now, device, &mut stack.sockets);
-        }
-        stack
-            .loop_iface
-            .poll(now, &mut stack.loop_device, &mut stack.sockets);
-        Some(r)
     };
-    if r.is_some() {
-        inet::wake_all_sockets();
-    }
-    r
+    let ns = NetNamespace::new(stack);
+    register_ns(&ns);
+    *HOST_NS.lock() = Some(ns);
+    INITIALIZED.store(true, Ordering::Release);
 }
 
-pub fn available() -> bool {
-    NET.lock().is_some()
+pub fn host_net_ns() -> Arc<NetNamespace> {
+    HOST_NS
+        .lock()
+        .as_ref()
+        .expect("net: host namespace not initialized")
+        .clone()
+}
+
+pub fn new_namespace() -> Arc<NetNamespace> {
+    let (loop_device, loop_iface) = build_loopback();
+    let stack = NetStack {
+        device: None,
+        iface: None,
+        loop_device,
+        loop_iface,
+        sockets: SocketSet::new(Vec::new()),
+    };
+    let ns = NetNamespace::new(stack);
+    register_ns(&ns);
+    ns
 }
 
 pub fn signal_pump_tick() {
     PUMP_WAIT.wake_all();
 }
 
+fn pump_all() {
+    let nss: Vec<Arc<NetNamespace>> = {
+        let mut list = NET_NS_LIST.lock();
+        list.retain(|w| w.strong_count() > 0);
+        list.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for ns in nss {
+        ns.with_stack(|_| {});
+    }
+}
+
 extern "C" fn smoltcp_pump() -> ! {
     loop {
-        if available() {
-            let _ = with_stack(|_| {});
+        if INITIALIZED.load(Ordering::Acquire) {
+            pump_all();
         }
         PUMP_WAIT.park();
     }
 }
 
 pub fn start_pump_kthread() {
-    if !available() {
-        return;
-    }
     let _pid = crate::sched::spawn_kthread("smoltcp-pump", smoltcp_pump);
 }
 

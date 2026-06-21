@@ -68,20 +68,7 @@ pub extern "C" fn _start() -> ! {
 
     const ENOSYS: i64 = -38;
     const EPERM: i64 = -1;
-    let enosys_nrs: [u64; 12] = [
-        156,
-        134,
-        174,
-        178,
-        183,
-        181,
-        175,
-        176,
-        205,
-        211,
-        154,
-        214,
-    ];
+    let enosys_nrs: [u64; 12] = [156, 134, 174, 178, 183, 181, 175, 176, 205, 211, 154, 214];
     for &nr in enosys_nrs.iter() {
         if raw_syscall0(nr) != ENOSYS {
             log("legacy syscall did not return -ENOSYS: nr=");
@@ -89,12 +76,7 @@ pub extern "C" fn _start() -> ! {
             sys_exit(1);
         }
     }
-    let eperm_nrs: [u64; 4] = [
-        172,
-        173,
-        246,
-        320,
-    ];
+    let eperm_nrs: [u64; 4] = [172, 173, 246, 320];
     for &nr in eperm_nrs.iter() {
         if raw_syscall0(nr) != EPERM {
             log("privileged-refusal syscall did not return -EPERM: nr=");

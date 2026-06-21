@@ -188,9 +188,7 @@ impl Inode for CgroupFile {
 impl CgroupFile {
     fn render(&self) -> String {
         match self.file {
-            ControlFile::CgroupControllers => {
-                String::from("cpu io memory pids\n")
-            }
+            ControlFile::CgroupControllers => String::from("cpu io memory pids\n"),
             ControlFile::CgroupEvents => {
                 let pop = !self.cg.pids.lock().is_empty();
                 format!("populated {}\nfrozen 0\n", if pop { 1 } else { 0 })

@@ -221,7 +221,14 @@ pub extern "C" fn _start() -> ! {
         }
         s += 1;
     }
-    let hm = sys_mmap(0, 3 * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, hfd as i32, 0);
+    let hm = sys_mmap(
+        0,
+        3 * 4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        hfd as i32,
+        0,
+    );
     if hm < 0 {
         log("holepunch mmap failed\n");
         sys_exit(1);
@@ -258,7 +265,14 @@ pub extern "C" fn _start() -> ! {
     sys_close(hfd2 as i32);
     log("hole-punch MAP_SHARED writeback offset OK\n");
 
-    let as_ = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let as_ = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if as_ < 0 {
         log("anon-shared mmap failed: ");
         log_num(as_);
@@ -295,7 +309,14 @@ pub extern "C" fn _start() -> ! {
     sys_munmap(as_ as u64, 4096);
     log("MAP_SHARED|MAP_ANONYMOUS coherent across fork OK\n");
 
-    let two = sys_mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let two = sys_mmap(
+        0,
+        8192,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if two < 0 {
         log("fixed-anon mmap(2pg) failed\n");
         sys_exit(1);
@@ -304,7 +325,14 @@ pub extern "C" fn _start() -> ! {
         core::ptr::write_volatile(two as *mut u32, 0xA1A1_A1A1u32);
         core::ptr::write_volatile((two as u64 + 4096) as *mut u32, 0xB2B2_B2B2u32);
     }
-    let ov = sys_mmap(two as u64, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    let ov = sys_mmap(
+        two as u64,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
     if ov != two {
         log("partial MAP_FIXED over anon-shared failed: ");
         log_num(ov);
@@ -322,13 +350,27 @@ pub extern "C" fn _start() -> ! {
     }
     sys_munmap(two as u64, 8192);
 
-    let one = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let one = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if one < 0 {
         log("fixed-anon mmap(1pg) failed\n");
         sys_exit(1);
     }
     unsafe { core::ptr::write_volatile(one as *mut u32, 0xD4D4_D4D4u32) };
-    let one2 = sys_mmap(one as u64, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    let one2 = sys_mmap(
+        one as u64,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
     if one2 != one {
         log("full MAP_FIXED over anon-shared failed\n");
         sys_exit(1);
@@ -339,7 +381,14 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1);
     }
     sys_munmap(one as u64, 4096);
-    let chk = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    let chk = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if chk < 0 {
         log("post-fixed fresh mmap failed\n");
         sys_exit(1);

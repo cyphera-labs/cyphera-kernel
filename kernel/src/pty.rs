@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use frame::sync::SpinIrq;
 
 use crate::process::Pid;
-use crate::vfs::{FsError, Inode, InodeKind, OpenFlags, Stat};
+use crate::vfs::{FsError, Inode, InodeKind, OpenFlags, PollMask, Stat};
 use crate::wait::WaitQueue;
 
 const RING_CAPACITY: usize = 4096;
@@ -252,19 +252,29 @@ impl Inode for MasterInode {
         close_pair(&self.0);
     }
 
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_with_flags(offset, buf, OpenFlags::empty())
+    }
+
+    fn read_at_with_flags(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
         if buf.is_empty() {
             return Ok(0);
         }
-        loop {
-            {
-                let mut r = self.0.m_to_app.lock();
-                if r.len > 0 {
-                    return Ok(r.pop_into(buf));
-                }
+        use crate::vfs::blocking::IoAttempt;
+        let nonblock = flags.contains(OpenFlags::NONBLOCK);
+        crate::vfs::blocking::block_io("pty_master_read", &self.0.m_readers, nonblock, None, || {
+            let mut r = self.0.m_to_app.lock();
+            if r.len > 0 {
+                IoAttempt::Ready(r.pop_into(buf))
+            } else {
+                IoAttempt::WouldBlock
             }
-            crate::sched::park_on(&self.0.m_readers);
-        }
+        })
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
@@ -279,6 +289,18 @@ impl Inode for MasterInode {
             let _ = crate::sched::wake_pid(pid);
         }
         Ok(buf.len())
+    }
+
+    fn poll(&self) -> PollMask {
+        let mut mask = PollMask::OUT;
+        if self.0.m_to_app.lock().len > 0 {
+            mask |= PollMask::IN;
+        }
+        mask
+    }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&WaitQueue)) {
+        f(&self.0.m_readers);
     }
 }
 
@@ -301,26 +323,38 @@ impl Inode for SlaveInode {
         close_pair(&self.0);
     }
 
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_with_flags(offset, buf, OpenFlags::empty())
+    }
+
+    fn read_at_with_flags(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
         if buf.is_empty() {
             return Ok(0);
         }
-        loop {
+        use crate::vfs::blocking::IoAttempt;
+        let nonblock = flags.contains(OpenFlags::NONBLOCK);
+        crate::vfs::blocking::block_io("pty_slave_read", &self.0.s_readers, nonblock, None, || {
+            let mut r = self.0.s_to_app.lock();
+            if r.len > 0 {
+                *self.0.slave_reader.lock() = Some(crate::sched::current_pid());
+                return IoAttempt::Ready(r.pop_into(buf));
+            }
             {
-                let mut r = self.0.s_to_app.lock();
-                if r.len > 0 {
-                    *self.0.slave_reader.lock() = Some(crate::sched::current_pid());
-                    return Ok(r.pop_into(buf));
-                }
                 let mut eof = self.0.eof_pending_slave.lock();
                 if *eof {
                     *eof = false;
-                    return Ok(0);
+                    return IoAttempt::Ready(0);
                 }
             }
+            drop(r);
             *self.0.slave_reader.lock() = Some(crate::sched::current_pid());
-            crate::sched::park_on(&self.0.s_readers);
-        }
+            IoAttempt::WouldBlock
+        })
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
@@ -336,5 +370,19 @@ impl Inode for SlaveInode {
             let _ = crate::sched::wake_pid(pid);
         }
         Ok(buf.len())
+    }
+
+    fn poll(&self) -> PollMask {
+        let mut mask = PollMask::OUT;
+        let has_data = self.0.s_to_app.lock().len > 0;
+        let eof = *self.0.eof_pending_slave.lock();
+        if has_data || eof {
+            mask |= PollMask::IN;
+        }
+        mask
+    }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&WaitQueue)) {
+        f(&self.0.s_readers);
     }
 }

@@ -76,10 +76,7 @@ impl PendingSigInfo {
             let status = (self.aux & 0xffff_ffff) as i32;
             info.sifields[0..4].copy_from_slice(&(pid as i32).to_le_bytes());
             info.sifields[8..12].copy_from_slice(&status.to_le_bytes());
-        } else if matches!(
-            signal,
-            crate::process::SIGSEGV | 7 | 8 | 4
-        ) {
+        } else if matches!(signal, crate::process::SIGSEGV | 7 | 8 | 4) {
             info.sifields[0..8].copy_from_slice(&self.aux.to_le_bytes());
         } else if signal == 31 && self.si_code == 1 {
             info.si_errno = self._pad as i32;
@@ -399,16 +396,7 @@ pub fn deliver_to_handler(
     info: &SigInfo,
     altstack: AltStack,
 ) -> Result<u64, frame::user::UserAccessFault> {
-    let never_restart = matches!(
-        tf.orig_rax,
-        7
-            | 23
-            | 232
-            | 270
-            | 271
-            | 281
-            | 441
-    );
+    let never_restart = matches!(tf.orig_rax, 7 | 23 | 232 | 270 | 271 | 281 | 441);
     if (tf.rax as i64) == -4 && action.flags & sa::SA_RESTART != 0 && !never_restart {
         tf.rip_user = tf.rip_user.wrapping_sub(2);
         tf.rax = tf.orig_rax;
@@ -425,7 +413,7 @@ pub fn deliver_to_handler(
 
     let aligned = base_rsp & !15;
     let frame_base = aligned.wrapping_sub(FRAME_TOTAL) & !15;
-    let frame_base = frame_base.wrapping_sub(8); // ABI: ret addr offset
+    let frame_base = frame_base.wrapping_sub(8);
 
     let pretcode_addr = frame_base;
     let uc_addr = frame_base + 8;

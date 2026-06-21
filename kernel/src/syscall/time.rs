@@ -20,13 +20,7 @@ const ITIMER_VIRTUAL: u64 = 1;
 const ITIMER_PROF: u64 = 2;
 
 fn process_cputime_nanos() -> u64 {
-    sched::with_target_process(sched::current_pid(), |p| {
-        let totals = p.total_utime_ns.saturating_add(p.total_stime_ns);
-        let now = frame::cpu::clock::nanos_since_boot();
-        let in_flight = now.saturating_sub(p.last_run_ns);
-        totals.saturating_add(in_flight)
-    })
-    .unwrap_or(0)
+    sched::current_cputime_nanos()
 }
 
 fn timespec_for_clock(clock: u64) -> Option<(i64, i64)> {
@@ -85,13 +79,13 @@ fn itimer_real_fire(key: u64) {
     const SIGALRM: u32 = 14;
     let info = crate::signal::SigInfo::for_kill(SIGALRM, 0);
     let _ = sched::send_signal_with_info(target, SIGALRM, info);
-    sched::with_target_process_mut(target, |p| {
-        if p.itimer_real_interval_ns != 0 {
+    sched::with_signal_mut(target, |s| {
+        if s.itimer_interval() != 0 {
             let now = frame::cpu::clock::nanos_since_boot();
-            p.itimer_real_deadline_ns = now.saturating_add(p.itimer_real_interval_ns);
-            crate::timeout::register_callback(p.itimer_real_deadline_ns, key, itimer_real_fire);
+            s.set_itimer_deadline(now.saturating_add(s.itimer_interval()));
+            crate::timeout::register_callback(s.itimer_deadline(), key, itimer_real_fire);
         } else {
-            p.itimer_real_deadline_ns = 0;
+            s.set_itimer_deadline(0);
         }
     });
 }
@@ -287,9 +281,19 @@ pub(super) fn sys_nanosleep(req: u64, rem: u64) -> i64 {
     let deadline = now.saturating_add(total_ns);
     let pid = sched::current_pid();
     crate::timeout::register(deadline, pid);
-    sched::park_self_at("nanosleep");
-    let woke_via_timeout = !crate::timeout::unregister(pid);
-    if !woke_via_timeout {
+    let signaled = loop {
+        if frame::cpu::clock::nanos_since_boot() >= deadline {
+            break false;
+        }
+        if sched::current_signal_pending() {
+            break true;
+        }
+        sched::park_self_at_guarded("nanosleep", &|| {
+            frame::cpu::clock::nanos_since_boot() < deadline
+        });
+    };
+    let _ = crate::timeout::unregister(pid);
+    if signaled {
         let now2 = frame::cpu::clock::nanos_since_boot();
         let remaining = deadline.saturating_sub(now2);
         if rem != 0 {
@@ -362,10 +366,10 @@ pub(super) fn sys_getitimer(which: u64, curr_ptr: u64) -> i64 {
         return EFAULT;
     }
     let (interval, value) = if which == ITIMER_REAL {
-        sched::with_target_process(sched::current_pid(), |p| {
+        sched::with_signal(sched::current_pid(), |s| {
             let now = frame::cpu::clock::nanos_since_boot();
-            let remaining = p.itimer_real_deadline_ns.saturating_sub(now);
-            (p.itimer_real_interval_ns, remaining)
+            let remaining = s.itimer_deadline().saturating_sub(now);
+            (s.itimer_interval(), remaining)
         })
         .unwrap_or((0, 0))
     } else {
@@ -392,25 +396,25 @@ pub(super) fn sys_setitimer(which: u64, new_ptr: u64, old_ptr: u64) -> i64 {
     let (interval_ns, value_ns) = decode_itimerval(&new_buf);
 
     let target = sched::current_pid();
-    let old = sched::with_target_process(target, |p| {
+    let old = sched::with_signal(target, |s| {
         let now = frame::cpu::clock::nanos_since_boot();
-        let remaining = p.itimer_real_deadline_ns.saturating_sub(now);
-        (p.itimer_real_interval_ns, remaining)
+        let remaining = s.itimer_deadline().saturating_sub(now);
+        (s.itimer_interval(), remaining)
     })
     .unwrap_or((0, 0));
 
     if which == ITIMER_REAL {
         crate::timeout::cancel_callback(itimer_real_key(target));
-        sched::with_target_process_mut(target, |p| {
+        sched::with_signal_mut(target, |s| {
             if value_ns == 0 {
-                p.itimer_real_interval_ns = 0;
-                p.itimer_real_deadline_ns = 0;
+                s.set_itimer_interval(0);
+                s.set_itimer_deadline(0);
             } else {
                 let now = frame::cpu::clock::nanos_since_boot();
-                p.itimer_real_interval_ns = interval_ns;
-                p.itimer_real_deadline_ns = now.saturating_add(value_ns);
+                s.set_itimer_interval(interval_ns);
+                s.set_itimer_deadline(now.saturating_add(value_ns));
                 crate::timeout::register_callback(
-                    p.itimer_real_deadline_ns,
+                    s.itimer_deadline(),
                     itimer_real_key(target),
                     itimer_real_fire,
                 );
@@ -430,10 +434,10 @@ pub(super) fn sys_setitimer(which: u64, new_ptr: u64, old_ptr: u64) -> i64 {
 pub(super) fn sys_alarm(seconds: u64) -> i64 {
     let cur = sched::current_pid();
     let key = itimer_real_key(cur);
-    let prev_remaining_sec: u64 = sched::with_target_process(cur, |p| {
+    let prev_remaining_sec: u64 = sched::with_signal(cur, |s| {
         let now = frame::cpu::clock::nanos_since_boot();
-        if p.itimer_real_deadline_ns > now {
-            (p.itimer_real_deadline_ns - now) / 1_000_000_000
+        if s.itimer_deadline() > now {
+            (s.itimer_deadline() - now) / 1_000_000_000
         } else {
             0
         }
@@ -441,9 +445,9 @@ pub(super) fn sys_alarm(seconds: u64) -> i64 {
     .unwrap_or(0);
 
     if seconds == 0 {
-        sched::with_target_process_mut(cur, |p| {
-            p.itimer_real_interval_ns = 0;
-            p.itimer_real_deadline_ns = 0;
+        sched::with_signal_mut(cur, |s| {
+            s.set_itimer_interval(0);
+            s.set_itimer_deadline(0);
         });
         crate::timeout::cancel_callback(key);
         return prev_remaining_sec as i64;
@@ -451,9 +455,9 @@ pub(super) fn sys_alarm(seconds: u64) -> i64 {
 
     let now = frame::cpu::clock::nanos_since_boot();
     let deadline = now.saturating_add(seconds.saturating_mul(1_000_000_000));
-    sched::with_target_process_mut(cur, |p| {
-        p.itimer_real_interval_ns = 0;
-        p.itimer_real_deadline_ns = deadline;
+    sched::with_signal_mut(cur, |s| {
+        s.set_itimer_interval(0);
+        s.set_itimer_deadline(deadline);
     });
     crate::timeout::cancel_callback(key);
     crate::timeout::register_callback(deadline, key, itimer_real_fire);

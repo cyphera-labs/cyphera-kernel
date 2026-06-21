@@ -115,7 +115,11 @@ pub extern "C" fn _start() -> ! {
     let dload = load1.wrapping_sub(load0);
     let djif = jif1.wrapping_sub(jif0);
     let dresched = resched1.wrapping_sub(resched0);
-    let diff = if dload > djif { dload - djif } else { djif - dload };
+    let diff = if dload > djif {
+        dload - djif
+    } else {
+        djif - dload
+    };
     log("loadtick: dload=");
     log_num(dload as i64);
     log(" djif=");
@@ -203,7 +207,11 @@ fn read_path(path: &[u8], buf: &mut [u8]) -> i64 {
     }
     let mut total = 0usize;
     while total < buf.len() {
-        let n = sys_read(fd as u64, unsafe { buf.as_mut_ptr().add(total) }, buf.len() - total);
+        let n = sys_read(
+            fd as u64,
+            unsafe { buf.as_mut_ptr().add(total) },
+            buf.len() - total,
+        );
         if n < 0 {
             sys_close(fd as u64);
             return n;

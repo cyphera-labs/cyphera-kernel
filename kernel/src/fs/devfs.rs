@@ -127,10 +127,8 @@ impl Inode for Urandom {
         char_stat()
     }
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        match virtio::fill_random(buf) {
-            Ok(0) | Err(_) => Err(FsError::WouldBlock),
-            Ok(n) => Ok(n),
-        }
+        crate::random::fill(buf);
+        Ok(buf.len())
     }
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         Ok(buf.len())
@@ -181,6 +179,16 @@ impl Inode for Console {
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         frame::io::uart::write_bytes(buf);
         Ok(buf.len())
+    }
+    fn poll(&self) -> crate::vfs::PollMask {
+        let mut m = crate::vfs::PollMask::OUT;
+        if crate::console::poll_readable() {
+            m |= crate::vfs::PollMask::IN;
+        }
+        m
+    }
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
+        crate::console::for_each_read_wq(f);
     }
 }
 
@@ -328,5 +336,17 @@ impl Inode for InputEvent {
     }
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> crate::vfs::PollMask {
+        if crate::input::has_pending(self.idx) {
+            crate::vfs::PollMask::IN
+        } else {
+            crate::vfs::PollMask::empty()
+        }
+    }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
+        crate::input::for_each_evdev_wq(self.idx, f);
     }
 }

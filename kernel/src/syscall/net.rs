@@ -1,19 +1,33 @@
 use alloc::sync::Arc;
 
-use crate::errno::{EFAULT, EINVAL, ENOTCONN};
+use crate::errno::{EAFNOSUPPORT, EBADF, EFAULT, EINVAL};
 use crate::sched;
 use crate::vfs::{self, Inode, OpenFile, OpenFlags};
 
 use super::fs::{READ_BUF_MAX, WRITE_BUF_MAX};
-use super::util::{fd_is_nonblock, lookup_inet_from_fd};
+use super::util::fd_is_nonblock;
 
 const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
 const AF_UNIX: u32 = 1;
 const AF_NETLINK: u32 = 16;
 
-pub(super) fn sys_socket(domain: u64, kind: u64, _protocol: u64) -> i64 {
+fn inet_family(domain: u32) -> crate::net::inet::Family {
+    if domain == AF_INET6 {
+        crate::net::inet::Family::Inet6
+    } else {
+        crate::net::inet::Family::Inet
+    }
+}
+
+const SOCK_RAW: u32 = 3;
+const IPPROTO_ICMP: u32 = 1;
+const IPPROTO_ICMPV6: u32 = 58;
+
+pub(super) fn sys_socket(domain: u64, kind: u64, protocol: u64) -> i64 {
     let domain = domain as u32;
     let stype = (kind as u32) & 0xff;
+    let proto = protocol as u32;
     let nonblock = kind & 0o4000 != 0;
     let cloexec = if kind & 0o2_000_000 != 0 {
         vfs::fd::FD_CLOEXEC
@@ -21,24 +35,36 @@ pub(super) fn sys_socket(domain: u64, kind: u64, _protocol: u64) -> i64 {
         0
     };
     let inode: Arc<dyn Inode> = match (domain, stype) {
-        (AF_INET, crate::net::inet::SOCK_DGRAM) => {
-            let s = match crate::net::inet::InetSocket::new_udp() {
+        (AF_INET | AF_INET6, crate::net::inet::SOCK_DGRAM | SOCK_RAW)
+            if matches!(proto, IPPROTO_ICMP | IPPROTO_ICMPV6) =>
+        {
+            let s = match crate::net::icmp::IcmpSocket::new() {
+                Ok(s) => s,
+                Err(e) => return e.errno(),
+            };
+            crate::net::icmp::register(&s);
+            s
+        }
+        (AF_INET | AF_INET6, crate::net::inet::SOCK_DGRAM) => {
+            let s = match crate::net::inet::InetSocket::new_udp(inet_family(domain)) {
                 Ok(s) => s,
                 Err(e) => return e.errno(),
             };
             crate::net::inet::register(&s);
             s
         }
-        (AF_INET, crate::net::inet::SOCK_STREAM) => {
-            let s = match crate::net::inet::InetSocket::new_tcp() {
+        (AF_INET | AF_INET6, crate::net::inet::SOCK_STREAM) => {
+            let s = match crate::net::inet::InetSocket::new_tcp(inet_family(domain)) {
                 Ok(s) => s,
                 Err(e) => return e.errno(),
             };
             crate::net::inet::register(&s);
             s
         }
+        (AF_UNIX, crate::net::inet::SOCK_STREAM) => crate::net::unix::UnixSocket::new_unbound(),
+        (AF_UNIX, crate::net::inet::SOCK_DGRAM) => crate::net::unix::UnixSocket::new_dgram(),
         (AF_NETLINK, _) => crate::net::netlink::NetlinkSocket::new(),
-        _ => return -97,
+        _ => return EAFNOSUPPORT,
     };
     let mut flags = OpenFlags::RDWR;
     if nonblock {
@@ -51,19 +77,28 @@ pub(super) fn sys_socket(domain: u64, kind: u64, _protocol: u64) -> i64 {
     }
 }
 
-pub(super) fn sys_socketpair(domain: u64, _kind: u64, _protocol: u64, sv: u64) -> i64 {
+pub(super) fn sys_socketpair(domain: u64, kind: u64, _protocol: u64, sv: u64) -> i64 {
     if domain as u32 != AF_UNIX {
-        return -97;
+        return EAFNOSUPPORT;
     }
+    let mut flags = OpenFlags::RDWR;
+    if kind & 0o4000 != 0 {
+        flags |= OpenFlags::NONBLOCK;
+    }
+    let cloexec = if kind & 0o2_000_000 != 0 {
+        vfs::fd::FD_CLOEXEC
+    } else {
+        0
+    };
     let (a, b) = crate::net::unix::UnixEnd::pair();
     let a_dyn: Arc<dyn Inode> = a;
     let b_dyn: Arc<dyn Inode> = b;
-    let fa = Arc::new(OpenFile::new(a_dyn, OpenFlags::RDWR));
-    let fb = Arc::new(OpenFile::new(b_dyn, OpenFlags::RDWR));
+    let fa = Arc::new(OpenFile::new(a_dyn, flags));
+    let fb = Arc::new(OpenFile::new(b_dyn, flags));
     let (fda, fdb) = sched::with_current_fds(|t| {
-        let a = t.install(fa);
+        let a = t.install_from(fa, 0, cloexec);
         let b = match a {
-            Ok(_) => t.install(fb),
+            Ok(_) => t.install_from(fb, 0, cloexec),
             Err(e) => Err(e),
         };
         (a, b)
@@ -93,7 +128,7 @@ pub(super) fn sys_socketpair(domain: u64, _kind: u64, _protocol: u64, sv: u64) -
 }
 
 fn read_sockaddr(addr: u64, addrlen: u64) -> Result<alloc::vec::Vec<u8>, i64> {
-    if addrlen == 0 || addrlen > 64 {
+    if addrlen == 0 || addrlen > 128 {
         return Err(EINVAL);
     }
     let mut buf = alloc::vec![0u8; addrlen as usize];
@@ -103,88 +138,55 @@ fn read_sockaddr(addr: u64, addrlen: u64) -> Result<alloc::vec::Vec<u8>, i64> {
     Ok(buf)
 }
 
+fn socket_from_fd(fd: u64) -> Result<Arc<OpenFile>, i64> {
+    sched::with_current_fds(|t| t.get(fd as i32)).ok_or(crate::errno::ENOTSOCK)
+}
+
 pub(super) fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
-    };
     let buf = match read_sockaddr(addr, addrlen) {
         Ok(b) => b,
         Err(e) => return e,
     };
-    let ep = match crate::net::inet::parse_sockaddr_in(&buf) {
-        Ok(e) => e,
-        Err(e) => return e.errno(),
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    if ep.port != 0 && ep.port < 1024 {
-        let allowed =
-            sched::with_current_creds(|c| c.capable_host(crate::process::CAP_NET_BIND_SERVICE));
-        if !allowed {
-            return -13;
-        }
-    }
-    let listen = smoltcp::wire::IpListenEndpoint {
-        addr: if ep.addr.is_unspecified() {
-            None
-        } else {
-            Some(ep.addr)
-        },
-        port: ep.port,
-    };
-    match sock.bind(listen) {
-        Ok(()) => 0,
-        Err(e) => e.errno(),
+    match file.inode.as_socket() {
+        Some(s) => s.bind(&buf),
+        None => crate::errno::ENOTSOCK,
     }
 }
 
 pub(super) fn sys_listen(fd: u64, backlog: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    match sock.listen(backlog as i32) {
-        Ok(()) => 0,
-        Err(e) => e.errno(),
+    match file.inode.as_socket() {
+        Some(s) => s.listen(backlog as i32),
+        None => crate::errno::ENOTSOCK,
     }
 }
 
 pub(super) fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
     let nonblock = fd_is_nonblock(fd as i32);
-    let new_sock = loop {
-        match sock.try_accept() {
-            Ok(s) => break s,
-            Err(crate::vfs::FsError::WouldBlock) => {
-                if nonblock {
-                    return crate::vfs::FsError::WouldBlock.errno();
-                }
-                sock.wait_queue().park();
-                if sched::current_signal_pending() {
-                    return crate::vfs::FsError::Interrupted.errno();
-                }
-            }
-            Err(e) => return e.errno(),
-        }
+    let peer_out = if addr != 0 && addrlen != 0 {
+        Some((addr, addrlen))
+    } else {
+        None
     };
-    crate::net::inet::register(&new_sock);
-    if addr != 0 && addrlen != 0 {
-        if let Some(ep) = new_sock.peer_endpoint() {
-            let mut cap = [0u8; 4];
-            if frame::user::copy_from_user(addrlen, &mut cap).is_ok() {
-                let cap = u32::from_le_bytes(cap) as usize;
-                let mut ab = [0u8; 16];
-                let full = crate::net::inet::write_sockaddr_in(&ep, &mut ab);
-                let n = full.min(cap);
-                let _ = frame::user::copy_to_user(addr, &ab[..n]);
-                let _ = frame::user::copy_to_user(addrlen, &(full as u32).to_le_bytes());
-            }
-        }
-    }
-    let dyn_inode: Arc<dyn Inode> = new_sock;
-    let of = Arc::new(OpenFile::new(dyn_inode, OpenFlags::RDWR));
+    let new_inode = match file.inode.as_socket() {
+        Some(s) => match s.accept(peer_out, nonblock) {
+            Ok(i) => i,
+            Err(e) => return e,
+        },
+        None => return crate::errno::ENOTSOCK,
+    };
+    let of = Arc::new(OpenFile::new_no_open(new_inode, OpenFlags::RDWR));
     match sched::with_current_fds(|t| t.install(of)) {
         Ok(fd) => fd as i64,
         Err(e) => e as i64,
@@ -192,21 +194,17 @@ pub(super) fn sys_accept(fd: u64, addr: u64, addrlen: u64) -> i64 {
 }
 
 pub(super) fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
-    };
     let buf = match read_sockaddr(addr, addrlen) {
         Ok(b) => b,
         Err(e) => return e,
     };
-    let ep = match crate::net::inet::parse_sockaddr_in(&buf) {
-        Ok(e) => e,
-        Err(e) => return e.errno(),
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    match sock.connect(ep) {
-        Ok(()) => 0,
-        Err(e) => e.errno(),
+    match file.inode.as_socket() {
+        Some(s) => s.connect(&buf, fd_is_nonblock(fd as i32)),
+        None => crate::errno::ENOTSOCK,
     }
 }
 
@@ -223,29 +221,27 @@ pub(super) fn sys_sendto(
         return 0;
     }
     let n = n.min(WRITE_BUF_MAX);
-    let sock = match lookup_inet_from_fd(fd as i32) {
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let sock = match file.inode.as_socket() {
         Some(s) => s,
-        None => return -88,
+        None => return crate::errno::ENOTSOCK,
     };
     let mut payload = alloc::vec![0u8; n];
     if frame::user::copy_from_user(buf, &mut payload).is_err() {
         return EFAULT;
     }
-    let peer = if addr != 0 && addrlen != 0 {
+    let nonblock = fd_is_nonblock(fd as i32);
+    if addr != 0 && addrlen != 0 {
         let ab = match read_sockaddr(addr, addrlen) {
             Ok(b) => b,
             Err(e) => return e,
         };
-        match crate::net::inet::parse_sockaddr_in(&ab) {
-            Ok(e) => Some(e),
-            Err(e) => return e.errno(),
-        }
+        sock.send_to(&payload, Some(&ab), nonblock)
     } else {
-        None
-    };
-    match sock.send_to(&payload, peer) {
-        Ok(w) => w as i64,
-        Err(e) => e.errno(),
+        sock.send_to(&payload, None, nonblock)
     }
 }
 
@@ -264,395 +260,268 @@ pub(super) fn sys_recvfrom(
     if n > READ_BUF_MAX {
         return EINVAL;
     }
-    let sock = match lookup_inet_from_fd(fd as i32) {
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let sock = match file.inode.as_socket() {
         Some(s) => s,
-        None => return -88,
+        None => return crate::errno::ENOTSOCK,
     };
     let mut tmp = alloc::vec![0u8; n];
     let nonblock = fd_is_nonblock(fd as i32);
-    let rcvtimeo_us = sock.opts.lock().rcvtimeo_us;
-    let deadline = if !nonblock && rcvtimeo_us != 0 {
-        Some(
-            frame::cpu::clock::nanos_since_boot().saturating_add(rcvtimeo_us.saturating_mul(1_000)),
-        )
+    let peer_out = if addr != 0 && addrlen_ptr != 0 {
+        Some((addr, addrlen_ptr))
     } else {
         None
     };
-    let pid = sched::current_pid();
-    let (read, peer) = loop {
-        match sock.try_recv_from(&mut tmp[..]) {
-            Ok(r) => {
-                if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
-                }
-                break r;
-            }
-            Err(crate::vfs::FsError::WouldBlock) => {
-                if nonblock {
-                    return crate::vfs::FsError::WouldBlock.errno();
-                }
-                if let Some(d) = deadline {
-                    if frame::cpu::clock::nanos_since_boot() >= d {
-                        let _ = crate::timeout::unregister(pid);
-                        return crate::vfs::FsError::WouldBlock.errno();
-                    }
-                    crate::timeout::register(d, pid);
-                }
-                sock.wait_queue().park();
-                sock.wait_queue().dequeue(pid);
-                if sched::current_signal_pending() {
-                    if deadline.is_some() {
-                        let _ = crate::timeout::unregister(pid);
-                    }
-                    return crate::vfs::FsError::Interrupted.errno();
-                }
-            }
-            Err(e) => {
-                if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
-                }
-                return e.errno();
-            }
-        }
-    };
+    let r = sock.recv_from(&mut tmp, peer_out, nonblock);
+    if r < 0 {
+        return r;
+    }
+    let read = r as usize;
     if read > 0 && frame::user::copy_to_user(buf, &tmp[..read]).is_err() {
         return EFAULT;
     }
-    if addr != 0 && addrlen_ptr != 0 {
-        if let Some(ep) = peer {
-            let mut ab = [0u8; 16];
-            let len = crate::net::inet::write_sockaddr_in(&ep, &mut ab);
-            let _ = frame::user::copy_to_user(addr, &ab[..len]);
-            let len32: u32 = len as u32;
-            let _ = frame::user::copy_to_user(addrlen_ptr, &len32.to_le_bytes());
+    r
+}
+
+const MSGHDR_SIZE: usize = 56;
+const MH_NAMELEN: u64 = 8;
+const MH_IOV: usize = 16;
+const MH_IOVLEN: usize = 24;
+const MH_CONTROL: usize = 32;
+const MH_CONTROLLEN: u64 = 40;
+const MH_FLAGS: u64 = 48;
+
+const CMSG_HDR_LEN: usize = 16;
+const SCM_SOL_SOCKET: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+const MSG_CTRUNC: u32 = 8;
+
+fn parse_scm_rights(control: u64, controllen: u64) -> Result<alloc::vec::Vec<Arc<OpenFile>>, i64> {
+    let mut out = alloc::vec::Vec::new();
+    if control == 0 || controllen < CMSG_HDR_LEN as u64 {
+        return Ok(out);
+    }
+    let mut chdr = [0u8; CMSG_HDR_LEN];
+    if frame::user::copy_from_user(control, &mut chdr).is_err() {
+        return Err(EFAULT);
+    }
+    let cmsg_len = u64::from_le_bytes(chdr[0..8].try_into().unwrap()) as usize;
+    let level = i32::from_le_bytes(chdr[8..12].try_into().unwrap());
+    let ctype = i32::from_le_bytes(chdr[12..16].try_into().unwrap());
+    if level != SCM_SOL_SOCKET || ctype != SCM_RIGHTS {
+        return Ok(out);
+    }
+    if cmsg_len < CMSG_HDR_LEN || cmsg_len as u64 > controllen {
+        return Err(EINVAL);
+    }
+    let nfds = (cmsg_len - CMSG_HDR_LEN) / 4;
+    for i in 0..nfds {
+        let mut b = [0u8; 4];
+        if frame::user::copy_from_user(control + CMSG_HDR_LEN as u64 + (i as u64) * 4, &mut b)
+            .is_err()
+        {
+            return Err(EFAULT);
+        }
+        let fdnum = i32::from_le_bytes(b);
+        match sched::with_current_fds(|t| t.get(fdnum)) {
+            Some(of) => out.push(of),
+            None => return Err(EBADF),
         }
     }
+    Ok(out)
+}
+
+fn deliver_scm_rights(
+    fds: alloc::vec::Vec<Arc<OpenFile>>,
+    control: u64,
+    controllen: u64,
+) -> (u64, bool) {
+    if fds.is_empty() {
+        return (0, false);
+    }
+    let needed = CMSG_HDR_LEN + fds.len() * 4;
+    if control == 0 || (controllen as usize) < needed {
+        return (0, true);
+    }
+    let mut ints: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+    for of in fds {
+        match sched::with_current_fds(|t| t.install(of)) {
+            Ok(fd) => ints.push(fd),
+            Err(_) => break,
+        }
+    }
+    let cmsg_len = CMSG_HDR_LEN + ints.len() * 4;
+    let mut cbuf = alloc::vec![0u8; cmsg_len];
+    cbuf[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+    cbuf[8..12].copy_from_slice(&SCM_SOL_SOCKET.to_le_bytes());
+    cbuf[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+    for (i, fd) in ints.iter().enumerate() {
+        cbuf[CMSG_HDR_LEN + i * 4..CMSG_HDR_LEN + i * 4 + 4].copy_from_slice(&fd.to_le_bytes());
+    }
+    if frame::user::copy_to_user(control, &cbuf).is_err() {
+        return (0, true);
+    }
+    (cmsg_len as u64, false)
+}
+
+pub(super) fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
+    let mut hdr = [0u8; MSGHDR_SIZE];
+    if frame::user::copy_from_user(msg, &mut hdr).is_err() {
+        return EFAULT;
+    }
+    let iov = u64::from_le_bytes(hdr[MH_IOV..MH_IOV + 8].try_into().unwrap());
+    let iovlen = u64::from_le_bytes(hdr[MH_IOVLEN..MH_IOVLEN + 8].try_into().unwrap());
+    let vecs = match super::fs::read_iovecs(iov, iovlen) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let total: usize = vecs
+        .iter()
+        .fold(0usize, |acc, (_, l)| acc.saturating_add(*l));
+    if total == 0 {
+        return 0;
+    }
+    let file = match sched::with_current_fds(|t| t.get(fd as i32)) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+    let cap = total.min(READ_BUF_MAX);
+    let mut tmp = alloc::vec![0u8; cap];
+    let (read, fds) = match file.inode.read_with_fds(&mut tmp) {
+        Ok(r) => r,
+        Err(e) => return e.errno(),
+    };
+    let mut off = 0usize;
+    for (base, len) in &vecs {
+        if off >= read {
+            break;
+        }
+        let take = (*len).min(read - off);
+        if take > 0 && frame::user::copy_to_user(*base, &tmp[off..off + take]).is_err() {
+            return EFAULT;
+        }
+        off += take;
+    }
+    let control = u64::from_le_bytes(hdr[MH_CONTROL..MH_CONTROL + 8].try_into().unwrap());
+    let controllen = u64::from_le_bytes(hdr[MH_CONTROL + 8..MH_CONTROL + 16].try_into().unwrap());
+    let (ctrl_len, ctrunc) = deliver_scm_rights(fds, control, controllen);
+    let _ = frame::user::copy_to_user(msg + MH_NAMELEN, &0u32.to_le_bytes());
+    let _ = frame::user::copy_to_user(msg + MH_CONTROLLEN, &ctrl_len.to_le_bytes());
+    let flags = if ctrunc { MSG_CTRUNC } else { 0 };
+    let _ = frame::user::copy_to_user(msg + MH_FLAGS, &flags.to_le_bytes());
     read as i64
 }
 
-pub(super) fn sys_shutdown(fd: u64, how: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+pub(super) fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
+    let mut hdr = [0u8; MSGHDR_SIZE];
+    if frame::user::copy_from_user(msg, &mut hdr).is_err() {
+        return EFAULT;
+    }
+    let iov = u64::from_le_bytes(hdr[MH_IOV..MH_IOV + 8].try_into().unwrap());
+    let iovlen = u64::from_le_bytes(hdr[MH_IOVLEN..MH_IOVLEN + 8].try_into().unwrap());
+    let vecs = match super::fs::read_iovecs(iov, iovlen) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    match sock.shutdown(how as i32) {
-        Ok(()) => 0,
+    let total: usize = vecs
+        .iter()
+        .fold(0usize, |acc, (_, l)| acc.saturating_add(*l));
+    let control = u64::from_le_bytes(hdr[MH_CONTROL..MH_CONTROL + 8].try_into().unwrap());
+    let controllen = u64::from_le_bytes(hdr[MH_CONTROL + 8..MH_CONTROL + 16].try_into().unwrap());
+    let fds = match parse_scm_rights(control, controllen) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if total == 0 && fds.is_empty() {
+        return 0;
+    }
+    let file = match sched::with_current_fds(|t| t.get(fd as i32)) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+    let cap = total.min(WRITE_BUF_MAX);
+    let mut tmp = alloc::vec![0u8; cap];
+    let mut off = 0usize;
+    for (base, len) in &vecs {
+        if off >= cap {
+            break;
+        }
+        let take = (*len).min(cap - off);
+        if take > 0 && frame::user::copy_from_user(*base, &mut tmp[off..off + take]).is_err() {
+            return EFAULT;
+        }
+        off += take;
+    }
+    let r = if fds.is_empty() {
+        let wf = if fd_is_nonblock(fd as i32) {
+            OpenFlags::NONBLOCK
+        } else {
+            OpenFlags::empty()
+        };
+        file.inode.write_at_with_flags(0, &tmp[..off], wf)
+    } else {
+        file.inode.write_with_fds(&tmp[..off], fds)
+    };
+    match r {
+        Ok(w) => w as i64,
         Err(e) => e.errno(),
     }
 }
 
-const SOL_SOCKET: u64 = 1;
-const IPPROTO_TCP: u64 = 6;
-const IPPROTO_IP: u64 = 0;
-
-const SO_DEBUG: u64 = 1;
-const SO_REUSEADDR: u64 = 2;
-const SO_TYPE: u64 = 3;
-const SO_ERROR: u64 = 4;
-const SO_DONTROUTE: u64 = 5;
-const SO_BROADCAST: u64 = 6;
-const SO_SNDBUF: u64 = 7;
-const SO_RCVBUF: u64 = 8;
-const SO_KEEPALIVE: u64 = 9;
-const SO_OOBINLINE: u64 = 10;
-const SO_LINGER: u64 = 13;
-const SO_REUSEPORT: u64 = 15;
-const SO_RCVTIMEO: u64 = 20;
-const SO_SNDTIMEO: u64 = 21;
-const SO_DOMAIN: u64 = 39;
-const SO_PROTOCOL: u64 = 38;
-
-const TCP_NODELAY: u64 = 1;
-const TCP_KEEPIDLE: u64 = 4;
-const TCP_KEEPINTVL: u64 = 5;
-const TCP_KEEPCNT: u64 = 6;
-
-const IP_TTL: u64 = 2;
-const IP_TOS: u64 = 1;
-const IP_PKTINFO: u64 = 8;
+pub(super) fn sys_shutdown(fd: u64, how: u64) -> i64 {
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    match file.inode.as_socket() {
+        Some(s) => s.shutdown(how as i32),
+        None => crate::errno::ENOTSOCK,
+    }
+}
 
 pub(super) fn sys_setsockopt(fd: u64, level: u64, opt: u64, optval: u64, optlen: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    let read_int = || -> Result<i32, i64> {
-        if optlen < 4 {
-            return Err(EINVAL);
-        }
-        let mut buf = [0u8; 4];
-        if frame::user::copy_from_user(optval, &mut buf).is_err() {
-            return Err(EFAULT);
-        }
-        Ok(i32::from_le_bytes(buf))
-    };
-    let read_timeval_us = || -> Result<u64, i64> {
-        if optlen < 16 {
-            return Err(EINVAL);
-        }
-        let mut buf = [0u8; 16];
-        if frame::user::copy_from_user(optval, &mut buf).is_err() {
-            return Err(EFAULT);
-        }
-        let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap()).max(0) as u64;
-        let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap()).max(0) as u64;
-        Ok(sec.saturating_mul(1_000_000).saturating_add(usec))
-    };
-
-    match (level, opt) {
-        (SOL_SOCKET, SO_REUSEADDR) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().reuseaddr = v != 0;
-            0
-        }
-        (SOL_SOCKET, SO_REUSEPORT) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().reuseport = v != 0;
-            0
-        }
-        (SOL_SOCKET, SO_KEEPALIVE) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().keepalive = v != 0;
-            if sock.is_tcp() {
-                sock.apply_smoltcp_sockopt(
-                    crate::net::inet::SmoltcpOpt::Keepalive,
-                    if v != 0 { 1 } else { 0 },
-                );
-            }
-            0
-        }
-        (SOL_SOCKET, SO_BROADCAST) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().broadcast = v != 0;
-            0
-        }
-        (SOL_SOCKET, SO_RCVBUF) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().rcvbuf = (v.max(0) as u32).saturating_mul(2);
-            0
-        }
-        (SOL_SOCKET, SO_SNDBUF) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().sndbuf = (v.max(0) as u32).saturating_mul(2);
-            0
-        }
-        (SOL_SOCKET, SO_RCVTIMEO) => {
-            let us = match read_timeval_us() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().rcvtimeo_us = us;
-            0
-        }
-        (SOL_SOCKET, SO_SNDTIMEO) => {
-            let us = match read_timeval_us() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().sndtimeo_us = us;
-            0
-        }
-        (SOL_SOCKET, SO_LINGER) => {
-            if optlen < 8 {
-                return EINVAL;
-            }
-            let mut buf = [0u8; 8];
-            if frame::user::copy_from_user(optval, &mut buf).is_err() {
-                return EFAULT;
-            }
-            let onoff = i32::from_le_bytes(buf[0..4].try_into().unwrap());
-            let secs = i32::from_le_bytes(buf[4..8].try_into().unwrap()).max(0) as u32;
-            let mut o = sock.opts.lock();
-            o.linger_on = onoff != 0;
-            o.linger_seconds = secs;
-            0
-        }
-        (SOL_SOCKET, SO_DEBUG | SO_DONTROUTE | SO_OOBINLINE) => {
-            let _ = read_int();
-            0
-        }
-        (IPPROTO_TCP, TCP_NODELAY) => {
-            if !sock.is_tcp() {
-                return -92;
-            }
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            sock.opts.lock().nodelay = v != 0;
-            sock.apply_smoltcp_sockopt(
-                crate::net::inet::SmoltcpOpt::TcpNoDelay,
-                if v != 0 { 1 } else { 0 },
-            );
-            0
-        }
-        (IPPROTO_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT) => {
-            let _ = read_int();
-            0
-        }
-        (IPPROTO_IP, IP_TTL) => {
-            let v = match read_int() {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            let ttl = v.clamp(1, 255) as u8;
-            sock.opts.lock().ip_ttl = ttl;
-            if sock.is_tcp() {
-                sock.apply_smoltcp_sockopt(crate::net::inet::SmoltcpOpt::HopLimit, ttl as u64);
-            }
-            0
-        }
-        (IPPROTO_IP, IP_TOS | IP_PKTINFO) => {
-            let _ = read_int();
-            0
-        }
-        _ => -92,
+    match file.inode.as_socket() {
+        Some(s) => s.setsockopt(level as i32, opt as i32, optval, optlen),
+        None => crate::errno::ENOTSOCK,
     }
 }
 
 pub(super) fn sys_getsockopt(fd: u64, level: u64, opt: u64, optval: u64, optlen_ptr: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    let mut user_len = [0u8; 4];
-    if frame::user::copy_from_user(optlen_ptr, &mut user_len).is_err() {
-        return EFAULT;
+    match file.inode.as_socket() {
+        Some(s) => s.getsockopt(level as i32, opt as i32, optval, optlen_ptr),
+        None => crate::errno::ENOTSOCK,
     }
-    let mut user_len = u32::from_le_bytes(user_len) as usize;
-    let write_int = |val: i32| -> i64 {
-        if user_len < 4 {
-            return EINVAL;
-        }
-        let bytes = val.to_le_bytes();
-        if frame::user::copy_to_user(optval, &bytes).is_err() {
-            return EFAULT;
-        }
-        if frame::user::copy_to_user(optlen_ptr, &4u32.to_le_bytes()).is_err() {
-            return EFAULT;
-        }
-        0
-    };
-    let write_timeval = |us: u64| -> i64 {
-        if user_len < 16 {
-            return EINVAL;
-        }
-        let mut buf = [0u8; 16];
-        let sec = (us / 1_000_000) as i64;
-        let usec = (us % 1_000_000) as i64;
-        buf[0..8].copy_from_slice(&sec.to_le_bytes());
-        buf[8..16].copy_from_slice(&usec.to_le_bytes());
-        if frame::user::copy_to_user(optval, &buf).is_err() {
-            return EFAULT;
-        }
-        if frame::user::copy_to_user(optlen_ptr, &16u32.to_le_bytes()).is_err() {
-            return EFAULT;
-        }
-        0
-    };
-
-    let opts = *sock.opts.lock();
-    match (level, opt) {
-        (SOL_SOCKET, SO_TYPE) => write_int(sock.sock_type() as i32),
-        (SOL_SOCKET, SO_PROTOCOL) => write_int(sock.proto() as i32),
-        (SOL_SOCKET, SO_DOMAIN) => write_int(2),
-        (SOL_SOCKET, SO_ERROR) => write_int(sock.take_so_error() as i32),
-        (SOL_SOCKET, SO_REUSEADDR) => write_int(opts.reuseaddr as i32),
-        (SOL_SOCKET, SO_REUSEPORT) => write_int(opts.reuseport as i32),
-        (SOL_SOCKET, SO_KEEPALIVE) => write_int(opts.keepalive as i32),
-        (SOL_SOCKET, SO_BROADCAST) => write_int(opts.broadcast as i32),
-        (SOL_SOCKET, SO_RCVBUF) => write_int(opts.rcvbuf as i32),
-        (SOL_SOCKET, SO_SNDBUF) => write_int(opts.sndbuf as i32),
-        (SOL_SOCKET, SO_RCVTIMEO) => write_timeval(opts.rcvtimeo_us),
-        (SOL_SOCKET, SO_SNDTIMEO) => write_timeval(opts.sndtimeo_us),
-        (SOL_SOCKET, SO_LINGER) => {
-            if user_len < 8 {
-                return EINVAL;
-            }
-            let mut buf = [0u8; 8];
-            buf[0..4].copy_from_slice(&(opts.linger_on as i32).to_le_bytes());
-            buf[4..8].copy_from_slice(&(opts.linger_seconds as i32).to_le_bytes());
-            if frame::user::copy_to_user(optval, &buf).is_err() {
-                return EFAULT;
-            }
-            if frame::user::copy_to_user(optlen_ptr, &8u32.to_le_bytes()).is_err() {
-                return EFAULT;
-            }
-            0
-        }
-        (SOL_SOCKET, SO_DEBUG | SO_DONTROUTE | SO_OOBINLINE) => write_int(0),
-        (IPPROTO_TCP, TCP_NODELAY) => write_int(opts.nodelay as i32),
-        (IPPROTO_TCP, TCP_KEEPIDLE) => write_int(60),
-        (IPPROTO_TCP, TCP_KEEPINTVL) => write_int(60),
-        (IPPROTO_TCP, TCP_KEEPCNT) => write_int(9),
-        (IPPROTO_IP, IP_TTL) => write_int(opts.ip_ttl as i32),
-        (IPPROTO_IP, IP_TOS) => write_int(0),
-        _ => {
-            user_len = user_len.min(4);
-            let zeroes = [0u8; 4];
-            let _ = frame::user::copy_to_user(optval, &zeroes[..user_len]);
-            -92
-        }
-    }
-}
-
-fn copy_sockaddr_to_user(ep: &smoltcp::wire::IpEndpoint, addr: u64, addrlen_ptr: u64) -> i64 {
-    if addr == 0 || addrlen_ptr == 0 {
-        return EFAULT;
-    }
-    let mut cap = [0u8; 4];
-    if frame::user::copy_from_user(addrlen_ptr, &mut cap).is_err() {
-        return EFAULT;
-    }
-    let cap = u32::from_le_bytes(cap) as usize;
-    let mut ab = [0u8; 16];
-    let full = crate::net::inet::write_sockaddr_in(ep, &mut ab);
-    let n = full.min(cap);
-    if n > 0 && frame::user::copy_to_user(addr, &ab[..n]).is_err() {
-        return EFAULT;
-    }
-    let full32 = full as u32;
-    if frame::user::copy_to_user(addrlen_ptr, &full32.to_le_bytes()).is_err() {
-        return EFAULT;
-    }
-    0
 }
 
 pub(super) fn sys_getsockname(fd: u64, addr: u64, addrlen_ptr: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    let ep = sock.local_name();
-    copy_sockaddr_to_user(&ep, addr, addrlen_ptr)
+    match file.inode.as_socket() {
+        Some(s) => s.getsockname(addr, addrlen_ptr),
+        None => crate::errno::ENOTSOCK,
+    }
 }
 
 pub(super) fn sys_getpeername(fd: u64, addr: u64, addrlen_ptr: u64) -> i64 {
-    let sock = match lookup_inet_from_fd(fd as i32) {
-        Some(s) => s,
-        None => return -88,
+    let file = match socket_from_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
     };
-    let ep = match sock.peer_endpoint() {
-        Some(ep) => ep,
-        None => return ENOTCONN,
-    };
-    copy_sockaddr_to_user(&ep, addr, addrlen_ptr)
+    match file.inode.as_socket() {
+        Some(s) => s.getpeername(addr, addrlen_ptr),
+        None => crate::errno::ENOTSOCK,
+    }
 }

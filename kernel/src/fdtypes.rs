@@ -6,7 +6,62 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use frame::sync::SpinIrq;
 
 use crate::process::Pid;
-use crate::vfs::{FsError, Inode, InodeKind, PollMask, Stat};
+use crate::vfs::blocking::IoAttempt;
+use crate::vfs::{FsError, Inode, InodeKind, OpenFlags, PollMask, Stat};
+
+#[derive(Clone)]
+pub enum NamespaceHandle {
+    Uts(Arc<crate::process::UtsNamespace>),
+    Ipc(Arc<crate::process::IpcNamespace>),
+    Pid(Arc<crate::process::PidNamespace>),
+    Cgroup(Arc<crate::process::CgroupNamespace>),
+    Time(Arc<crate::process::TimeNamespace>),
+    Net(Arc<crate::net::NetNamespace>),
+}
+
+impl NamespaceHandle {
+    pub fn type_flag(&self) -> u64 {
+        match self {
+            NamespaceHandle::Uts(_) => 0x0400_0000,
+            NamespaceHandle::Ipc(_) => 0x0800_0000,
+            NamespaceHandle::Pid(_) => 0x2000_0000,
+            NamespaceHandle::Cgroup(_) => 0x0200_0000,
+            NamespaceHandle::Time(_) => 0x0000_0080,
+            NamespaceHandle::Net(_) => 0x4000_0000,
+        }
+    }
+}
+
+pub struct NamespaceFdInode {
+    handle: NamespaceHandle,
+    inode_id: u64,
+}
+
+static NEXT_NSFD_ID: AtomicU64 = AtomicU64::new(1);
+
+impl NamespaceFdInode {
+    pub fn new(handle: NamespaceHandle) -> Arc<Self> {
+        let inode_id = 0xf500_0000_0000_0000 | NEXT_NSFD_ID.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Self { handle, inode_id })
+    }
+}
+
+impl Inode for NamespaceFdInode {
+    fn kind(&self) -> InodeKind {
+        InodeKind::Regular
+    }
+    fn stat(&self) -> Stat {
+        let mut s = Stat::fresh(InodeKind::Regular, 0, 0o444);
+        s.inode_id = self.inode_id;
+        s
+    }
+    fn inode_id(&self) -> u64 {
+        self.inode_id
+    }
+    fn as_namespace_handle(&self) -> Option<&NamespaceHandle> {
+        Some(&self.handle)
+    }
+}
 
 pub struct PidFdInode {
     pub target: Pid,
@@ -185,35 +240,56 @@ impl Inode for EventFdInode {
         self.inode_id
     }
 
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_with_flags(off, buf, OpenFlags::empty())
+    }
+
+    fn read_at_with_flags(
+        &self,
+        _off: u64,
+        buf: &mut [u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
         if buf.len() < 8 {
             return Err(FsError::InvalidArgument);
         }
-        loop {
-            let mut c = self.counter.lock();
-            if *c > 0 {
-                let val = if self.semaphore {
-                    *c -= 1;
-                    1u64
+        crate::vfs::blocking::block_io(
+            "eventfd_read",
+            &self.wait,
+            flags.contains(OpenFlags::NONBLOCK),
+            None,
+            || {
+                let mut c = self.counter.lock();
+                if *c > 0 {
+                    let val = if self.semaphore {
+                        *c -= 1;
+                        1u64
+                    } else {
+                        let v = *c;
+                        *c = 0;
+                        v
+                    };
+                    drop(c);
+                    buf[..8].copy_from_slice(&val.to_le_bytes());
+                    self.wait.wake_all();
+                    IoAttempt::Ready(8)
                 } else {
-                    let v = *c;
-                    *c = 0;
-                    v
-                };
-                drop(c);
-                buf[..8].copy_from_slice(&val.to_le_bytes());
-                self.wait.wake_all();
-                return Ok(8);
-            }
-            drop(c);
-            self.wait.park();
-            if crate::sched::current_signal_pending() {
-                return Err(FsError::Interrupted);
-            }
-        }
+                    IoAttempt::WouldBlock
+                }
+            },
+        )
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, FsError> {
+        self.write_at_with_flags(off, buf, OpenFlags::empty())
+    }
+
+    fn write_at_with_flags(
+        &self,
+        _off: u64,
+        buf: &[u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
         if buf.len() < 8 {
             return Err(FsError::InvalidArgument);
         }
@@ -221,23 +297,26 @@ impl Inode for EventFdInode {
         if add == u64::MAX {
             return Err(FsError::InvalidArgument);
         }
-        loop {
-            let mut c = self.counter.lock();
-            if c.checked_add(add)
-                .map(|n| n <= EVENTFD_MAX)
-                .unwrap_or(false)
-            {
-                *c += add;
-                drop(c);
-                self.wait.wake_all();
-                return Ok(8);
-            }
-            drop(c);
-            self.wait.park();
-            if crate::sched::current_signal_pending() {
-                return Err(FsError::Interrupted);
-            }
-        }
+        crate::vfs::blocking::block_io(
+            "eventfd_write",
+            &self.wait,
+            flags.contains(OpenFlags::NONBLOCK),
+            None,
+            || {
+                let mut c = self.counter.lock();
+                if c.checked_add(add)
+                    .map(|n| n <= EVENTFD_MAX)
+                    .unwrap_or(false)
+                {
+                    *c += add;
+                    drop(c);
+                    self.wait.wake_all();
+                    IoAttempt::Ready(8)
+                } else {
+                    IoAttempt::WouldBlock
+                }
+            },
+        )
     }
 
     fn poll(&self) -> PollMask {
@@ -354,18 +433,28 @@ impl Inode for TimerFdInode {
         if buf.len() < 8 {
             return Err(FsError::InvalidArgument);
         }
+        let pid = crate::sched::current_pid();
         loop {
-            let mut s = self.state.lock();
-            if s.expirations > 0 {
-                let v = s.expirations;
-                s.expirations = 0;
-                drop(s);
+            self.wait.enqueue(pid);
+            let ready = {
+                let mut s = self.state.lock();
+                if s.expirations > 0 {
+                    let v = s.expirations;
+                    s.expirations = 0;
+                    Some(v)
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = ready {
+                self.wait.dequeue(pid);
                 buf[..8].copy_from_slice(&v.to_le_bytes());
                 return Ok(8);
             }
-            drop(s);
-            self.wait.park();
-            if crate::sched::current_signal_pending() {
+            let still_parked = || self.wait.contains(pid);
+            let outcome = crate::wait::wait_guarded("timerfd_read", None, &still_parked);
+            self.wait.dequeue(pid);
+            if outcome == crate::wait::WaitOutcome::Interrupted {
                 return Err(FsError::Interrupted);
             }
         }

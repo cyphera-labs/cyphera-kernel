@@ -1,15 +1,4 @@
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Pid(pub u32);
-
-impl Pid {
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-
-    pub const fn from_raw(raw: u32) -> Self {
-        Pid(raw)
-    }
-}
+pub use cyphera_kapi::Pid;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedClass {

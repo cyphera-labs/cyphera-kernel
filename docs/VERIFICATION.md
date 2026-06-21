@@ -245,12 +245,11 @@ A successful verification confirms:
 ### Verify the Sigstore cosign signature
 
 ```bash
-# Requires `cosign` >= 2.x.
+# Requires `cosign` >= 3.x.
 cosign verify-blob \
   --certificate-identity-regexp "^https://github.com/cyphera-labs/cyphera-kernel/" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --signature cyphera-kernel-vX.Y.Z.elf.sig \
-  --certificate cyphera-kernel-vX.Y.Z.elf.pem \
+  --bundle cyphera-kernel-vX.Y.Z.elf.sigstore.json \
   cyphera-kernel-vX.Y.Z.elf
 ```
 

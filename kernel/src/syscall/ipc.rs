@@ -86,16 +86,14 @@ pub(super) fn sys_futex(
             };
             crate::futex::wait_requeue_pi(vmspace_id, uaddr, val as i32, deadline, uaddr2)
         }
-        FUTEX_CMP_REQUEUE_PI => {
-            crate::futex::cmp_requeue_pi(
-                vmspace_id,
-                uaddr,
-                val as u32,
-                timeout as u32,
-                uaddr2,
-                val3 as i32,
-            )
-        }
+        FUTEX_CMP_REQUEUE_PI => crate::futex::cmp_requeue_pi(
+            vmspace_id,
+            uaddr,
+            val as u32,
+            timeout as u32,
+            uaddr2,
+            val3 as i32,
+        ),
         _ => ENOSYS,
     }
 }

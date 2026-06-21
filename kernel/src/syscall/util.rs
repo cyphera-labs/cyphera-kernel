@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-use alloc::sync::Arc;
-
 use crate::errno::{EFAULT, EINVAL};
 use crate::sched;
 use crate::vfs::{OpenFlags, TimeSpec};
@@ -83,7 +81,7 @@ pub(super) fn validate_futex2_flags(flags: u32) -> Result<(), i64> {
 }
 
 pub(super) fn caller_can_set_time() -> bool {
-    sched::with_target_process(sched::current_pid(), |p| p.creds.lock().euid == 0).unwrap_or(false)
+    sched::with_target_creds(sched::current_pid(), |c| c.euid == 0).unwrap_or(false)
 }
 
 pub(super) fn read_user_cstr(ptr: u64, max: usize) -> Result<alloc::string::String, i64> {
@@ -97,11 +95,6 @@ pub(super) fn read_user_cstr(ptr: u64, max: usize) -> Result<alloc::string::Stri
     let n = buf.iter().position(|&b| b == 0).ok_or(EINVAL)?;
     buf.truncate(n);
     alloc::string::String::from_utf8(buf).map_err(|_| EINVAL)
-}
-
-pub(super) fn lookup_inet_from_fd(fd: i32) -> Option<Arc<crate::net::inet::InetSocket>> {
-    let file = sched::with_current_fds(|t| t.get(fd))?;
-    crate::net::inet::lookup_by_inode(&*file.inode)
 }
 
 pub(super) fn fd_is_nonblock(fd: i32) -> bool {

@@ -3,6 +3,7 @@ cargo-features = ["trim-paths"]
 [workspace]
 resolver = "2"
 members = [
+    "kapi",
     "frame",
     "frame_host",
     "kernel",
@@ -19,7 +20,7 @@ members = [
 default-members = ["runtime/boot"]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.4"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Horizon Digital Engineering LLC <security@horizondigital.dev>"]

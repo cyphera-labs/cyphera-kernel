@@ -133,6 +133,25 @@ pub fn register_user_pf_hook(f: UserPageFaultHook) {
     USER_PF_HOOK.store(f as *mut (), Ordering::SeqCst);
 }
 
+pub type IrqNotifyResume = fn();
+
+static IRQ_NOTIFY_RESUME: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_irq_notify_resume(f: IrqNotifyResume) {
+    IRQ_NOTIFY_RESUME.store(f as *mut (), Ordering::SeqCst);
+}
+
+pub(crate) fn irq_notify_resume() -> Option<IrqNotifyResume> {
+    let ptr = IRQ_NOTIFY_RESUME.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: only register_irq_notify_resume stores into this slot, and
+        // it stores a valid `fn` pointer.
+        Some(unsafe { core::mem::transmute::<*mut (), IrqNotifyResume>(ptr) })
+    }
+}
+
 pub(crate) fn user_fault_handler() -> Option<UserFaultHandler> {
     let ptr = USER_FAULT_HANDLER.load(Ordering::SeqCst);
     if ptr.is_null() {
@@ -311,20 +330,15 @@ pub fn peek_other_vmspace(
             Some(p) => p,
             None => return Err(UserAccessFault),
         };
-        let kva = pa.as_u64() + crate::boot::KERNEL_VMA_OFFSET + page_off as u64;
-        // SAFETY: `kva` is the boot-stub 1 GiB high-half window alias
-        // (`pa | KERNEL_VMA_OFFSET`, PDPT_high[510]) of the frame
-        // `translate` resolved, plus `page_off`. That window is a valid
-        // alias only for pa < 1 GiB; the supported microvm config keeps
-        // all guest DRAM (hence every tracee frame) below 1 GiB, so the
-        // resolved frame is in range. `chunk` is clamped to the bytes
-        // left in that 4 KiB page (`4096 - page_off`) and to
-        // `dst.len() - written`, so the read stays inside one mapped
-        // frame and the write inside `dst`. The two regions never
-        // overlap — `kva` is a kernel-window address, `dst` a
-        // caller-owned kernel buffer. The caller holds the tracee's
-        // `VmSpace` lock so the translation can't be unmapped under us
-        // between `translate` and the read.
+        let kva = crate::mm::direct_map::phys_to_virt(pa.as_u64()) + page_off as u64;
+        // SAFETY: `kva` is the direct-map alias of the frame `translate`
+        // resolved, plus `page_off`; the direct map covers all RAM. `chunk`
+        // is clamped to the bytes left in the 4 KiB page (`4096 - page_off`)
+        // and to `dst.len() - written`, so the read stays inside one mapped
+        // frame and the write inside `dst`; the two never overlap (`kva` is
+        // a direct-map address, `dst` a caller-owned buffer). The caller
+        // holds the tracee's `VmSpace` lock, so the translation can't be
+        // unmapped between `translate` and the read.
         unsafe {
             core::ptr::copy_nonoverlapping(kva as *const u8, dst[written..].as_mut_ptr(), chunk);
         }
@@ -333,20 +347,24 @@ pub fn peek_other_vmspace(
     Ok(())
 }
 
+pub struct PokeBreaks(pub alloc::vec::Vec<crate::mm::PhysFrame<crate::mm::Size4KiB>>);
+
 pub fn poke_other_vmspace(
     vmspace: &mut crate::mm::vm::VmSpace,
     user_va: u64,
     src: &[u8],
-) -> Result<(), UserAccessFault> {
+) -> (PokeBreaks, Result<(), UserAccessFault>) {
+    let mut freed: alloc::vec::Vec<crate::mm::PhysFrame<crate::mm::Size4KiB>> =
+        alloc::vec::Vec::new();
     if src.is_empty() {
-        return Ok(());
+        return (PokeBreaks(freed), Ok(()));
     }
     let end = match user_va.checked_add(src.len() as u64) {
         Some(e) => e,
-        None => return Err(UserAccessFault),
+        None => return (PokeBreaks(freed), Err(UserAccessFault)),
     };
     if end > 0x0000_8000_0000_0000 {
-        return Err(UserAccessFault);
+        return (PokeBreaks(freed), Err(UserAccessFault));
     }
 
     let mut read = 0;
@@ -354,30 +372,34 @@ pub fn poke_other_vmspace(
         let va = user_va + read as u64;
         let page_off = (va & 0xfff) as usize;
         let chunk = (4096 - page_off).min(src.len() - read);
-        let pa = match vmspace.translate(crate::mm::VirtAddr::new(va & !0xfff)) {
+        let page_va = crate::mm::VirtAddr::new(va & !0xfff);
+        if vmspace.page_is_cow(page_va) {
+            match vmspace.break_cow(page_va, None) {
+                Ok(crate::mm::vm::CowBreak::Broken { old_frame }) => freed.push(old_frame),
+                Ok(crate::mm::vm::CowBreak::BrokenInPlace) => {}
+                Ok(_) => {}
+                Err(_) => return (PokeBreaks(freed), Err(UserAccessFault)),
+            }
+        }
+        let pa = match vmspace.translate(page_va) {
             Some(p) => p,
-            None => return Err(UserAccessFault),
+            None => return (PokeBreaks(freed), Err(UserAccessFault)),
         };
-        let kva = pa.as_u64() + crate::boot::KERNEL_VMA_OFFSET + page_off as u64;
-        // SAFETY: `kva` is the boot-stub 1 GiB high-half window alias
-        // (`pa | KERNEL_VMA_OFFSET`, PDPT_high[510]) of the frame
-        // `translate` resolved, plus `page_off`. The kernel window maps
-        // the frame RW regardless of the per-process PTE write bit, so
-        // POKETEXT into RO `.text` lands. The window is a valid alias
-        // only for pa < 1 GiB; the supported microvm config keeps all
-        // guest DRAM (hence every tracee frame) below 1 GiB, so the
-        // resolved frame is in range. `chunk` is clamped to the bytes
-        // left in that 4 KiB page and to `src.len() - read`, so the
-        // write stays inside one mapped frame and the read inside
-        // `src`. Source (caller's kernel buffer) and destination
-        // (window) don't overlap. The caller holds the tracee's
-        // `VmSpace` lock, pinning the translation across the write.
+        let kva = crate::mm::direct_map::phys_to_virt(pa.as_u64()) + page_off as u64;
+        // SAFETY: `kva` is the direct-map alias of the frame `translate`
+        // resolved, plus `page_off`; the direct map covers all RAM and is
+        // writable regardless of the per-process PTE write bit, so POKETEXT
+        // into RO `.text` lands. `chunk` is clamped to the bytes left in the
+        // 4 KiB page and to `src.len() - read`, so the write stays inside one
+        // mapped frame and the read inside `src`; source (caller buffer) and
+        // destination (direct map) don't overlap. The caller holds the
+        // tracee's `VmSpace` lock, pinning the translation across the write.
         unsafe {
             core::ptr::copy_nonoverlapping(src[read..].as_ptr(), kva as *mut u8, chunk);
         }
         read += chunk;
     }
-    Ok(())
+    (PokeBreaks(freed), Ok(()))
 }
 
 pub fn copy_to_user(user_addr: u64, src: &[u8]) -> Result<(), UserAccessFault> {
@@ -401,6 +423,7 @@ pub fn cmpxchg_user_u32(user_addr: u64, expected: u32, new: u32) -> Result<u32, 
         return Err(UserAccessFault);
     }
     let prev: u32;
+    let mut faulted: u32 = 0;
     // SAFETY: `user_addr` was checked 4-byte-aligned and validated
     // USER-RW for 4 bytes by `access_ok` just above, so the single
     // aligned 32-bit `lock cmpxchg` it names is a well-formed atomic
@@ -408,15 +431,30 @@ pub fn cmpxchg_user_u32(user_addr: u64, expected: u32, new: u32) -> Result<u32, 
     // honored (no stack refs); the only memory accessed is that
     // validated user dword named by `{ptr}` (a read-modify-write,
     // so `nomem` is intentionally NOT set), and the asm otherwise
-    // touches only `eax`.
+    // touches only `eax` and `{faulted}`. The `__ex_table` entry
+    // points the cmpxchg's CPL0 #PF (a concurrent fork can RO-downgrade
+    // the page between access_ok and the RMW) at a fixup pad that sets
+    // `{faulted}` instead of panicking — recovered into Err below.
     unsafe {
         core::arch::asm!(
-            "lock cmpxchg [{ptr}], {new:e}",
+            "23: lock cmpxchg [{ptr}], {new:e}",
+            "    jmp 25f",
+            "24: mov {faulted:e}, 1",
+            "25:",
+            ".pushsection __ex_table, \"a\"",
+            "    .balign 8",
+            "    .quad 23b",
+            "    .quad 24b",
+            ".popsection",
             ptr = in(reg) user_addr,
             new = in(reg) new,
+            faulted = inout(reg) faulted,
             inout("eax") expected => prev,
             options(nostack),
         );
+    }
+    if faulted != 0 {
+        return Err(UserAccessFault);
     }
     Ok(prev)
 }
@@ -430,13 +468,7 @@ pub fn atomic_or_user_u32(user_addr: u64, mask: u32) -> Result<u32, UserAccessFa
     }
     loop {
         let mut buf = [0u8; 4];
-        // SAFETY: `user_addr` was checked 4-byte-aligned and validated
-        // USER-RW (hence readable) for 4 bytes by `access_ok` above, so
-        // reading 4 bytes from it is in-bounds of a mapped user dword.
-        // `buf` is a 4-byte local; source and destination don't overlap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(user_addr as *const u8, buf.as_mut_ptr(), 4);
-        }
+        copy_from_user(user_addr, &mut buf)?;
         let cur = u32::from_le_bytes(buf);
         let new = cur | mask;
         if new == cur {

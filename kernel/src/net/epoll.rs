@@ -174,7 +174,7 @@ impl EpollInstance {
                 }
                 true
             };
-            crate::sched::park_self_at_guarded("epoll_wait", &still_queued);
+            let outcome = crate::wait::wait_guarded("epoll_wait", deadline, &still_queued);
 
             for (_e, of) in &snapshot {
                 of.inode
@@ -182,17 +182,20 @@ impl EpollInstance {
             }
             drop(snapshot);
 
-            if crate::sched::current_signal_pending() {
-                if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+            match outcome {
+                crate::wait::WaitOutcome::Interrupted => {
+                    if deadline.is_some() {
+                        let _ = crate::timeout::unregister(pid);
+                    }
+                    return Err(EINTR);
                 }
-                return Err(EINTR);
-            }
-            if let Some(d) = deadline {
-                if frame::cpu::clock::nanos_since_boot() >= d {
-                    let _ = crate::timeout::unregister(pid);
+                crate::wait::WaitOutcome::TimedOut => {
+                    if deadline.is_some() {
+                        let _ = crate::timeout::unregister(pid);
+                    }
                     return Ok(Vec::new());
                 }
+                crate::wait::WaitOutcome::Woken => {}
             }
         }
     }

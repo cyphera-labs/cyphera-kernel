@@ -72,17 +72,16 @@ jobs:
       #   cosign verify-blob \
       #     --certificate-identity-regexp "^https://github.com/cyphera-labs/cyphera-kernel/" \
       #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      #     --signature <file>.sig --certificate <file>.pem <file>
+      #     --bundle <file>.sigstore.json <file>
       - name: Install cosign
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign SBOMs with cosign (keyless)
         run: |
           set -eo pipefail
           for f in cyphera-kernel-*-sbom.*.json; do
             cosign sign-blob --yes \
-              --output-signature "${f}.sig" \
-              --output-certificate "${f}.pem" \
+              --bundle "${f}.sigstore.json" \
               "$f"
           done
           ls -la cyphera-kernel-*-sbom.*
@@ -92,8 +91,7 @@ jobs:
           name: sbom
           path: |
             cyphera-kernel-*-sbom.*.json
-            cyphera-kernel-*-sbom.*.json.sig
-            cyphera-kernel-*-sbom.*.json.pem
+            cyphera-kernel-*-sbom.*.json.sigstore.json
             cyphera-kernel-*.provenance.intoto.jsonl
 
       - name: Attach SBOMs + signatures + provenance to release
@@ -103,7 +101,6 @@ jobs:
         run: |
           gh release upload "$REF_NAME" \
             cyphera-kernel-*-sbom.*.json \
-            cyphera-kernel-*-sbom.*.json.sig \
-            cyphera-kernel-*-sbom.*.json.pem \
+            cyphera-kernel-*-sbom.*.json.sigstore.json \
             cyphera-kernel-*.provenance.intoto.jsonl \
             --clobber

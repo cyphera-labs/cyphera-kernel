@@ -22,7 +22,7 @@ linux_nr,name,status,notes
 20,writev,implemented,
 21,access,implemented,"Real per-mode check via `Credentials::can_access` against the inode's owner/group/mode. ABI semantics: uses *real* (`ruid`/`rgid`) creds, not effective. Privileged caller bypasses (CAP_DAC_OVERRIDE-style)."
 22,pipe,implemented,Reuses `pipe2` with flags=0.
-23,select,missing,
+23,select,implemented,"fd_set bitmaps marshalled to/from a pollfd buffer and waited via the shared `poll_wait` core (the lost-wake-guarded loop factored out of `poll`). Returns the count of ready (fd,set) bits; POLLNVAL in a set → EBADF. timeout is a `timeval` (NULL = block forever). Cap 64 fds."
 24,sched_yield,implemented,Schedules into the per-CPU runqueue.
 25,mremap,implemented,"Anon-VMA shrink + extend-in-place + `MREMAP_MAYMOVE` relocate. Whole-VMA only (partial-range remap = EINVAL); file-backed grow = EINVAL (deferred). `MREMAP_FIXED` / `MREMAP_DONTUNMAP` = EINVAL. Copy via `frame::user::copy_{from,to}_user` through a 4 KiB chunk so `kernel/` keeps `forbid(unsafe_code)`. Cgroup uncharged on shrink + relocate."
 26,msync,implemented,"Walks SHARED file VMAs in `[addr, addr+length)` and calls `pagecache::writeback` for each. Conservative dirty-tracking (every writable SHARED faulted page is dirty until written back). MS_SYNC / MS_ASYNC / MS_INVALIDATE all map to synchronous writeback."
@@ -45,10 +45,10 @@ linux_nr,name,status,notes
 43,accept,implemented,"Real `accept`: listener has a backlog pool of N smoltcp sockets in `Listen`; accept finds an `Established` slot, swaps it for a fresh listener, returns the connection as a new fd. Honors O_NONBLOCK / parks on the listener's wait queue. Signal-interruptible — returns `-EINTR` on a deliverable signal during park."
 44,sendto,implemented,UDP send (`addr` is the dest); TCP `sendto` ignores `addr` per the ABI.
 45,recvfrom,implemented,Honors O_NONBLOCK: blocking → park on socket wait queue; non-blocking → -EAGAIN. Signal-interruptible — returns `-EINTR` on a deliverable signal during park.
-46,sendmsg,missing,
-47,recvmsg,missing,
+46,sendmsg,implemented,Gathers the iovecs into one kernel buffer and writes through the fd (every socket family + ordinary files). `msg_name` / ancillary `SCM_*` data not surfaced.
+47,recvmsg,implemented,Receives one message and scatters it across the iovecs; honors the fd's blocking mode via the underlying read. Source address / ancillary data reported empty.
 48,shutdown,implemented,Real half-close. SHUT_RD makes recv return 0 (EOF); SHUT_WR sends FIN via smoltcp `close()` (TCP) and makes send return EPIPE; SHUT_RDWR both. Poll surfaces POLLHUP.
-49,bind,implemented,
+49,bind,implemented,A wildcard bind (port 0) on a UDP socket assigns an ephemeral port.
 50,listen,implemented,"Backlog now allocates a real smoltcp listener pool, capped at `MAX_LISTEN_BACKLOG = 16`."
 51,getsockname,implemented,
 52,getpeername,implemented,reports the connected peer's address; -ENOTCONN if not connected. Shares the sockaddr copy-out path with getsockname.
@@ -269,8 +269,8 @@ linux_nr,name,status,notes
 267,readlinkat,implemented,tmpfs only.
 268,fchmodat,implemented,
 269,faccessat,implemented,
-270,pselect6,missing,
-271,ppoll,missing,
+270,pselect6,implemented,Like `select` but a `timespec` timeout. The 6th arg (sigmask) is not yet applied — callers needing the atomic mask swap aren't covered; most pass NULL. Shares the `poll_wait` core + fd_set marshalling with `select`.
+271,ppoll,implemented,`poll` with a `timespec` deadline. sigmask not applied (see pselect6). Shares the `poll_wait` core with `poll`.
 272,unshare,implemented,"`CLONE_NEWNS` real (snapshot mount table). `CLONE_NEWUSER` real (UserNamespace alloc). `CLONE_NEWUTS` real (UtsNamespace + hostname). `CLONE_NEWPID` real (PID ns — next forked child becomes pid 1). `CLONE_NEWIPC` / `CLONE_NEWCGROUP` / `CLONE_NEWTIME` allocate the per-process slot — userland tooling that probes for ns membership sees a distinct ns id. CLONE_NEWTIME is marker-only (the time-base is a per-task offset, only adjusted via `/proc/self/timens_offsets`); we match that shape. `CLONE_NEWNET` returns `-EINVAL` honestly (no per-ns network stack — the smoltcp-stack is global)."
 273,set_robust_list,implemented,"Stores user-vaddr head; at exit `kernel::futex::exit_robust_list` walks the 64-bit ABI robust-futex list (head: `list / futex_offset / list_op_pending`; entries: linked `robust_list { next }`; futex addr = `entry + futex_offset`; cap = `ROBUST_LIST_LIMIT = 2048`). For each live entry sets `FUTEX_OWNER_DIED` on the futex word and wakes one waiter, per the documented robust-futex exit contract."
 274,get_robust_list,missing,

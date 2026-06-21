@@ -161,16 +161,15 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
         perms |= Perms::WRITE;
     }
 
-    let mapping_addr =
-        sched::with_current_process_mut(|p| pick_address(p, addr, length)).unwrap_or(None);
+    let mapping_addr = sched::current_addr_space_opt().and_then(|a| pick_address(&a, addr, length));
     let vaddr = match mapping_addr {
         Some(a) => a,
         None => return EINVAL,
     };
 
-    let vm_arc = match sched::with_current_process(|p| p.vmspace()) {
-        Some(Some(v)) => v,
-        _ => return EINVAL,
+    let vm_arc = match sched::current_vmspace() {
+        Some(v) => v,
+        None => return EINVAL,
     };
     {
         let mut vm = vm_arc.lock();
@@ -199,7 +198,7 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
         }
     }
 
-    sched::with_current_process_mut(|p| {
+    {
         let vma = Vma {
             start: vaddr,
             end: vaddr + length,
@@ -209,12 +208,8 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
                 segment: seg.clone(),
             },
         };
-        let mut m = p
-            .addr_space
-            .as_ref()
-            .expect("shmat: no address space")
-            .mmap
-            .lock();
+        let addr_space = sched::current_addr_space_opt().expect("shmat: no address space");
+        let mut m = addr_space.mmap.lock();
         let pos = m
             .vmas
             .binary_search_by_key(&vaddr, |v| v.start)
@@ -224,7 +219,7 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
         if new_end > m.last_end {
             m.last_end = new_end;
         }
-    });
+    }
     seg.attached.fetch_add(1, Ordering::AcqRel);
     seg.atime.store(now_secs(), Ordering::Relaxed);
     seg.lpid
@@ -233,8 +228,8 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
 }
 
 pub fn shmdt(addr: u64) -> i64 {
-    let detached = sched::with_current_process_mut(|p| {
-        let mut m = p.addr_space.as_ref()?.mmap.lock();
+    let detached = sched::current_addr_space_opt().and_then(|addr_space| {
+        let mut m = addr_space.mmap.lock();
         let pos = m.vmas.iter().position(|v| v.start == addr)?;
         let vma = &m.vmas[pos];
         match &vma.backing {
@@ -248,13 +243,13 @@ pub fn shmdt(addr: u64) -> i64 {
         }
     });
     let (segment, length) = match detached {
-        Some(Some(t)) => t,
-        _ => return EINVAL,
+        Some(t) => t,
+        None => return EINVAL,
     };
 
-    let vm_arc = match sched::with_current_process(|p| p.vmspace()) {
-        Some(Some(v)) => v,
-        _ => return EINVAL,
+    let vm_arc = match sched::current_vmspace() {
+        Some(v) => v,
+        None => return EINVAL,
     };
     {
         let mut vm = vm_arc.lock();
@@ -270,25 +265,19 @@ pub fn shmdt(addr: u64) -> i64 {
         .store(sched::current_tgid().raw(), Ordering::Relaxed);
     let prev = segment.attached.fetch_sub(1, Ordering::AcqRel);
     if prev == 1 && segment.marked_rmid.load(Ordering::Acquire) {
-        sched::with_current_ipc(|ns| {
-            ns.shm_table.lock().remove(&segment.id);
-            if segment.key != IPC_PRIVATE {
-                ns.key_to_id.lock().remove(&segment.key);
-            }
-        });
+        sched::with_current_ipc(|ns| remove_segment_if_member(ns, &segment));
     }
     0
 }
 
 pub fn detach_all_current() {
-    if sched::with_current_process(|p| p.vfork_shared_vm.load(Ordering::Acquire)).unwrap_or(false) {
+    if sched::with_current_lifecycle(|l| l.vfork_shared_vm()).unwrap_or(false) {
         return;
     }
-    let Some((Some(addr_space), ipc_ns)) =
-        sched::with_current_process(|p| (p.addr_space.clone(), p.ipc_ns.clone()))
-    else {
+    let Some(addr_space) = sched::current_addr_space_opt() else {
         return;
     };
+    let ipc_ns = sched::current_ipc_ns();
     detach_all_for(&addr_space, ipc_ns.as_ref());
 }
 
@@ -330,11 +319,23 @@ pub fn detach_all_for(
         let prev = segment.attached.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 && segment.marked_rmid.load(Ordering::Acquire) {
             if let Some(ns) = ipc_ns {
-                ns.shm_table.lock().remove(&segment.id);
-                if segment.key != IPC_PRIVATE {
-                    ns.key_to_id.lock().remove(&segment.key);
-                }
+                remove_segment_if_member(ns, &segment);
             }
+        }
+    }
+}
+
+fn remove_segment_if_member(ns: &crate::process::IpcNamespace, segment: &Arc<ShmSegment>) {
+    let mut table = ns.shm_table.lock();
+    if table
+        .get(&segment.id)
+        .map(|e| Arc::ptr_eq(e, segment))
+        .unwrap_or(false)
+    {
+        table.remove(&segment.id);
+        drop(table);
+        if segment.key != IPC_PRIVATE {
+            ns.key_to_id.lock().remove(&segment.key);
         }
     }
 }
@@ -456,8 +457,8 @@ fn now_secs() -> u64 {
     ns / 1_000_000_000
 }
 
-fn pick_address(p: &mut crate::process::Process, addr: u64, length: u64) -> Option<u64> {
-    let m = p.addr_space.as_ref()?.mmap.lock();
+fn pick_address(addr_space: &crate::process::AddressSpace, addr: u64, length: u64) -> Option<u64> {
+    let m = addr_space.mmap.lock();
     if addr != 0 {
         if (addr & 0xfff) != 0 {
             return None;

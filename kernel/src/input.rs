@@ -71,6 +71,14 @@ pub fn park_on_kbd() {
     crate::sched::park_on(&KBD_WAITERS)
 }
 
+pub fn kbd_has_event() -> bool {
+    KBD_RING.lock().len != 0
+}
+
+pub fn for_each_kbd_wq(f: &mut dyn FnMut(&WaitQueue)) {
+    f(&KBD_WAITERS);
+}
+
 const RING_CAPACITY: usize = 512;
 
 struct DeviceState {
@@ -186,6 +194,20 @@ pub fn drain_for(idx: usize) -> Vec<StoredEvent> {
         return Vec::new();
     }
     DEVS.lock()[idx].drain()
+}
+
+pub fn has_pending(idx: usize) -> bool {
+    if idx >= MAX_DEVS {
+        return false;
+    }
+    DEVS.lock()[idx].len != 0
+}
+
+pub fn for_each_evdev_wq(idx: usize, f: &mut dyn FnMut(&WaitQueue)) {
+    if idx >= MAX_DEVS {
+        return;
+    }
+    f(&WAITERS[idx]);
 }
 
 pub fn read_blocking(idx: usize, buf: &mut [u8]) -> usize {

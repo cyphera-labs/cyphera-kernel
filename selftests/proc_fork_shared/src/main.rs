@@ -262,7 +262,8 @@ fn test_shmctl_stat_set() -> bool {
         sys_shmctl(id, IPC_RMID, 0);
         return false;
     }
-    if rd_u64(&ds[88..96]) != 1 || rd_u64(&ds[56..64]) == 0 || rd_u32(&ds[84..88]) != my_pid as u32 {
+    if rd_u64(&ds[88..96]) != 1 || rd_u64(&ds[56..64]) == 0 || rd_u32(&ds[84..88]) != my_pid as u32
+    {
         log("post-attach IPC_STAT wrong (nattch/atime/lpid)\n");
         sys_shmdt(a as u64);
         sys_shmctl(id, IPC_RMID, 0);

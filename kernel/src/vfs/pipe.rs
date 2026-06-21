@@ -179,7 +179,17 @@ impl Inode for Pipe {
         Ok(self.peek_inner(buf))
     }
 
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_with_flags(offset, buf, OpenFlags::empty())
+    }
+
+    fn read_at_with_flags(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
+        let nonblock = flags.contains(OpenFlags::NONBLOCK);
         let cur = crate::sched::current_pid();
         loop {
             self.read_waiters.enqueue(cur);
@@ -193,38 +203,43 @@ impl Inode for Pipe {
                     self.read_waiters.dequeue(cur);
                     return Ok(0);
                 }
+                ReadStep::WouldPark if nonblock => {
+                    self.read_waiters.dequeue(cur);
+                    return Err(FsError::WouldBlock);
+                }
                 ReadStep::WouldPark => {}
             }
-            crate::sched::park_on_pre_enqueued(&self.read_waiters);
+            let outcome =
+                crate::wait::wait_guarded("pipe_read", None, &|| self.read_waiters.contains(cur));
             self.read_waiters.dequeue(cur);
-            if crate::sched::current_signal_pending() {
+            if outcome == crate::wait::WaitOutcome::Interrupted {
                 return Err(FsError::Interrupted);
             }
         }
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let cur = crate::sched::current_pid();
-        loop {
-            self.write_waiters.enqueue(cur);
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+        self.write_at_with_flags(offset, buf, OpenFlags::empty())
+    }
+
+    fn write_at_with_flags(
+        &self,
+        _offset: u64,
+        buf: &[u8],
+        flags: OpenFlags,
+    ) -> Result<usize, FsError> {
+        use crate::vfs::blocking::IoAttempt;
+        let nonblock = flags.contains(OpenFlags::NONBLOCK);
+        crate::vfs::blocking::block_io("pipe_write", &self.write_waiters, nonblock, None, || {
             match self.write_step(buf) {
                 WriteStep::Wrote(n) => {
-                    self.write_waiters.dequeue(cur);
                     self.read_waiters.wake_one();
-                    return Ok(n);
+                    IoAttempt::Ready(n)
                 }
-                WriteStep::BrokenPipe => {
-                    self.write_waiters.dequeue(cur);
-                    return Err(FsError::BrokenPipe);
-                }
-                WriteStep::WouldPark => {}
+                WriteStep::BrokenPipe => IoAttempt::Err(FsError::BrokenPipe),
+                WriteStep::WouldPark => IoAttempt::WouldBlock,
             }
-            crate::sched::park_on_pre_enqueued(&self.write_waiters);
-            self.write_waiters.dequeue(cur);
-            if crate::sched::current_signal_pending() {
-                return Err(FsError::Interrupted);
-            }
-        }
+        })
     }
 
     fn on_open(&self, flags: OpenFlags) {

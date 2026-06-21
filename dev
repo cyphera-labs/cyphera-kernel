@@ -15,8 +15,18 @@ ensure_image() {
 run_in_container() {
     ensure_image
     local args=(--rm)
+    # With a controlling terminal, run interactively and let the container
+    # share our stdin (so `./dev shell` / `./dev run` are usable). Without
+    # one (CI, or any non-interactive runner), feed the container stdin from
+    # /dev/null: the QEMU integration tests attach the kernel console with
+    # `-serial stdio`, so QEMU reads the runner's stdin. Handing it the
+    # parent's (already-consumed or watched) stdin makes QEMU block / the
+    # run get torn down; a clean EOF lets the battery run headless and
+    # report pass/fail through the exit code.
+    local stdin_src=/dev/null
     if [[ -t 0 && -t 1 ]]; then
         args+=(-it)
+        stdin_src=/dev/stdin
     fi
     # Hardware-accelerate the QEMU integration tests when the host exposes
     # KVM; without it QEMU falls back to software emulation, under which the
@@ -24,13 +34,33 @@ run_in_container() {
     if [[ -e /dev/kvm ]]; then
         args+=(--device /dev/kvm --group-add "$(stat -c '%g' /dev/kvm)")
     fi
+    # Forward the QEMU-runner knobs (run-qemu.sh reads these) so e.g.
+    # CYPHERA_MEM=4096M ./dev test exercises the >1 GiB direct-map path.
+    for var in CYPHERA_MEM CYPHERA_GRAPHICAL CYPHERA_AUDIO CYPHERA_AUDIO_BACKEND \
+        CYPHERA_TEST_TIMEOUT CYPHERA_GDB CYPHERA_DISK_IMG CYPHERA_ACCEL CYPHERA_SMP; do
+        [[ -n "${!var:-}" ]] && args+=(-e "$var=${!var}")
+    done
+    # The container runs as root and bind-mounts the source tree at
+    # /workspace. Every directory the build writes to is shadowed by a
+    # named volume so build artifacts land in Docker-managed storage, not
+    # as root-owned droppings in the host checkout. The bind mount is then
+    # source-only (edited on the host as the unprivileged user, read in the
+    # container). Test results come back over stdout / the process exit
+    # code, never as files on the host. The shadowed write paths:
+    #   /workspace/target          — root + kernel cargo target
+    #   /workspace/selftests/target — selftests workspace cargo target
+    #   /workspace/bundles          — staged userland ELFs (build-userland.sh)
+    #   /workspace/demo/.build      — initrd/rootfs staged by demo/run.sh
     docker run "${args[@]}" \
         -v "$PROJECT_ROOT:/workspace" \
         -v cyphera-kernel-cargo-registry:/usr/local/cargo/registry \
         -v cyphera-kernel-cargo-git:/usr/local/cargo/git \
         -v cyphera-kernel-target:/workspace/target \
+        -v cyphera-kernel-selftests-target:/workspace/selftests/target \
+        -v cyphera-kernel-bundles:/workspace/bundles \
+        -v cyphera-kernel-demo-build:/workspace/demo/.build \
         "$IMAGE_TAG" \
-        "$@"
+        "$@" < "$stdin_src"
 }
 
 usage() {

@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 pub mod clock;
+pub mod hwrng;
 pub mod per_cpu;
 pub mod rtc;
 pub mod task;

@@ -1,5 +1,7 @@
+pub mod blocking;
 pub mod fd;
 pub mod locks;
+pub mod mount;
 pub mod path;
 pub mod pipe;
 
@@ -14,6 +16,7 @@ pub enum InodeKind {
     CharDevice,
     Symlink,
     Pipe,
+    Socket,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -136,6 +139,27 @@ pub trait Inode: Send + Sync {
         Err(FsError::NotFile)
     }
 
+    fn write_at_with_flags(
+        &self,
+        offset: u64,
+        buf: &[u8],
+        _flags: OpenFlags,
+    ) -> Result<usize, FsError> {
+        self.write_at(offset, buf)
+    }
+
+    fn write_with_fds(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> Result<usize, FsError> {
+        if !fds.is_empty() {
+            return Err(FsError::NotSupported);
+        }
+        self.write_at(0, buf)
+    }
+
+    fn read_with_fds(&self, buf: &mut [u8]) -> Result<(usize, Vec<Arc<OpenFile>>), FsError> {
+        let n = self.read_at(0, buf)?;
+        Ok((n, Vec::new()))
+    }
+
     fn truncate(&self, _len: u64) -> Result<(), FsError> {
         Err(FsError::NotFile)
     }
@@ -186,6 +210,10 @@ pub trait Inode: Send + Sync {
 
     fn on_open(&self, _flags: OpenFlags) {}
     fn on_close(&self, _flags: OpenFlags) {}
+
+    fn is_drm_card(&self) -> bool {
+        false
+    }
 
     fn set_mode(&self, _mode: u16) -> Result<(), FsError> {
         Err(FsError::NotSupported)
@@ -252,6 +280,14 @@ pub trait Inode: Send + Sync {
     }
 
     fn for_each_wait_queue(&self, _f: &mut dyn FnMut(&crate::wait::WaitQueue)) {}
+
+    fn as_socket(&self) -> Option<&dyn crate::net::Socket> {
+        None
+    }
+
+    fn as_namespace_handle(&self) -> Option<&crate::fdtypes::NamespaceHandle> {
+        None
+    }
 }
 
 bitflags::bitflags! {
@@ -303,6 +339,7 @@ pub struct OpenFile {
     flags_bits: core::sync::atomic::AtomicU32,
     pub offset: frame::sync::SpinIrq<u64>,
     pub _mount_guard: Option<MountInUseGuard>,
+    pub path: String,
 }
 
 impl OpenFile {
@@ -321,7 +358,23 @@ impl OpenFile {
             flags_bits: core::sync::atomic::AtomicU32::new(flags.bits()),
             offset: frame::sync::SpinIrq::new(0),
             _mount_guard: mount_guard,
+            path: String::new(),
         }
+    }
+
+    pub fn new_no_open(inode: Arc<dyn Inode>, flags: OpenFlags) -> Self {
+        Self {
+            inode,
+            flags_bits: core::sync::atomic::AtomicU32::new(flags.bits()),
+            offset: frame::sync::SpinIrq::new(0),
+            _mount_guard: None,
+            path: String::new(),
+        }
+    }
+
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path = path;
+        self
     }
 
     pub fn flags(&self) -> OpenFlags {
@@ -358,7 +411,7 @@ impl OpenFile {
         } else {
             *self.offset.lock()
         };
-        let n = self.inode.write_at(off, buf)?;
+        let n = self.inode.write_at_with_flags(off, buf, f)?;
         *self.offset.lock() = off.saturating_add(n as u64);
         Ok(n)
     }
@@ -569,6 +622,8 @@ pub struct MountEntry {
     pub root: Arc<dyn Inode>,
     pub propagation: MountPropagation,
     pub in_use: Arc<MountInUseTag>,
+    pub source: String,
+    pub fstype: String,
 }
 
 struct MountTableInner {
@@ -605,12 +660,15 @@ impl MountTable {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         self: &Arc<Self>,
         target_path: &str,
         target_inode_id: u64,
         root: Arc<dyn Inode>,
         propagation: MountPropagation,
+        source: &str,
+        fstype: &str,
     ) {
         let weak = Arc::downgrade(self);
         let mut g = self.inner.lock();
@@ -621,9 +679,12 @@ impl MountTable {
             target_inode_id,
             root,
             propagation,
+            source,
+            fstype,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_locked(
         g: &mut MountTableInner,
         self_weak: &alloc::sync::Weak<MountTable>,
@@ -631,6 +692,8 @@ impl MountTable {
         target_inode_id: u64,
         root: Arc<dyn Inode>,
         propagation: MountPropagation,
+        source: &str,
+        fstype: &str,
     ) {
         if let Some(prev) = g.mounts.get(target_path) {
             match &prev.propagation {
@@ -659,6 +722,8 @@ impl MountTable {
                 root,
                 propagation,
                 in_use,
+                source: String::from(source),
+                fstype: String::from(fstype),
             },
         );
     }
@@ -780,17 +845,24 @@ impl MountTable {
     pub fn set_propagation(self: &Arc<Self>, path: &str, new_prop: MountPropagation) -> bool {
         let weak = Arc::downgrade(self);
         let mut g = self.inner.lock();
-        let target_id_and_root = match g.mounts.get(path) {
-            Some(e) => (e.target_inode_id, e.root.clone()),
+        let existing = match g.mounts.get(path) {
+            Some(e) => (
+                e.target_inode_id,
+                e.root.clone(),
+                e.source.clone(),
+                e.fstype.clone(),
+            ),
             None => return false,
         };
         Self::install_locked(
             &mut g,
             &weak,
             path,
-            target_id_and_root.0,
-            target_id_and_root.1,
+            existing.0,
+            existing.1,
             new_prop,
+            &existing.2,
+            &existing.3,
         );
         true
     }
@@ -839,8 +911,17 @@ pub fn mount_install(
     target_inode_id: u64,
     root: Arc<dyn Inode>,
     propagation: MountPropagation,
+    source: &str,
+    fstype: &str,
 ) {
-    global_mount_table().install(target_path, target_inode_id, root, propagation);
+    global_mount_table().install(
+        target_path,
+        target_inode_id,
+        root,
+        propagation,
+        source,
+        fstype,
+    );
 }
 
 pub fn mount_lookup(target_path: &str) -> Option<Arc<dyn Inode>> {

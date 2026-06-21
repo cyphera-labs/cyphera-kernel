@@ -1,4 +1,5 @@
 /target
+/.ci-target
 **/*.rs.bk
 .DS_Store
 .idea/

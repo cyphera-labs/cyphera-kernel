@@ -131,11 +131,7 @@ fn build_user_stack_active(
     let _ = (argv_str_bytes, envp_str_bytes);
 
     let auxv_entries = 15;
-    let structure_words = 1
-        + (argc + 1)
-        + (envc + 1)
-        + (auxv_entries * 2)
-        + 2;
+    let structure_words = 1 + (argc + 1) + (envc + 1) + (auxv_entries * 2) + 2;
     let structure_bytes = (structure_words * 8) as u64;
 
     let strings_bottom = p;
@@ -252,12 +248,6 @@ fn write_user(addr: u64, bytes: &[u8]) -> Result<(), StackInitError> {
 
 fn random_bytes_16() -> [u8; 16] {
     let mut buf = [0u8; 16];
-    let _ = virtio::fill_random(&mut buf);
-    if buf == [0u8; 16] {
-        let t = frame::cpu::rdtsc();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (t.wrapping_mul((i as u64).wrapping_add(1))) as u8;
-        }
-    }
+    crate::random::fill(&mut buf);
     buf
 }

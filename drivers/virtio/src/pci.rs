@@ -106,8 +106,7 @@ fn pci_device_id_to_type(device_id: u16) -> Option<DeviceType> {
     }
 }
 
-pub fn init_ecam_window() {
-}
+pub fn init_ecam_window() {}
 
 struct VirtioPciErrorDbg<'a>(&'a VirtioPciError);
 

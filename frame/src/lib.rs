@@ -26,7 +26,10 @@ pub unsafe fn init(boot_info: &boot::BootInfo) {
     cpu::per_cpu::init_bsp();
     mm::heap::init();
     mm::frame_alloc::init(boot_info);
-    mm::heap::expand_to_main();
+    mm::direct_map::init(boot_info);
+    mm::frame_alloc::release_low_pool();
+    mm::frame_alloc::init_refcounts();
+    mm::heap::expand_initial();
     cpu::clock::init();
     intr::init();
     intr::lapic::init();

@@ -68,10 +68,22 @@ static mut SEEN_ARCH: u32 = 0;
 extern "C" fn sigsys_handler(signum: i32, info: *const u8, _ctx: *const u8) {
     unsafe {
         core::ptr::write_volatile(&raw mut SEEN_SIGNO, signum);
-        core::ptr::write_volatile(&raw mut SEEN_ERRNO, core::ptr::read_volatile(info.add(4) as *const i32));
-        core::ptr::write_volatile(&raw mut SEEN_CODE, core::ptr::read_volatile(info.add(8) as *const i32));
-        core::ptr::write_volatile(&raw mut SEEN_SYSCALL, core::ptr::read_volatile(info.add(24) as *const i32));
-        core::ptr::write_volatile(&raw mut SEEN_ARCH, core::ptr::read_volatile(info.add(28) as *const u32));
+        core::ptr::write_volatile(
+            &raw mut SEEN_ERRNO,
+            core::ptr::read_volatile(info.add(4) as *const i32),
+        );
+        core::ptr::write_volatile(
+            &raw mut SEEN_CODE,
+            core::ptr::read_volatile(info.add(8) as *const i32),
+        );
+        core::ptr::write_volatile(
+            &raw mut SEEN_SYSCALL,
+            core::ptr::read_volatile(info.add(24) as *const i32),
+        );
+        core::ptr::write_volatile(
+            &raw mut SEEN_ARCH,
+            core::ptr::read_volatile(info.add(28) as *const u32),
+        );
         let r = core::ptr::read_volatile(&raw const HANDLER_RAN);
         core::ptr::write_volatile(&raw mut HANDLER_RAN, r + 1);
     }
@@ -222,10 +234,30 @@ pub extern "C" fn _start() -> ! {
             sys_exit(50);
         }
         let trap_filter: [SockFilter; 4] = [
-            SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: 0 },
-            SockFilter { code: BPF_JMP_JEQ_K, jt: 0, jf: 1, k: SYS_GETPPID },
-            SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_TRAP | TRAP_DATA },
-            SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+            SockFilter {
+                code: BPF_LD_W_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            SockFilter {
+                code: BPF_JMP_JEQ_K,
+                jt: 0,
+                jf: 1,
+                k: SYS_GETPPID,
+            },
+            SockFilter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_TRAP | TRAP_DATA,
+            },
+            SockFilter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
         ];
         let tp = SockFprog {
             len: 4,

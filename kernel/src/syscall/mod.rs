@@ -2,7 +2,7 @@ use frame::user::TrapFrame;
 
 use crate::sched;
 
-use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL, ENODEV, ENOSYS, EOPNOTSUPP, ESRCH};
+use crate::errno::{EBADF, EFAULT, EINVAL, ENOSYS, EOPNOTSUPP, ESRCH};
 
 mod numbers;
 use numbers::*;
@@ -21,15 +21,18 @@ mod ptrace_dispatch;
 mod scheduling;
 mod signal;
 mod time;
+use crate::security::setid::{
+    sys_setfsgid, sys_setfsuid, sys_setgid, sys_setregid, sys_setresgid, sys_setresuid,
+    sys_setreuid, sys_setuid,
+};
 use creds::{
     apply_seccomp, sys_capget, sys_capset, sys_getgroups, sys_getresgid, sys_getresuid,
-    sys_seccomp, sys_setdomainname, sys_setfsgid, sys_setfsuid, sys_setgid, sys_setgroups,
-    sys_sethostname, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid, sys_setuid,
+    sys_seccomp, sys_setdomainname, sys_setgroups, sys_sethostname,
 };
 use event::{
     sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2, sys_epoll_wait,
-    sys_eventfd2, sys_poll, sys_signalfd4, sys_timerfd_create, sys_timerfd_gettime,
-    sys_timerfd_settime,
+    sys_eventfd2, sys_poll, sys_ppoll, sys_pselect6, sys_select, sys_signalfd4, sys_timerfd_create,
+    sys_timerfd_gettime, sys_timerfd_settime,
 };
 pub use fs::console_fg_pgrp;
 pub use fs::termios_get_pub;
@@ -59,21 +62,22 @@ use mm::{
 };
 use net::{
     sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
-    sys_listen, sys_recvfrom, sys_sendto, sys_setsockopt, sys_shutdown, sys_socket, sys_socketpair,
+    sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_shutdown,
+    sys_socket, sys_socketpair,
 };
 pub use proc::default_rlimit;
 use proc::{
     sys_arch_prctl, sys_clone, sys_clone3, sys_execve, sys_execveat, sys_exit_simple, sys_fork,
     sys_getrlimit, sys_getrusage, sys_personality, sys_prctl, sys_prlimit64, sys_set_robust_list,
-    sys_set_tid_address, sys_setrlimit, sys_sysinfo, sys_syslog, sys_times, sys_uname, sys_unshare,
-    sys_vfork, sys_wait4, sys_waitid,
+    sys_set_tid_address, sys_setns, sys_setrlimit, sys_sysinfo, sys_syslog, sys_times, sys_uname,
+    sys_unshare, sys_vfork, sys_wait4, sys_waitid,
 };
 use ptrace_dispatch::sys_ptrace;
 use scheduling::{
     sys_getcpu, sys_getpriority, sys_rseq, sys_sched_get_priority_max, sys_sched_get_priority_min,
     sys_sched_getaffinity, sys_sched_getattr, sys_sched_getparam, sys_sched_getscheduler,
-    sys_sched_rr_get_interval, sys_sched_setattr, sys_sched_setparam, sys_sched_setscheduler,
-    sys_setpriority,
+    sys_sched_rr_get_interval, sys_sched_setaffinity, sys_sched_setattr, sys_sched_setparam,
+    sys_sched_setscheduler, sys_setpriority,
 };
 use signal::{
     sys_kill, sys_pause, sys_pidfd_open, sys_pidfd_send_signal, sys_rt_sigaction,
@@ -274,6 +278,9 @@ pub fn dispatch(tf: &mut TrapFrame) {
             SYS_UNSHARE => {
                 tf.rax = sys_unshare(tf.rdi) as u64;
             }
+            SYS_SETNS => {
+                tf.rax = sys_setns(tf.rdi, tf.rsi) as u64;
+            }
             SYS_OPEN_LEGACY => {
                 tf.rax = sys_openat(AT_FDCWD as u64, tf.rdi, tf.rsi, tf.rdx) as u64;
             }
@@ -301,6 +308,15 @@ pub fn dispatch(tf: &mut TrapFrame) {
             }
             SYS_POLL => {
                 tf.rax = sys_poll(tf.rdi, tf.rsi, tf.rdx) as u64;
+            }
+            SYS_PPOLL => {
+                tf.rax = sys_ppoll(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+            }
+            SYS_SELECT => {
+                tf.rax = sys_select(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+            }
+            SYS_PSELECT6 => {
+                tf.rax = sys_pselect6(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
             }
             SYS_PREADV | SYS_PREADV2 => {
                 tf.rax = sys_preadv(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
@@ -437,6 +453,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
             SYS_RECVFROM => {
                 tf.rax = sys_recvfrom(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
             }
+            SYS_SENDMSG => {
+                tf.rax = sys_sendmsg(tf.rdi, tf.rsi, tf.rdx) as u64;
+            }
+            SYS_RECVMSG => {
+                tf.rax = sys_recvmsg(tf.rdi, tf.rsi, tf.rdx) as u64;
+            }
             SYS_SHUTDOWN => {
                 tf.rax = sys_shutdown(tf.rdi, tf.rsi) as u64;
             }
@@ -493,7 +515,8 @@ pub fn dispatch(tf: &mut TrapFrame) {
                 return;
             }
             SYS_SCHED_SETAFFINITY => {
-                tf.rax = 0;
+                let (pid, size, ptr) = (tf.rdi, tf.rsi, tf.rdx);
+                tf.rax = sys_sched_setaffinity(tf, pid, size, ptr) as u64;
             }
             SYS_SCHED_GETAFFINITY => {
                 tf.rax = sys_sched_getaffinity(tf.rdi, tf.rsi, tf.rdx) as u64;
@@ -950,7 +973,7 @@ const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0;
 const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
 
 fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> i64 {
-    if !sched::with_current_creds(|c| c.capable_host(crate::process::CAP_SYS_BOOT)) {
+    if !crate::security::capable(crate::process::CAP_SYS_BOOT) {
         return -1;
     }
     if (magic1 as u32) as u64 != LINUX_REBOOT_MAGIC1 {
@@ -985,34 +1008,16 @@ fn sys_getrandom(buf: u64, count: u64, flags: u64) -> i64 {
     if flags & !(GRND_RANDOM | GRND_NONBLOCK) != 0 {
         return EINVAL;
     }
-    let nonblock = flags & GRND_NONBLOCK != 0;
     if count == 0 {
         return 0;
     }
     let len = (count as usize).min(0x100_0000);
     let mut tmp = alloc::vec![0u8; len];
-    let mut filled = 0usize;
-    while filled < len {
-        match virtio::fill_random(&mut tmp[filled..]) {
-            Ok(0) => {
-                if filled > 0 {
-                    break;
-                }
-                return if nonblock { EAGAIN } else { ENODEV };
-            }
-            Ok(n) => filled += n,
-            Err(_) => {
-                if filled > 0 {
-                    break;
-                }
-                return if nonblock { EAGAIN } else { ENODEV };
-            }
-        }
-    }
-    if frame::user::copy_to_user(buf, &tmp[..filled]).is_err() {
+    crate::random::fill(&mut tmp);
+    if frame::user::copy_to_user(buf, &tmp).is_err() {
         return EFAULT;
     }
-    filled as i64
+    len as i64
 }
 
 #[allow(dead_code)]
@@ -1048,6 +1053,7 @@ pub fn install() {
     frame::user::register_dispatcher(dispatch);
     frame::user::register_user_fault_handler(user_fault_handler);
     frame::user::register_user_pf_hook(crate::mmap_fault::try_handle);
+    frame::user::register_irq_notify_resume(crate::sched::irq_notify_resume_checkpoint);
 }
 
 fn user_fault_handler(addr: u64, vector: u8, error: u64) -> ! {

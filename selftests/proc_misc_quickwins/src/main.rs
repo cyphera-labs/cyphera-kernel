@@ -111,8 +111,73 @@ pub extern "C" fn _start() -> ! {
     }
     log("mlock + munlock round-trip OK\n");
 
+    {
+        let mut online: u64 = 0;
+        if sys_sched_getaffinity(0, 8, &mut online as *mut u64 as *mut u8) < 0 {
+            log("getaffinity failed\n");
+            sys_exit(20);
+        }
+        if online & 0b10 != 0 {
+            let m1: u64 = 0b10;
+            if sys_sched_setaffinity(0, 8, &m1 as *const u64 as *const u8) != 0 {
+                log("setaffinity(cpu1) failed\n");
+                sys_exit(21);
+            }
+            let mut back: u64 = 0;
+            sys_sched_getaffinity(0, 8, &mut back as *mut u64 as *mut u8);
+            if back != m1 {
+                log("getaffinity mismatch after pin to cpu1\n");
+                sys_exit(22);
+            }
+            for _ in 0..200 {
+                let mut c: u32 = u32::MAX;
+                let mut n: u32 = 0;
+                sys_getcpu(&mut c, &mut n);
+                if c != 1 {
+                    log("ran on a cpu outside the affinity mask (expected cpu1)\n");
+                    sys_exit(23);
+                }
+            }
+            let m0: u64 = 0b01;
+            if sys_sched_setaffinity(0, 8, &m0 as *const u64 as *const u8) != 0 {
+                log("setaffinity(cpu0) failed\n");
+                sys_exit(24);
+            }
+            for _ in 0..200 {
+                let mut c: u32 = u32::MAX;
+                let mut n: u32 = 0;
+                sys_getcpu(&mut c, &mut n);
+                if c != 0 {
+                    log("ran on a cpu outside the affinity mask (expected cpu0)\n");
+                    sys_exit(25);
+                }
+            }
+            log("cpu affinity: setaffinity pins + getcpu observes OK\n");
+        } else {
+            log("cpu affinity: single online cpu, skipped\n");
+        }
+    }
+
     log("MISC_QUICKWINS_OK\n");
     sys_exit(0);
+}
+
+fn sys_sched_setaffinity(pid: u64, size: u64, mask: *const u8) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 203u64, in("rdi") pid, in("rsi") size, in("rdx") mask,
+            lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+fn sys_sched_getaffinity(pid: u64, size: u64, mask: *mut u8) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 204u64, in("rdi") pid, in("rsi") size, in("rdx") mask,
+            lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
 }
 
 fn log(msg: &str) {

@@ -72,10 +72,25 @@ pub(super) fn sys_mprotect(addr: u64, length: u64, prot: u64) -> i64 {
     let gaps = sched::with_current_mmap_mut(|m| m.protect_range(addr, hi, perms));
 
     let mut vmspace = VmSpace::current();
-    let not_present = match vmspace.change_perms(VirtAddr::new(addr), pages, perms) {
-        Ok(n) => n,
+    let result = match vmspace.change_perms(VirtAddr::new(addr), pages, perms) {
+        Ok(r) => r,
         Err(_) => return EINVAL,
     };
+    let not_present = result.not_present;
+
+    if result.copied > 0 {
+        let bytes = (result.copied as u64) * 4096;
+        let charged = match sched::current_cgroup() {
+            Some(cg) if cg.try_charge_memory(bytes).is_err() => {
+                cg.oom_kill_one();
+                false
+            }
+            _ => true,
+        };
+        if charged {
+            sched::add_cgroup_charge(bytes);
+        }
+    }
 
     if not_present > 0 && !gaps.is_empty() {
         for (g_lo, g_hi) in gaps {
@@ -118,6 +133,62 @@ pub(super) fn sys_brk(addr: u64) -> u64 {
         return cur.current;
     }
     sched::set_current_brk(target)
+}
+
+fn map_shared_segment(
+    vaddr: u64,
+    length_aligned: u64,
+    perms: Perms,
+    segment: Arc<crate::ipc::shm::ShmSegment>,
+) -> i64 {
+    use crate::process::{Vma, VmaBacking, VmaFlags};
+    let pages = (length_aligned / 4096) as usize;
+    let vm_arc = match sched::current_vmspace() {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+    {
+        let mut vm = vm_arc.lock();
+        let mut mapped = 0usize;
+        let mut failed = false;
+        for (i, frame) in segment.frames.iter().take(pages).enumerate() {
+            let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(
+                vaddr + (i * 4096) as u64,
+            )) {
+                Ok(p) => p,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            };
+            if vm.map_one_frame(page, *frame, perms).is_err() {
+                failed = true;
+                break;
+            }
+            mapped += 1;
+        }
+        if failed {
+            for j in 0..mapped {
+                vm.unmap_keep_frame(VirtAddr::new(vaddr + (j * 4096) as u64));
+            }
+            return ENOMEM;
+        }
+    }
+    sched::with_current_mmap_mut(|m| {
+        m.insert(Vma {
+            start: vaddr,
+            end: vaddr + length_aligned,
+            prot: perms,
+            flags: VmaFlags::SHARED,
+            backing: VmaBacking::Shm {
+                segment: segment.clone(),
+            },
+        });
+    });
+    segment
+        .attached
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    vaddr as i64
 }
 
 pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64 {
@@ -187,7 +258,7 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
     if (flags & MAP_FIXED) != 0 {
         let mut vmspace = VmSpace::current();
         detach_shared_dropped(&mut vmspace, &fixed_dropped, vaddr, vaddr + length_aligned);
-        vmspace.unmap_pages(VirtAddr::new(vaddr), pages);
+        unmap_pages_locked(vaddr, pages);
     }
 
     if is_anon && is_shared {
@@ -195,52 +266,25 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
             Some(s) => s,
             None => return ENOMEM,
         };
-        let vm_arc = match sched::with_current_process(|p| p.vmspace()) {
-            Some(Some(v)) => v,
-            _ => return EINVAL,
-        };
-        {
-            let mut vm = vm_arc.lock();
-            let mut mapped = 0usize;
-            let mut failed = false;
-            for (i, frame) in segment.frames.iter().enumerate() {
-                let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(
-                    vaddr + (i * 4096) as u64,
-                )) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        failed = true;
-                        break;
-                    }
+        return map_shared_segment(vaddr, length_aligned, perms, segment);
+    }
+
+    if let VmaBacking::File {
+        inode,
+        file_offset_base,
+    } = &backing
+    {
+        if inode.is_drm_card() {
+            if !is_shared {
+                return EINVAL;
+            }
+            let segment =
+                match crate::drm::segment_for_mmap(*file_offset_base, length_aligned as usize) {
+                    Some(s) => s,
+                    None => return EINVAL,
                 };
-                if vm.map_one_frame(page, *frame, perms).is_err() {
-                    failed = true;
-                    break;
-                }
-                mapped += 1;
-            }
-            if failed {
-                for j in 0..mapped {
-                    vm.unmap_keep_frame(VirtAddr::new(vaddr + (j * 4096) as u64));
-                }
-                return ENOMEM;
-            }
+            return map_shared_segment(vaddr, length_aligned, perms, segment);
         }
-        sched::with_current_mmap_mut(|m| {
-            m.insert(Vma {
-                start: vaddr,
-                end: vaddr + length_aligned,
-                prot: perms,
-                flags: VmaFlags::SHARED,
-                backing: VmaBacking::Shm {
-                    segment: segment.clone(),
-                },
-            });
-        });
-        segment
-            .attached
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        return vaddr as i64;
     }
 
     let mut vflags = VmaFlags::empty();
@@ -360,7 +404,7 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> i64 {
     }
     let mut vmspace = VmSpace::current();
     detach_shared_dropped(&mut vmspace, &dropped, addr, addr + length_aligned);
-    vmspace.unmap_pages(VirtAddr::new(addr), pages);
+    unmap_pages_locked(addr, pages);
     if present_pages > 0 {
         sched::sub_cgroup_charge((present_pages as u64) * 4096);
     }
@@ -417,7 +461,7 @@ pub(super) fn sys_mremap(
         let mut vmspace = VmSpace::current();
         let drop_pages = ((drop_hi - drop_lo) / 4096) as usize;
         let present = count_present(&mut vmspace, drop_lo, drop_pages);
-        vmspace.unmap_pages(VirtAddr::new(drop_lo), drop_pages);
+        unmap_pages_locked(drop_lo, drop_pages);
         if present > 0 {
             sched::sub_cgroup_charge((present as u64) * 4096);
         }
@@ -478,8 +522,8 @@ pub(super) fn sys_mremap(
         sched::with_current_mmap_mut(|m| m.unmap_range(old_addr, old_addr + old_aligned));
     let mut vmspace = VmSpace::current();
     let present = count_present(&mut vmspace, old_addr, old_pages);
-    vmspace.unmap_pages(VirtAddr::new(old_addr), old_pages);
     drop(vmspace);
+    unmap_pages_locked(old_addr, old_pages);
     if present > 0 {
         sched::sub_cgroup_charge((present as u64) * 4096);
     }
@@ -498,6 +542,23 @@ fn count_present(vmspace: &mut VmSpace, base: u64, pages: usize) -> usize {
         }
     }
     n
+}
+
+fn unmap_pages_locked(vaddr: u64, pages: usize) {
+    match sched::current_vmspace() {
+        Some(vm_arc) => {
+            let freed = vm_arc
+                .lock()
+                .unmap_pages_collect(VirtAddr::new(vaddr), pages);
+            if !freed.is_empty() {
+                frame::cpu::tlb::shootdown_all();
+                for f in freed {
+                    frame::mm::frame_alloc::free_frame(f);
+                }
+            }
+        }
+        None => VmSpace::current().unmap_pages(VirtAddr::new(vaddr), pages),
+    }
 }
 
 fn m_last_end_bump(m: &mut crate::process::MmapState, new_end: u64) {
@@ -630,7 +691,7 @@ pub(super) fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     for (lo, hi) in ranges {
         let rpages = ((hi - lo) / 4096) as usize;
         freed_pages += count_present(&mut vmspace, lo, rpages);
-        vmspace.unmap_pages(VirtAddr::new(lo), rpages);
+        unmap_pages_locked(lo, rpages);
     }
     if freed_pages > 0 {
         sched::sub_cgroup_charge((freed_pages as u64) * 4096);
@@ -647,9 +708,7 @@ pub(super) fn sys_membarrier(cmd: u64, _flags: u64, _cpu_id: u64) -> i64 {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             0
         }
-        3 | 16 | 64 => {
-            0
-        }
+        3 | 16 | 64 => 0,
         _ => EINVAL,
     }
 }
@@ -731,11 +790,10 @@ pub(super) fn sys_mincore(addr: u64, len: u64, vec: u64) -> i64 {
     }
     let mut out = alloc::vec![0u8; pages];
     {
-        let vm_arc =
-            match sched::with_target_process(sched::current_pid(), |p| p.vmspace()).flatten() {
-                Some(v) => v,
-                None => return ENOMEM,
-            };
+        let vm_arc = match sched::with_target_vmspace(sched::current_pid()) {
+            Some(v) => v,
+            None => return ENOMEM,
+        };
         let mut vm = vm_arc.lock();
         for (i, slot) in out.iter_mut().enumerate().take(pages) {
             let va = addr + (i as u64) * 4096;
@@ -780,7 +838,7 @@ fn process_vm_iov(
     riovcnt: u64,
     write: bool,
 ) -> i64 {
-    if liovcnt > 1024 || riovcnt > 1024 {
+    if liovcnt > super::fs::IOV_MAX as u64 || riovcnt > super::fs::IOV_MAX as u64 {
         return EINVAL;
     }
     let target = match sched::caller_local_to_host(local_pid as u32) {
@@ -789,15 +847,14 @@ fn process_vm_iov(
     };
     let caller_pid = sched::current_pid();
     if target != caller_pid {
-        let cu: u32 = sched::with_target_process(caller_pid, |c| c.creds.lock().euid).unwrap_or(0);
+        let cu: u32 = sched::with_target_creds(caller_pid, |c| c.euid).unwrap_or(0);
         let allowed = if cu == 0 {
             true
         } else {
-            sched::with_target_process(target, |t| {
-                t.creds.lock().euid == cu
-                    && t.dumpable.load(core::sync::atomic::Ordering::Relaxed) != 0
-            })
-            .unwrap_or(false)
+            sched::with_target_creds(target, |c| c.euid == cu).unwrap_or(false)
+                && sched::process_dumpable(target)
+                    .map(|d| d != 0)
+                    .unwrap_or(false)
         };
         if !allowed {
             return EPERM;
@@ -860,8 +917,19 @@ fn process_vm_iov(
             if frame::user::copy_from_user(l_addr, &mut tmp[..chunk]).is_err() {
                 break;
             }
-            let mut vm = target_vm.lock();
-            if frame::user::poke_other_vmspace(&mut vm, r_addr, &tmp[..chunk]).is_err() {
+            let (breaks, status) = {
+                let mut vm = target_vm.lock();
+                frame::user::poke_other_vmspace(&mut vm, r_addr, &tmp[..chunk])
+            };
+            if !breaks.0.is_empty() {
+                frame::cpu::tlb::shootdown_all();
+                let n = breaks.0.len();
+                for f in breaks.0 {
+                    frame::mm::frame_alloc::free_frame(f);
+                }
+                sched::charge_process_memory(target, (n as u64) * 4096);
+            }
+            if status.is_err() {
                 break;
             }
         } else {

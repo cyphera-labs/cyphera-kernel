@@ -12,9 +12,9 @@ That **385** is the count of `common` + `64` entries — the syscalls a
 non-contiguous (ours top out at 471), so the highest number is larger
 than the count.
 
-Counts: **270 of 385 implemented**. A further 15 entries (14 dead +
+Counts: **275 of 385 implemented**. A further 15 entries (14 dead +
 1 deprecated) correctly return `-ENOSYS` / `-EPERM` like mainline,
-**10 out-of-scope**, **90 missing** (385 total per the documented
+**10 out-of-scope**, **85 missing** (385 total per the documented
 syscall ABI table).
 
 Each "implemented" row is either a real implementation or an
@@ -82,14 +82,14 @@ commit.
 
   `deprecated` + `dead` are handled/complete (the correct behavior
   *is* the `-ENOSYS`), and are counted separately — they are NOT part
-  of the 270 `implemented` rows. Only `missing` is an actual to-do.
+  of the 275 `implemented` rows. Only `missing` is an actual to-do.
 When you add or modify a syscall, update its row in the same
 commit. New syscalls land at their canonical Linux number — we
 do not gap or renumber.
 
 ## What's missing — a quick map
 
-Rough grouping of the 90 currently-missing syscalls. Items
+Rough grouping of the 85 currently-missing syscalls. Items
 already implemented aren't listed here; see the CSV.
 
 - **Async I/O and readiness primitives** — `io_uring_*`,
@@ -123,8 +123,8 @@ already implemented aren't listed here; see the CSV.
   `move_pages`), `process_vm_*` / `process_madvise` /
   `process_mrelease`, `mseal`, `remap_file_pages`,
   `cachestat`, `map_shadow_stack`, `memfd_secret`.
-- **Networking** — vector forms (`sendmsg` / `recvmsg` /
-  `sendmmsg` / `recvmmsg`), `getpeername`, raw sockets, `bpf`.
+- **Networking** — the multi-message vector forms (`sendmmsg` /
+  `recvmmsg`), `getpeername`, raw sockets, `bpf`.
   Core BSD socket calls (`socket` / `bind` / `listen` / `accept`
   / `connect` / `send` / `recv` / `shutdown` / `getsockname` /
   `getsockopt` / `setsockopt`) are implemented.
