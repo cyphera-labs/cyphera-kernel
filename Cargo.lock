@@ -16,9 +16,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.12.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "block-buffer"
@@ -162,7 +162,7 @@ dependencies = [
 name = "frame"
 version = "0.0.4"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "buddy_system_allocator",
  "linked_list_allocator",
  "spin",
@@ -214,7 +214,7 @@ dependencies = [
 name = "kernel"
 version = "0.0.4"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "chacha20",
  "cyphera-kapi",
  "frame",
@@ -405,7 +405,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7"
 dependencies = [
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "enumn",
  "log",
  "safe-mmio",
@@ -426,7 +426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7841fa0098ceb15c567d93d3fae292c49e10a7662b4936d5f6a9728594555ba"
 dependencies = [
  "bit_field",
- "bitflags 2.12.1",
+ "bitflags 2.13.0",
  "const_fn",
  "rustversion",
  "volatile",
