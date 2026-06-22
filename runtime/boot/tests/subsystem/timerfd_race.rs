@@ -38,7 +38,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     kernel::init();
 
     let mut vmspace = VmSpace::new_user().expect("alloc proc_timerfd_race vmspace");
-    let loaded = kernel::elf::load_static(PROC_TIMERFD_RACE_ELF, &mut vmspace)
+    let loaded = kernel::loader::elf::load_static(PROC_TIMERFD_RACE_ELF, &mut vmspace)
         .expect("load proc_timerfd_race");
     let _ = vmspace
         .map_anon(
@@ -47,7 +47,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
             Perms::READ | Perms::WRITE | Perms::USER,
         )
         .expect("map proc_timerfd_race stack");
-    let pid = kernel::sched::register_with_vmspace(
+    let pid = kernel::process_model::register_with_vmspace(
         Some(vmspace),
         loaded.entry,
         STACK_VADDR + (STACK_PAGES * 4096) as u64,
@@ -60,5 +60,5 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         loaded.entry
     );
     println!("------ user output ------");
-    kernel::sched::start_first()
+    kernel::core::start_first()
 }

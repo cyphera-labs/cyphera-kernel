@@ -18,6 +18,9 @@ SELFTESTS="$ROOT/selftests"
 REL="$SELFTESTS/target/x86_64-unknown-none/release"
 DEST="$ROOT/bundles/userland"
 
+if [ "${CYPHERA_ACCEL:-}" = "tcg" ] || [ ! -e /dev/kvm ]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} --cfg cyphera_reduced"
+fi
 echo "==> Building selftests userland binaries (release)"
 ( cd "$SELFTESTS" && cargo build --release )
 

@@ -83,6 +83,42 @@ pub struct TrapFrame {
     pub r14: u64,
     pub r15: u64,
     pub orig_rax: u64,
+    pub rcx: u64,
+    pub r11: u64,
+}
+
+impl TrapFrame {
+    pub fn syscall_nr(&self) -> u64 {
+        self.rax
+    }
+
+    pub fn arg(&self, i: usize) -> u64 {
+        match i {
+            0 => self.rdi,
+            1 => self.rsi,
+            2 => self.rdx,
+            3 => self.r10,
+            4 => self.r8,
+            5 => self.r9,
+            _ => 0,
+        }
+    }
+
+    pub fn set_ret(&mut self, v: u64) {
+        self.rax = v;
+    }
+
+    pub fn user_sp(&self) -> u64 {
+        self.rsp_user
+    }
+
+    pub fn user_ip(&self) -> u64 {
+        self.rip_user
+    }
+
+    pub fn orig_nr(&self) -> u64 {
+        self.orig_rax
+    }
 }
 
 extern "C" {
@@ -96,8 +132,6 @@ static DISPATCHER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 pub fn register_dispatcher(f: Dispatcher) {
     DISPATCHER.store(f as *mut (), Ordering::SeqCst);
 }
-
-pub type UserFaultHandler = fn(fault_addr: u64, vector: u8, error: u64) -> !;
 
 pub type TraceTrapHook = fn(rip: &mut u64, rflags: &mut u64, vector: u8) -> bool;
 
@@ -122,12 +156,7 @@ pub(crate) fn trace_trap_hook() -> Option<TraceTrapHook> {
 
 pub type UserPageFaultHook = fn(cr2: u64, error: u64) -> bool;
 
-static USER_FAULT_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static USER_PF_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-pub fn register_user_fault_handler(f: UserFaultHandler) {
-    USER_FAULT_HANDLER.store(f as *mut (), Ordering::SeqCst);
-}
 
 pub fn register_user_pf_hook(f: UserPageFaultHook) {
     USER_PF_HOOK.store(f as *mut (), Ordering::SeqCst);
@@ -152,17 +181,6 @@ pub(crate) fn irq_notify_resume() -> Option<IrqNotifyResume> {
     }
 }
 
-pub(crate) fn user_fault_handler() -> Option<UserFaultHandler> {
-    let ptr = USER_FAULT_HANDLER.load(Ordering::SeqCst);
-    if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: only register_user_fault_handler stores into this
-        // slot, and it stores a valid `fn` pointer.
-        Some(unsafe { core::mem::transmute::<*mut (), UserFaultHandler>(ptr) })
-    }
-}
-
 pub(crate) fn user_pf_hook() -> Option<UserPageFaultHook> {
     let ptr = USER_PF_HOOK.load(Ordering::SeqCst);
     if ptr.is_null() {
@@ -173,6 +191,51 @@ pub(crate) fn user_pf_hook() -> Option<UserPageFaultHook> {
         // `UserPageFaultHook` fn pointer cast to `*mut ()`. The
         // transmute recovers that fn pointer (identical layout).
         Some(unsafe { core::mem::transmute::<*mut (), UserPageFaultHook>(ptr) })
+    }
+}
+
+pub type UserFaultSignal = fn(tf: &mut TrapFrame, vector: u8, error: u64, addr: u64) -> !;
+
+static USER_FAULT_SIGNAL: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_user_fault_signal(f: UserFaultSignal) {
+    USER_FAULT_SIGNAL.store(f as *mut (), Ordering::SeqCst);
+}
+
+pub(crate) fn user_fault_signal() -> Option<UserFaultSignal> {
+    let ptr = USER_FAULT_SIGNAL.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: only `register_user_fault_signal` writes this slot, storing
+        // a `UserFaultSignal` fn pointer cast to `*mut ()`. The transmute
+        // recovers that fn pointer (identical layout).
+        Some(unsafe { core::mem::transmute::<*mut (), UserFaultSignal>(ptr) })
+    }
+}
+
+pub fn fault_trapframe(rip: u64, rflags: u64, rsp: u64) -> TrapFrame {
+    let g = crate::cpu::per_cpu::fault_gprs();
+    TrapFrame {
+        rax: g[0],
+        rdi: g[5],
+        rsi: g[4],
+        rdx: g[3],
+        r10: g[9],
+        r8: g[7],
+        r9: g[8],
+        rip_user: rip,
+        rflags_user: rflags,
+        rsp_user: rsp,
+        rbx: g[1],
+        rbp: g[6],
+        r12: g[11],
+        r13: g[12],
+        r14: g[13],
+        r15: g[14],
+        orig_rax: g[0],
+        rcx: g[2],
+        r11: g[10],
     }
 }
 
@@ -561,9 +624,9 @@ pub fn resume_user_from_tf(tf: &TrapFrame) -> ! {
             "mov r10, [rdi + 32]",
             "mov r8,  [rdi + 40]",
             "mov r9,  [rdi + 48]",
+            "mov rcx, [rdi + 136]",
+            "mov r11, [rdi + 144]",
             "mov rdi, [rdi + 8]",
-            "xor rcx, rcx",
-            "xor r11, r11",
             "iretq",
             in("rdi") tf_ptr,
             options(noreturn),
@@ -648,9 +711,9 @@ unsafe extern "C" fn enter_with_tf_naked(_tf: *const TrapFrame) -> ! {
         "mov r10, [rdi + 32]",
         "mov r8,  [rdi + 40]",
         "mov r9,  [rdi + 48]",
+        "mov rcx, [rdi + 136]",
+        "mov r11, [rdi + 144]",
         "mov rdi, [rdi + 8]",
-        "xor rcx, rcx",
-        "xor r11, r11",
         "iretq",
     )
 }

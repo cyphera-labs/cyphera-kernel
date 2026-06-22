@@ -5,9 +5,11 @@ use alloc::vec::Vec;
 
 use frame::sync::SpinIrq;
 
+use cyphera_kapi::{Errno, KResult};
+
+use crate::core::wait::WaitQueue;
 use crate::errno::EINTR;
-use crate::vfs::{FsError, Inode, InodeKind, OpenFile, OpenFlags, PollMask, Stat};
-use crate::wait::WaitQueue;
+use crate::vfs::{Inode, InodeKind, OpenFile, OpenFlags, PollMask, Stat};
 
 pub const EPOLLIN: u32 = 0x001;
 pub const EPOLLOUT: u32 = 0x004;
@@ -32,10 +34,10 @@ impl EpollInstance {
         })
     }
 
-    pub fn ctl_add(&self, fd: i32, events: u32, user_data: u64) -> Result<(), FsError> {
+    pub fn ctl_add(&self, fd: i32, events: u32, user_data: u64) -> KResult<()> {
         let mut e = self.entries.lock();
         if e.iter().any(|x| x.fd == fd) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         e.push(EpollEntry {
             fd,
@@ -45,7 +47,7 @@ impl EpollInstance {
         Ok(())
     }
 
-    pub fn ctl_mod(&self, fd: i32, events: u32, user_data: u64) -> Result<(), FsError> {
+    pub fn ctl_mod(&self, fd: i32, events: u32, user_data: u64) -> KResult<()> {
         let mut e = self.entries.lock();
         for entry in e.iter_mut() {
             if entry.fd == fd {
@@ -54,15 +56,15 @@ impl EpollInstance {
                 return Ok(());
             }
         }
-        Err(FsError::NotFound)
+        Err(Errno::NOENT)
     }
 
-    pub fn ctl_del(&self, fd: i32) -> Result<(), FsError> {
+    pub fn ctl_del(&self, fd: i32) -> KResult<()> {
         let mut e = self.entries.lock();
         let len_before = e.len();
         e.retain(|x| x.fd != fd);
         if e.len() == len_before {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         Ok(())
     }
@@ -98,7 +100,7 @@ impl EpollInstance {
     where
         F: Fn(i32) -> Option<Arc<OpenFile>>,
     {
-        let pid = crate::sched::current_pid();
+        let pid = crate::core::current_pid();
         let deadline = if timeout_ms > 0 {
             Some(
                 frame::cpu::clock::nanos_since_boot()
@@ -108,14 +110,14 @@ impl EpollInstance {
             None
         };
         if let Some(d) = deadline {
-            crate::timeout::register(d, pid);
+            crate::core::timeout::register(d, pid);
         }
 
         loop {
             let ready = self.probe(lookup, max);
             if !ready.is_empty() || timeout_ms == 0 {
                 if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+                    let _ = crate::core::timeout::unregister(pid);
                 }
                 return Ok(ready);
             }
@@ -138,7 +140,7 @@ impl EpollInstance {
 
             if queue_count == 0 {
                 if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+                    let _ = crate::core::timeout::unregister(pid);
                 }
                 return Ok(Vec::new());
             }
@@ -150,7 +152,7 @@ impl EpollInstance {
                         .for_each_wait_queue(&mut |q: &WaitQueue| q.dequeue(pid));
                 }
                 if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+                    let _ = crate::core::timeout::unregister(pid);
                 }
                 return Ok(ready);
             }
@@ -174,7 +176,7 @@ impl EpollInstance {
                 }
                 true
             };
-            let outcome = crate::wait::wait_guarded("epoll_wait", deadline, &still_queued);
+            let outcome = crate::core::wait::wait_guarded("epoll_wait", deadline, &still_queued);
 
             for (_e, of) in &snapshot {
                 of.inode
@@ -183,19 +185,19 @@ impl EpollInstance {
             drop(snapshot);
 
             match outcome {
-                crate::wait::WaitOutcome::Interrupted => {
+                crate::core::wait::WaitOutcome::Interrupted => {
                     if deadline.is_some() {
-                        let _ = crate::timeout::unregister(pid);
+                        let _ = crate::core::timeout::unregister(pid);
                     }
                     return Err(EINTR);
                 }
-                crate::wait::WaitOutcome::TimedOut => {
+                crate::core::wait::WaitOutcome::TimedOut => {
                     if deadline.is_some() {
-                        let _ = crate::timeout::unregister(pid);
+                        let _ = crate::core::timeout::unregister(pid);
                     }
                     return Ok(Vec::new());
                 }
-                crate::wait::WaitOutcome::Woken => {}
+                crate::core::wait::WaitOutcome::Woken => {}
             }
         }
     }

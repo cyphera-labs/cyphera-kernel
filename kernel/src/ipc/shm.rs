@@ -4,8 +4,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use frame::mm::{Page, PhysFrame, Size4KiB, VirtAddr, frame_alloc, vm::Perms};
 
-use crate::process::{Vma, VmaBacking, VmaFlags};
-use crate::sched;
+use crate::core as sched;
+use crate::process_model::{Vma, VmaBacking, VmaFlags};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -282,8 +282,8 @@ pub fn detach_all_current() {
 }
 
 pub fn detach_all_for(
-    addr_space: &crate::process::AddressSpace,
-    ipc_ns: Option<&Arc<crate::process::IpcNamespace>>,
+    addr_space: &crate::process_model::AddressSpace,
+    ipc_ns: Option<&Arc<crate::process_model::IpcNamespace>>,
 ) {
     let detached: Vec<(Arc<ShmSegment>, u64, u64)> = {
         let mut m = addr_space.mmap.lock();
@@ -325,7 +325,7 @@ pub fn detach_all_for(
     }
 }
 
-fn remove_segment_if_member(ns: &crate::process::IpcNamespace, segment: &Arc<ShmSegment>) {
+fn remove_segment_if_member(ns: &crate::process_model::IpcNamespace, segment: &Arc<ShmSegment>) {
     let mut table = ns.shm_table.lock();
     if table
         .get(&segment.id)
@@ -398,13 +398,13 @@ pub fn shmctl(shmid: i32, cmd: i32, buf: u64) -> i64 {
             ds[56..64].copy_from_slice(&(seg.atime.load(Ordering::Relaxed) as i64).to_le_bytes());
             ds[64..72].copy_from_slice(&(seg.dtime.load(Ordering::Relaxed) as i64).to_le_bytes());
             ds[72..80].copy_from_slice(&(seg.ctime.load(Ordering::Relaxed) as i64).to_le_bytes());
-            let cpid_local = sched::host_to_caller_local(crate::process::Pid(seg.cpid));
+            let cpid_local = sched::host_to_caller_local(crate::process_model::Pid(seg.cpid));
             ds[80..84].copy_from_slice(&(cpid_local as i32).to_le_bytes());
             let lpid_raw = seg.lpid.load(Ordering::Relaxed);
             let lpid_local = if lpid_raw == 0 {
                 0
             } else {
-                sched::host_to_caller_local(crate::process::Pid(lpid_raw))
+                sched::host_to_caller_local(crate::process_model::Pid(lpid_raw))
             };
             ds[84..88].copy_from_slice(&(lpid_local as i32).to_le_bytes());
             let nattch = seg.attached.load(Ordering::Acquire) as u64;
@@ -457,7 +457,11 @@ fn now_secs() -> u64 {
     ns / 1_000_000_000
 }
 
-fn pick_address(addr_space: &crate::process::AddressSpace, addr: u64, length: u64) -> Option<u64> {
+fn pick_address(
+    addr_space: &crate::process_model::AddressSpace,
+    addr: u64,
+    length: u64,
+) -> Option<u64> {
     let m = addr_space.mmap.lock();
     if addr != 0 {
         if (addr & 0xfff) != 0 {
@@ -497,7 +501,7 @@ fn check_access(seg: &ShmSegment, flags: u32) -> bool {
 
 fn ipc_owner_or_admin(seg: &ShmSegment) -> bool {
     sched::with_current_creds(|c| {
-        c.capable_host(crate::process::CAP_SYS_ADMIN)
+        c.capable_host(crate::process_model::CAP_SYS_ADMIN)
             || c.euid == seg.uid.load(Ordering::Relaxed)
             || c.euid == seg.creator_uid
     })

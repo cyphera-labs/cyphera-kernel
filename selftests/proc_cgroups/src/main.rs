@@ -12,7 +12,7 @@ const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
 const AT_FDCWD: i32 = -100;
 
-const ENOTEMPTY: i64 = -39;
+const EBUSY: i64 = -16;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -82,12 +82,12 @@ pub extern "C" fn _start() -> ! {
     log("migrate self into /sys/fs/cgroup/test1 OK\n");
 
     let r = sys_rmdir(b"/sys/fs/cgroup/test1\0".as_ptr());
-    if r != ENOTEMPTY {
-        log("rmdir non-empty: expected ENOTEMPTY got ");
+    if r != EBUSY {
+        log("rmdir non-empty: expected EBUSY got ");
         log_num(r);
         sys_exit(1);
     }
-    log("rmdir non-empty -> ENOTEMPTY OK\n");
+    log("rmdir non-empty -> EBUSY OK\n");
 
     let mut buf = [0u8; 16];
     let n = format_pid(my_pid, &mut buf);

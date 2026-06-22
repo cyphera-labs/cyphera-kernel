@@ -1,6 +1,6 @@
 use frame::user::TrapFrame;
 
-use crate::sched;
+use crate::core as sched;
 
 use crate::errno::{EBADF, EFAULT, EINVAL, ENOSYS, EOPNOTSUPP, ESRCH};
 
@@ -41,14 +41,15 @@ use fs::{
     sys_chdir, sys_chroot, sys_close, sys_close_range, sys_copy_file_range, sys_dup, sys_dup2,
     sys_dup3, sys_faccessat, sys_fadvise64, sys_fallocate, sys_fchdir, sys_fchmod, sys_fchmodat,
     sys_fchown, sys_fchownat, sys_fcntl, sys_fgetxattr, sys_flistxattr, sys_flock,
-    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_ftruncate, sys_getcwd, sys_getdents,
+    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_fsync, sys_ftruncate, sys_getcwd, sys_getdents,
     sys_getdents64, sys_getxattr, sys_getxattrat, sys_ioctl, sys_linkat, sys_listxattr,
     sys_listxattrat, sys_lseek, sys_memfd_create, sys_mkdirat, sys_mknodat, sys_mount,
     sys_newfstatat, sys_openat, sys_openat2, sys_pipe, sys_pipe2, sys_pivot_root, sys_pread64,
     sys_preadv, sys_pwrite64, sys_pwritev, sys_read, sys_readahead, sys_readlinkat, sys_readv,
     sys_removexattr, sys_removexattrat, sys_renameat, sys_renameat2, sys_sendfile, sys_setxattr,
-    sys_setxattrat, sys_splice, sys_stat, sys_statfs, sys_statx, sys_symlinkat, sys_tee,
-    sys_truncate, sys_umount2, sys_unlinkat, sys_utimensat, sys_vmsplice, sys_write, sys_writev,
+    sys_setxattrat, sys_splice, sys_stat, sys_statfs, sys_statx, sys_symlinkat,
+    sys_sync_file_range, sys_tee, sys_truncate, sys_umount2, sys_unlinkat, sys_utimensat,
+    sys_vmsplice, sys_write, sys_writev,
 };
 use ipc::{
     sys_futex, sys_futex_requeue, sys_futex_wait, sys_futex_waitv, sys_futex_wake, sys_keyctl,
@@ -106,853 +107,1027 @@ pub fn dispatch(tf: &mut TrapFrame) {
 
     if legacy::dispatch_if_legacy(tf) {
     } else {
-        match tf.rax {
+        match tf.syscall_nr() {
             SYS_READ => {
-                tf.rax = sys_read(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_read(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_WRITE => {
-                tf.rax = sys_write(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_write(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_CLOSE => {
-                tf.rax = sys_close(tf.rdi) as u64;
+                tf.set_ret(sys_close(tf.arg(0)) as u64);
             }
             SYS_FSTAT => {
-                tf.rax = sys_fstat(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_fstat(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_LSEEK => {
-                tf.rax = sys_lseek(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_lseek(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GETCWD => {
-                tf.rax = sys_getcwd(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getcwd(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CHDIR => {
-                tf.rax = sys_chdir(tf.rdi) as u64;
+                tf.set_ret(sys_chdir(tf.arg(0)) as u64);
             }
             SYS_GETDENTS64 => {
-                tf.rax = sys_getdents64(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getdents64(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_OPENAT => {
-                tf.rax = sys_openat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_openat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_NEWFSTATAT => {
-                tf.rax = sys_newfstatat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_newfstatat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_DUP => {
-                tf.rax = sys_dup(tf.rdi) as u64;
+                tf.set_ret(sys_dup(tf.arg(0)) as u64);
             }
             SYS_DUP2 => {
-                tf.rax = sys_dup2(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_dup2(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_DUP3 => {
-                tf.rax = sys_dup3(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_dup3(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_FCNTL => {
-                tf.rax = sys_fcntl(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_fcntl(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PREAD64 => {
-                tf.rax = sys_pread64(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_pread64(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_PWRITE64 => {
-                tf.rax = sys_pwrite64(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_pwrite64(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_READV => {
-                tf.rax = sys_readv(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_readv(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_WRITEV => {
-                tf.rax = sys_writev(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_writev(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_IOCTL => {
-                tf.rax = sys_ioctl(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_ioctl(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PIPE => {
-                tf.rax = sys_pipe(tf.rdi) as u64;
+                tf.set_ret(sys_pipe(tf.arg(0)) as u64);
             }
             SYS_PIPE2 => {
-                tf.rax = sys_pipe2(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_pipe2(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MKDIRAT => {
-                tf.rax = sys_mkdirat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_mkdirat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_UNLINKAT => {
-                tf.rax = sys_unlinkat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_unlinkat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_RENAMEAT => {
-                tf.rax = sys_renameat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_renameat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_LINKAT => {
-                tf.rax = sys_linkat(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_linkat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_SYMLINKAT => {
-                tf.rax = sys_symlinkat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_symlinkat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_READLINKAT => {
-                tf.rax = sys_readlinkat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_readlinkat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_STAT => {
-                tf.rax = sys_stat(tf.rdi, tf.rsi, false) as u64;
+                tf.set_ret(sys_stat(tf.arg(0), tf.arg(1), false) as u64);
             }
             SYS_LSTAT => {
-                tf.rax = sys_stat(tf.rdi, tf.rsi, true) as u64;
+                tf.set_ret(sys_stat(tf.arg(0), tf.arg(1), true) as u64);
             }
             SYS_STATX => {
-                tf.rax = sys_statx(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(sys_statx(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64);
             }
             SYS_ACCESS => {
-                tf.rax = sys_faccessat(AT_FDCWD as u64, tf.rdi, tf.rsi, 0) as u64;
+                tf.set_ret(sys_faccessat(AT_FDCWD as u64, tf.arg(0), tf.arg(1), 0) as u64);
             }
             SYS_FACCESSAT => {
-                tf.rax = sys_faccessat(tf.rdi, tf.rsi, tf.rdx, 0) as u64;
+                tf.set_ret(sys_faccessat(tf.arg(0), tf.arg(1), tf.arg(2), 0) as u64);
             }
             SYS_FACCESSAT2 => {
-                tf.rax = sys_faccessat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_faccessat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_UMASK => {
-                tf.rax = sched::set_current_umask(tf.rdi as u16) as u64;
+                tf.set_ret(sched::set_current_umask(tf.arg(0) as u16) as u64);
             }
             SYS_CHMOD => {
-                tf.rax = sys_fchmodat(AT_FDCWD as u64, tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_fchmodat(AT_FDCWD as u64, tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FCHMOD => {
-                tf.rax = sys_fchmod(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_fchmod(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FCHMODAT => {
-                tf.rax = sys_fchmodat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_fchmodat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_CHOWN | SYS_LCHOWN => {
-                tf.rax = sys_fchownat(AT_FDCWD as u64, tf.rdi, tf.rsi, tf.rdx, 0) as u64;
+                tf.set_ret(
+                    sys_fchownat(AT_FDCWD as u64, tf.arg(0), tf.arg(1), tf.arg(2), 0) as u64,
+                );
             }
             SYS_FCHOWN => {
-                tf.rax = sys_fchown(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_fchown(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_FCHOWNAT => {
-                tf.rax = sys_fchownat(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_fchownat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_TRUNCATE => {
-                tf.rax = sys_truncate(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_truncate(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FTRUNCATE => {
-                tf.rax = sys_ftruncate(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_ftruncate(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_UNLINK => {
-                tf.rax = sys_unlinkat(AT_FDCWD as u64, tf.rdi, 0) as u64;
+                tf.set_ret(sys_unlinkat(AT_FDCWD as u64, tf.arg(0), 0) as u64);
             }
             SYS_RMDIR => {
-                tf.rax = sys_unlinkat(AT_FDCWD as u64, tf.rdi, AT_REMOVEDIR) as u64;
+                tf.set_ret(sys_unlinkat(AT_FDCWD as u64, tf.arg(0), AT_REMOVEDIR) as u64);
             }
             SYS_LINK => {
-                tf.rax = sys_linkat(AT_FDCWD as u64, tf.rdi, AT_FDCWD as u64, tf.rsi, 0) as u64;
+                tf.set_ret(
+                    sys_linkat(AT_FDCWD as u64, tf.arg(0), AT_FDCWD as u64, tf.arg(1), 0) as u64,
+                );
             }
             SYS_SYMLINK => {
-                tf.rax = sys_symlinkat(tf.rdi, AT_FDCWD as u64, tf.rsi) as u64;
+                tf.set_ret(sys_symlinkat(tf.arg(0), AT_FDCWD as u64, tf.arg(1)) as u64);
             }
             SYS_READLINK => {
-                tf.rax = sys_readlinkat(AT_FDCWD as u64, tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_readlinkat(AT_FDCWD as u64, tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_RENAME => {
-                tf.rax = sys_renameat2(AT_FDCWD as u64, tf.rdi, AT_FDCWD as u64, tf.rsi, 0) as u64;
+                tf.set_ret(
+                    sys_renameat2(AT_FDCWD as u64, tf.arg(0), AT_FDCWD as u64, tf.arg(1), 0) as u64,
+                );
             }
             SYS_RENAMEAT2 => {
-                tf.rax = sys_renameat2(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_renameat2(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_MKDIR => {
-                tf.rax = sys_mkdirat(AT_FDCWD as u64, tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_mkdirat(AT_FDCWD as u64, tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MKNOD => {
-                tf.rax = sys_mknodat(AT_FDCWD as u64, tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_mknodat(AT_FDCWD as u64, tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_MKNODAT => {
-                tf.rax = sys_mknodat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_mknodat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_STATFS => {
-                tf.rax = sys_statfs(tf.rdi, tf.rsi, false) as u64;
+                tf.set_ret(sys_statfs(tf.arg(0), tf.arg(1), false) as u64);
             }
             SYS_FSTATFS => {
-                tf.rax = sys_statfs(tf.rdi, tf.rsi, true) as u64;
+                tf.set_ret(sys_statfs(tf.arg(0), tf.arg(1), true) as u64);
             }
-            SYS_FSYNC | SYS_FDATASYNC | SYS_SYNC | SYS_SYNC_FILE_RANGE => {
-                tf.rax = 0;
+            SYS_FSYNC | SYS_FDATASYNC => {
+                tf.set_ret(sys_fsync(tf.arg(0)) as u64);
+            }
+            SYS_SYNC => {
+                tf.set_ret(0);
+            }
+            SYS_SYNC_FILE_RANGE => {
+                tf.set_ret(sys_sync_file_range(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_CHROOT => {
-                tf.rax = sys_chroot(tf.rdi) as u64;
+                tf.set_ret(sys_chroot(tf.arg(0)) as u64);
             }
             SYS_UNSHARE => {
-                tf.rax = sys_unshare(tf.rdi) as u64;
+                tf.set_ret(sys_unshare(tf.arg(0)) as u64);
             }
             SYS_SETNS => {
-                tf.rax = sys_setns(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_setns(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_OPEN_LEGACY => {
-                tf.rax = sys_openat(AT_FDCWD as u64, tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_openat(AT_FDCWD as u64, tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_CREAT => {
                 const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
-                tf.rax = sys_openat(AT_FDCWD as u64, tf.rdi, O_CREAT_WRONLY_TRUNC, tf.rsi) as u64;
+                tf.set_ret(
+                    sys_openat(AT_FDCWD as u64, tf.arg(0), O_CREAT_WRONLY_TRUNC, tf.arg(1)) as u64,
+                );
             }
             SYS_GETDENTS_LEGACY => {
-                tf.rax = sys_getdents(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getdents(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_FCHDIR => {
-                tf.rax = sys_fchdir(tf.rdi) as u64;
+                tf.set_ret(sys_fchdir(tf.arg(0)) as u64);
             }
             SYS_FALLOCATE => {
-                tf.rax = sys_fallocate(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_fallocate(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_FLOCK => {
-                tf.rax = sys_flock(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_flock(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FADVISE64 => {
-                tf.rax = sys_fadvise64(tf.rdi) as u64;
+                tf.set_ret(sys_fadvise64(tf.arg(0)) as u64);
             }
             SYS_MADVISE => {
-                tf.rax = sys_madvise(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_madvise(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_POLL => {
-                tf.rax = sys_poll(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_poll(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PPOLL => {
-                tf.rax = sys_ppoll(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(sys_ppoll(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64);
             }
             SYS_SELECT => {
-                tf.rax = sys_select(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_select(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_PSELECT6 => {
-                tf.rax = sys_pselect6(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_pselect6(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_PREADV | SYS_PREADV2 => {
-                tf.rax = sys_preadv(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_preadv(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_PWRITEV | SYS_PWRITEV2 => {
-                tf.rax = sys_pwritev(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_pwritev(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_SENDFILE => {
-                tf.rax = sys_sendfile(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_sendfile(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_COPY_FILE_RANGE => {
-                tf.rax = sys_copy_file_range(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_copy_file_range(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_SPLICE => {
-                tf.rax = sys_splice(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_splice(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_TEE => {
-                tf.rax = sys_tee(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_tee(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_VMSPLICE => {
-                tf.rax = sys_vmsplice(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_vmsplice(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_PIVOT_ROOT => {
-                tf.rax = sys_pivot_root(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_pivot_root(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_OPENAT2 => {
-                tf.rax = sys_openat2(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_openat2(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_FCHMODAT2 => {
-                tf.rax = sys_fchmodat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_fchmodat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SETXATTRAT => {
-                tf.rax = sys_setxattrat(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_setxattrat(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_GETXATTRAT => {
-                tf.rax = sys_getxattrat(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_getxattrat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_LISTXATTRAT => {
-                tf.rax = sys_listxattrat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_listxattrat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_REMOVEXATTRAT => {
-                tf.rax = sys_removexattrat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_removexattrat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_CLOSE_RANGE => {
-                tf.rax = sys_close_range(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_close_range(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GETGROUPS => {
-                tf.rax = sys_getgroups(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getgroups(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SETGROUPS => {
-                tf.rax = sys_setgroups(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_setgroups(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_GETRESUID => {
-                tf.rax = sys_getresuid(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getresuid(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GETRESGID => {
-                tf.rax = sys_getresgid(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getresgid(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SETRESUID => {
-                tf.rax = sys_setresuid(tf.rdi as u32, tf.rsi as u32, tf.rdx as u32) as u64;
+                tf.set_ret(
+                    sys_setresuid(tf.arg(0) as u32, tf.arg(1) as u32, tf.arg(2) as u32) as u64,
+                );
             }
             SYS_SETRESGID => {
-                tf.rax = sys_setresgid(tf.rdi as u32, tf.rsi as u32, tf.rdx as u32) as u64;
+                tf.set_ret(
+                    sys_setresgid(tf.arg(0) as u32, tf.arg(1) as u32, tf.arg(2) as u32) as u64,
+                );
             }
             SYS_SETUID => {
-                tf.rax = sys_setuid(tf.rdi as u32) as u64;
+                tf.set_ret(sys_setuid(tf.arg(0) as u32) as u64);
             }
             SYS_SETGID => {
-                tf.rax = sys_setgid(tf.rdi as u32) as u64;
+                tf.set_ret(sys_setgid(tf.arg(0) as u32) as u64);
             }
             SYS_SETREUID => {
-                tf.rax = sys_setreuid(tf.rdi as u32, tf.rsi as u32) as u64;
+                tf.set_ret(sys_setreuid(tf.arg(0) as u32, tf.arg(1) as u32) as u64);
             }
             SYS_SETREGID => {
-                tf.rax = sys_setregid(tf.rdi as u32, tf.rsi as u32) as u64;
+                tf.set_ret(sys_setregid(tf.arg(0) as u32, tf.arg(1) as u32) as u64);
             }
             SYS_SETFSUID => {
-                tf.rax = sys_setfsuid(tf.rdi as u32) as u64;
+                tf.set_ret(sys_setfsuid(tf.arg(0) as u32) as u64);
             }
             SYS_SETFSGID => {
-                tf.rax = sys_setfsgid(tf.rdi as u32) as u64;
+                tf.set_ret(sys_setfsgid(tf.arg(0) as u32) as u64);
             }
             SYS_UTIMENSAT => {
-                tf.rax = sys_utimensat(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_utimensat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_SETXATTR => {
-                tf.rax = sys_setxattr(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, false) as u64;
+                tf.set_ret(sys_setxattr(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    false,
+                ) as u64);
             }
             SYS_LSETXATTR => {
-                tf.rax = sys_setxattr(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, true) as u64;
+                tf.set_ret(
+                    sys_setxattr(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4), true)
+                        as u64,
+                );
             }
             SYS_FSETXATTR => {
-                tf.rax = sys_fsetxattr(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_fsetxattr(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_GETXATTR | SYS_LGETXATTR => {
-                tf.rax = sys_getxattr(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_getxattr(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_FGETXATTR => {
-                tf.rax = sys_fgetxattr(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_fgetxattr(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_LISTXATTR | SYS_LLISTXATTR => {
-                tf.rax = sys_listxattr(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_listxattr(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_FLISTXATTR => {
-                tf.rax = sys_flistxattr(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_flistxattr(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_REMOVEXATTR | SYS_LREMOVEXATTR => {
-                tf.rax = sys_removexattr(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_removexattr(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FREMOVEXATTR => {
-                tf.rax = sys_fremovexattr(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_fremovexattr(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SOCKET => {
-                tf.rax = sys_socket(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_socket(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SOCKETPAIR => {
-                tf.rax = sys_socketpair(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_socketpair(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_BIND => {
-                tf.rax = sys_bind(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_bind(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_LISTEN => {
-                tf.rax = sys_listen(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_listen(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_ACCEPT | SYS_ACCEPT4 => {
-                tf.rax = sys_accept(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_accept(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_CONNECT => {
-                tf.rax = sys_connect(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_connect(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SENDTO => {
-                tf.rax = sys_sendto(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_sendto(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_RECVFROM => {
-                tf.rax = sys_recvfrom(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_recvfrom(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_SENDMSG => {
-                tf.rax = sys_sendmsg(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_sendmsg(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_RECVMSG => {
-                tf.rax = sys_recvmsg(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_recvmsg(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SHUTDOWN => {
-                tf.rax = sys_shutdown(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_shutdown(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_GETSOCKNAME => {
-                tf.rax = sys_getsockname(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getsockname(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GETPEERNAME => {
-                tf.rax = sys_getpeername(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getpeername(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SETSOCKOPT => {
-                tf.rax = sys_setsockopt(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_setsockopt(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_GETSOCKOPT => {
-                tf.rax = sys_getsockopt(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_getsockopt(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_EPOLL_CREATE1 => {
-                tf.rax = sys_epoll_create1(tf.rdi) as u64;
+                tf.set_ret(sys_epoll_create1(tf.arg(0)) as u64);
             }
             SYS_EPOLL_CTL => {
-                tf.rax = sys_epoll_ctl(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_epoll_ctl(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_EPOLL_WAIT => {
-                tf.rax = sys_epoll_wait(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_epoll_wait(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_EPOLL_PWAIT => {
-                tf.rax = sys_epoll_pwait(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_epoll_pwait(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_EPOLL_PWAIT2 => {
-                tf.rax = sys_epoll_pwait2(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_epoll_pwait2(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_MMAP => {
-                tf.rax = sys_mmap(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_mmap(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_MUNMAP => {
-                tf.rax = sys_munmap(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_munmap(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MREMAP => {
-                tf.rax = sys_mremap(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_mremap(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_MSYNC => {
-                tf.rax = sys_msync(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_msync(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_BRK => {
-                tf.rax = sys_brk(tf.rdi);
+                tf.set_ret(sys_brk(tf.arg(0)));
             }
             SYS_RT_SIGACTION => {
-                tf.rax = sys_rt_sigaction(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_rt_sigaction(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_RT_SIGPROCMASK => {
-                tf.rax = sys_rt_sigprocmask(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_rt_sigprocmask(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_RT_SIGRETURN => {
                 sys_rt_sigreturn(tf);
                 return;
             }
             SYS_SCHED_SETAFFINITY => {
-                let (pid, size, ptr) = (tf.rdi, tf.rsi, tf.rdx);
-                tf.rax = sys_sched_setaffinity(tf, pid, size, ptr) as u64;
+                let (pid, size, ptr) = (tf.arg(0), tf.arg(1), tf.arg(2));
+                let r = sys_sched_setaffinity(tf, pid, size, ptr) as u64;
+                tf.set_ret(r);
             }
             SYS_SCHED_GETAFFINITY => {
-                tf.rax = sys_sched_getaffinity(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_sched_getaffinity(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SCHED_YIELD => {
                 sched::yield_current(tf);
             }
             SYS_SCHED_SETSCHEDULER => {
-                tf.rax = sys_sched_setscheduler(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_sched_setscheduler(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SCHED_GETSCHEDULER => {
-                tf.rax = sys_sched_getscheduler(tf.rdi) as u64;
+                tf.set_ret(sys_sched_getscheduler(tf.arg(0)) as u64);
             }
             SYS_SCHED_SETPARAM => {
-                tf.rax = sys_sched_setparam(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_sched_setparam(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SCHED_GETPARAM => {
-                tf.rax = sys_sched_getparam(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_sched_getparam(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SCHED_GET_PRIORITY_MAX => {
-                tf.rax = sys_sched_get_priority_max(tf.rdi) as u64;
+                tf.set_ret(sys_sched_get_priority_max(tf.arg(0)) as u64);
             }
             SYS_SCHED_GET_PRIORITY_MIN => {
-                tf.rax = sys_sched_get_priority_min(tf.rdi) as u64;
+                tf.set_ret(sys_sched_get_priority_min(tf.arg(0)) as u64);
             }
             SYS_SCHED_RR_GET_INTERVAL => {
-                tf.rax = sys_sched_rr_get_interval(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_sched_rr_get_interval(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SCHED_SETATTR => {
-                tf.rax = sys_sched_setattr(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_sched_setattr(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SCHED_GETATTR => {
-                tf.rax = sys_sched_getattr(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_sched_getattr(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_NANOSLEEP => {
-                tf.rax = sys_nanosleep(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_nanosleep(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FORK => {
-                tf.rax = sys_fork(tf) as u64;
+                let r = sys_fork(tf) as u64;
+                tf.set_ret(r);
             }
             SYS_VFORK => {
-                tf.rax = sys_vfork(tf) as u64;
+                let r = sys_vfork(tf) as u64;
+                tf.set_ret(r);
             }
             SYS_CLONE => {
-                tf.rax = sys_clone(tf) as u64;
+                let r = sys_clone(tf) as u64;
+                tf.set_ret(r);
             }
             SYS_CLONE3 => {
-                tf.rax = sys_clone3(tf, tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_clone3(tf, tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_EXECVE => {
                 if let Err(errno) = sys_execve(tf) {
-                    tf.rax = errno as u64;
+                    tf.set_ret(errno as u64);
                 }
             }
             SYS_EXECVEAT => {
                 if let Err(errno) = sys_execveat(tf) {
-                    tf.rax = errno as u64;
+                    tf.set_ret(errno as u64);
                 }
             }
             SYS_GETPID => {
-                tf.rax = sched::host_to_caller_local(sched::current_tgid()) as u64;
+                tf.set_ret(sched::host_to_caller_local(sched::current_tgid()) as u64);
             }
             SYS_KILL => {
-                tf.rax = sys_kill(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_kill(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_EXIT => {
-                sched::exit_current(tf, tf.rdi as i32);
+                sched::exit_current(tf, tf.arg(0) as i32);
             }
             SYS_EXIT_GROUP => {
-                sched::exit_group_current(tf, tf.rdi as i32);
+                sched::exit_group_current(tf, tf.arg(0) as i32);
             }
             SYS_WAIT4 => {
-                tf.rax = sys_wait4(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_wait4(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_WAITID => {
-                tf.rax = sys_waitid(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_waitid(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_SIGALTSTACK => {
-                tf.rax = sys_sigaltstack(tf.rdi, tf.rsi, tf.rsp_user) as u64;
+                tf.set_ret(sys_sigaltstack(tf.arg(0), tf.arg(1), tf.user_sp()) as u64);
             }
             SYS_TGKILL => {
-                tf.rax = sys_tgkill(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_tgkill(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GETPPID => {
                 let parent_host = sched::current_parent_pid();
                 if parent_host == 0 {
-                    tf.rax = 0u64;
+                    tf.set_ret(0u64);
                 } else {
-                    tf.rax = sched::host_to_caller_local(crate::process::Pid(parent_host)) as u64;
+                    tf.set_ret(
+                        sched::host_to_caller_local(crate::process_model::Pid(parent_host)) as u64,
+                    );
                 }
             }
             SYS_GETPGRP => {
-                tf.rax = sched::host_to_caller_local(sched::current_pgid()) as u64;
+                tf.set_ret(sched::host_to_caller_local(sched::current_pgid()) as u64);
             }
             SYS_GETPGID => {
-                let target_host = if tf.rdi as u32 == 0 {
+                let target_host = if tf.arg(0) as u32 == 0 {
                     sched::current_pid()
                 } else {
-                    match sched::caller_local_to_host(tf.rdi as u32) {
+                    match sched::caller_local_to_host(tf.arg(0) as u32) {
                         Some(p) => p,
                         None => {
-                            tf.rax = ESRCH as u64;
+                            tf.set_ret(ESRCH as u64);
                             return;
                         }
                     }
                 };
-                tf.rax = match sched::getpgid(target_host) {
+                tf.set_ret(match sched::getpgid(target_host) {
                     Ok(p) => sched::host_to_caller_local(p) as u64,
                     Err(e) => e as u64,
-                };
+                });
             }
             SYS_SETPGID => {
-                let target_host = if tf.rdi as u32 == 0 {
+                let target_host = if tf.arg(0) as u32 == 0 {
                     sched::current_pid()
                 } else {
-                    match sched::caller_local_to_host(tf.rdi as u32) {
+                    match sched::caller_local_to_host(tf.arg(0) as u32) {
                         Some(p) => p,
                         None => {
-                            tf.rax = ESRCH as u64;
+                            tf.set_ret(ESRCH as u64);
                             return;
                         }
                     }
                 };
-                let new_pgid_host = if tf.rsi as u32 == 0 {
+                let new_pgid_host = if tf.arg(1) as u32 == 0 {
                     target_host
                 } else {
-                    match sched::caller_local_to_host(tf.rsi as u32) {
+                    match sched::caller_local_to_host(tf.arg(1) as u32) {
                         Some(p) => p,
                         None => {
-                            tf.rax = ESRCH as u64;
+                            tf.set_ret(ESRCH as u64);
                             return;
                         }
                     }
                 };
-                tf.rax = match sched::setpgid(target_host, new_pgid_host) {
+                tf.set_ret(match sched::setpgid(target_host, new_pgid_host) {
                     Ok(()) => 0,
                     Err(e) => e as u64,
-                };
+                });
             }
             SYS_SETSID => {
-                tf.rax = match sched::setsid() {
+                tf.set_ret(match sched::setsid() {
                     Ok(p) => sched::host_to_caller_local(p) as u64,
                     Err(e) => e as u64,
-                };
+                });
             }
             SYS_GETSID => {
-                let target_host = if tf.rdi as u32 == 0 {
+                let target_host = if tf.arg(0) as u32 == 0 {
                     sched::current_pid()
                 } else {
-                    match sched::caller_local_to_host(tf.rdi as u32) {
+                    match sched::caller_local_to_host(tf.arg(0) as u32) {
                         Some(p) => p,
                         None => {
-                            tf.rax = ESRCH as u64;
+                            tf.set_ret(ESRCH as u64);
                             return;
                         }
                     }
                 };
-                tf.rax = match sched::getsid(target_host) {
+                tf.set_ret(match sched::getsid(target_host) {
                     Ok(p) => sched::host_to_caller_local(p) as u64,
                     Err(e) => e as u64,
-                };
+                });
             }
             SYS_PIDFD_OPEN => {
-                tf.rax = sys_pidfd_open(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_pidfd_open(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_PIDFD_SEND_SIGNAL => {
-                tf.rax = sys_pidfd_send_signal(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(
+                    sys_pidfd_send_signal(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64,
+                );
             }
             SYS_SIGNALFD4 => {
-                tf.rax = sys_signalfd4(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_signalfd4(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_EVENTFD2 => {
-                tf.rax = sys_eventfd2(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_eventfd2(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MEMFD_CREATE => {
-                tf.rax = sys_memfd_create(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_memfd_create(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_RSEQ => {
-                tf.rax = sys_rseq(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_rseq(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_PAUSE => {
-                tf.rax = sys_pause() as u64;
+                tf.set_ret(sys_pause() as u64);
             }
             SYS_RT_SIGTIMEDWAIT => {
-                tf.rax = sys_rt_sigtimedwait(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_rt_sigtimedwait(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_GETITIMER => {
-                tf.rax = sys_getitimer(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getitimer(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SETITIMER => {
-                tf.rax = sys_setitimer(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_setitimer(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SHMGET => {
-                tf.rax = sys_shmget(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_shmget(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SHMAT => {
-                tf.rax = sys_shmat(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_shmat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SHMCTL => {
-                tf.rax = sys_shmctl(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_shmctl(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_SHMDT => {
-                tf.rax = sys_shmdt(tf.rdi) as u64;
+                tf.set_ret(sys_shmdt(tf.arg(0)) as u64);
             }
             SYS_KEYCTL => {
-                tf.rax = sys_keyctl(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_keyctl(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_ADD_KEY | SYS_REQUEST_KEY => {
-                tf.rax = (-95i64) as u64;
+                tf.set_ret((-95i64) as u64);
             }
             SYS_GETRUSAGE => {
-                tf.rax = sys_getrusage(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getrusage(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_TIMES => {
-                tf.rax = sys_times(tf.rdi) as u64;
+                tf.set_ret(sys_times(tf.arg(0)) as u64);
             }
             SYS_SYSINFO => {
-                tf.rax = sys_sysinfo(tf.rdi) as u64;
+                tf.set_ret(sys_sysinfo(tf.arg(0)) as u64);
             }
             SYS_SYSLOG => {
-                tf.rax = sys_syslog(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_syslog(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PTRACE => {
-                tf.rax = sys_ptrace(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_ptrace(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_MINCORE => {
-                tf.rax = sys_mincore(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_mincore(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_ALARM => {
-                tf.rax = sys_alarm(tf.rdi) as u64;
+                tf.set_ret(sys_alarm(tf.arg(0)) as u64);
             }
             SYS_RT_SIGPENDING => {
-                tf.rax = sys_rt_sigpending(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_rt_sigpending(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_RT_SIGQUEUEINFO => {
-                tf.rax = sys_rt_sigqueueinfo(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_rt_sigqueueinfo(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_RT_SIGSUSPEND => {
-                tf.rax = sys_rt_sigsuspend(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_rt_sigsuspend(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MLOCK => {
-                tf.rax = sys_mlock(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_mlock(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MUNLOCK => {
-                tf.rax = sys_munlock(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_munlock(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MLOCKALL => {
-                tf.rax = sys_mlockall(tf.rdi) as u64;
+                tf.set_ret(sys_mlockall(tf.arg(0)) as u64);
             }
             SYS_MUNLOCKALL => {
-                tf.rax = sys_munlockall() as u64;
+                tf.set_ret(sys_munlockall() as u64);
             }
             SYS_SETRLIMIT => {
-                tf.rax = sys_setrlimit(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_setrlimit(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CLOCK_NANOSLEEP => {
-                tf.rax = sys_clock_nanosleep(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_clock_nanosleep(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_RT_TGSIGQUEUEINFO => {
-                tf.rax = sys_rt_tgsigqueueinfo(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(
+                    sys_rt_tgsigqueueinfo(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64,
+                );
             }
             SYS_GETCPU => {
-                tf.rax = sys_getcpu(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getcpu(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PROCESS_VM_READV => {
-                tf.rax = sys_process_vm_readv(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_process_vm_readv(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_PROCESS_VM_WRITEV => {
-                tf.rax = sys_process_vm_writev(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_process_vm_writev(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_MEMBARRIER => {
-                tf.rax = sys_membarrier(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_membarrier(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_MLOCK2 => {
-                tf.rax = sys_mlock2(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_mlock2(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_PKEY_MPROTECT | SYS_PKEY_ALLOC | SYS_PKEY_FREE => {
-                tf.rax = EOPNOTSUPP as u64;
+                tf.set_ret(EOPNOTSUPP as u64);
             }
             SYS_READAHEAD => {
-                tf.rax = sys_readahead(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_readahead(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_EPOLL_CREATE => {
-                if (tf.rdi as i64) <= 0 {
-                    tf.rax = EINVAL as u64;
+                if (tf.arg(0) as i64) <= 0 {
+                    tf.set_ret(EINVAL as u64);
                 } else {
-                    tf.rax = sys_epoll_create1(0) as u64;
+                    tf.set_ret(sys_epoll_create1(0) as u64);
                 }
             }
             SYS_EVENTFD => {
-                tf.rax = sys_eventfd2(tf.rdi, 0) as u64;
+                tf.set_ret(sys_eventfd2(tf.arg(0), 0) as u64);
             }
             SYS_MBIND => {
-                tf.rax = sys_mbind(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_mbind(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_SET_MEMPOLICY => {
-                tf.rax = sys_set_mempolicy(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_set_mempolicy(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_GET_MEMPOLICY => {
-                tf.rax = sys_get_mempolicy(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_get_mempolicy(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_SET_MEMPOLICY_HOME_NODE => {
-                tf.rax = sys_set_mempolicy_home_node(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(
+                    sys_set_mempolicy_home_node(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64,
+                );
             }
             SYS_SETTIMEOFDAY => {
-                tf.rax = sys_settimeofday(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_settimeofday(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CLOCK_SETTIME => {
-                tf.rax = sys_clock_settime(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_clock_settime(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_ADJTIMEX => {
-                tf.rax = sys_adjtimex(tf.rdi) as u64;
+                tf.set_ret(sys_adjtimex(tf.arg(0)) as u64);
             }
             SYS_CLOCK_ADJTIME => {
-                tf.rax = sys_clock_adjtime(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_clock_adjtime(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_FUTEX_WAITV => {
-                tf.rax = sys_futex_waitv(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(
+                    sys_futex_waitv(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64,
+                );
             }
             SYS_FUTEX_WAKE => {
-                tf.rax = sys_futex_wake(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_futex_wake(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_FUTEX_WAIT => {
-                tf.rax = sys_futex_wait(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_futex_wait(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_FUTEX_REQUEUE => {
-                tf.rax = sys_futex_requeue(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_futex_requeue(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_PERSONALITY => {
-                tf.rax = sys_personality(tf.rdi) as u64;
+                tf.set_ret(sys_personality(tf.arg(0)) as u64);
             }
             SYS_GETPRIORITY => {
-                tf.rax = sys_getpriority(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getpriority(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SETPRIORITY => {
-                tf.rax = sys_setpriority(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_setpriority(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_TKILL => {
-                tf.rax = sys_tkill(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_tkill(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_TIME => {
-                tf.rax = sys_time(tf.rdi) as u64;
+                tf.set_ret(sys_time(tf.arg(0)) as u64);
             }
             SYS_TIMERFD_CREATE => {
-                tf.rax = sys_timerfd_create(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_timerfd_create(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_TIMERFD_SETTIME => {
-                tf.rax = sys_timerfd_settime(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_timerfd_settime(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_TIMERFD_GETTIME => {
-                tf.rax = sys_timerfd_gettime(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_timerfd_gettime(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MOUNT => {
-                tf.rax = sys_mount(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(sys_mount(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64);
             }
             SYS_UMOUNT2 => {
-                tf.rax = sys_umount2(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_umount2(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CLOCK_GETTIME => {
-                tf.rax = sys_clock_gettime(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_clock_gettime(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CLOCK_GETRES => {
-                tf.rax = sys_clock_getres(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_clock_getres(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_GETTIMEOFDAY => {
-                tf.rax = sys_gettimeofday(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_gettimeofday(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_MPROTECT => {
-                tf.rax = sys_mprotect(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_mprotect(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_UNAME => {
-                tf.rax = sys_uname(tf.rdi) as u64;
+                tf.set_ret(sys_uname(tf.arg(0)) as u64);
             }
             SYS_GETUID => {
-                tf.rax = sched::with_current_creds(|c| c.uid_from_kernel(c.ruid) as u64);
+                tf.set_ret(sched::with_current_creds(|c| {
+                    c.uid_from_kernel(c.ruid) as u64
+                }));
             }
             SYS_GETEUID => {
-                tf.rax = sched::with_current_creds(|c| c.uid_from_kernel(c.euid) as u64);
+                tf.set_ret(sched::with_current_creds(|c| {
+                    c.uid_from_kernel(c.euid) as u64
+                }));
             }
             SYS_GETGID => {
-                tf.rax = sched::with_current_creds(|c| c.gid_from_kernel(c.rgid) as u64);
+                tf.set_ret(sched::with_current_creds(|c| {
+                    c.gid_from_kernel(c.rgid) as u64
+                }));
             }
             SYS_GETEGID => {
-                tf.rax = sched::with_current_creds(|c| c.gid_from_kernel(c.egid) as u64);
+                tf.set_ret(sched::with_current_creds(|c| {
+                    c.gid_from_kernel(c.egid) as u64
+                }));
             }
             SYS_GETTID => {
-                tf.rax = sched::current_local_pid() as u64;
+                tf.set_ret(sched::current_local_pid() as u64);
             }
             SYS_GETRLIMIT => {
-                tf.rax = sys_getrlimit(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_getrlimit(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_PRLIMIT64 => {
-                tf.rax = sys_prlimit64(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_prlimit64(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             SYS_PRCTL => {
-                tf.rax = sys_prctl(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8) as u64;
+                tf.set_ret(sys_prctl(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4)) as u64);
             }
             SYS_CAPGET => {
-                tf.rax = sys_capget(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_capget(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_CAPSET => {
-                tf.rax = sys_capset(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_capset(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SETHOSTNAME => {
-                tf.rax = sys_sethostname(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_sethostname(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SETDOMAINNAME => {
-                tf.rax = sys_setdomainname(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_setdomainname(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SECCOMP => {
-                tf.rax = sys_seccomp(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_seccomp(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_ARCH_PRCTL => {
-                tf.rax = sys_arch_prctl(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_arch_prctl(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_SET_TID_ADDRESS => {
-                tf.rax = sys_set_tid_address(tf.rdi) as u64;
+                tf.set_ret(sys_set_tid_address(tf.arg(0)) as u64);
             }
             SYS_SET_ROBUST_LIST => {
-                tf.rax = sys_set_robust_list(tf.rdi, tf.rsi) as u64;
+                tf.set_ret(sys_set_robust_list(tf.arg(0), tf.arg(1)) as u64);
             }
             SYS_GETRANDOM => {
-                tf.rax = sys_getrandom(tf.rdi, tf.rsi, tf.rdx) as u64;
+                tf.set_ret(sys_getrandom(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
             }
             SYS_FUTEX => {
-                tf.rax = sys_futex(tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8, tf.r9) as u64;
+                tf.set_ret(sys_futex(
+                    tf.arg(0),
+                    tf.arg(1),
+                    tf.arg(2),
+                    tf.arg(3),
+                    tf.arg(4),
+                    tf.arg(5),
+                ) as u64);
             }
             SYS_REBOOT => {
-                tf.rax = sys_reboot(tf.rdi, tf.rsi, tf.rdx, tf.r10) as u64;
+                tf.set_ret(sys_reboot(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
             n => {
                 frame::println!(
                     "[syscall] pid {} unhandled #{n} -> -ENOSYS",
                     sched::current_pid().0
                 );
-                tf.rax = ENOSYS as u64;
+                tf.set_ret(ENOSYS as u64);
             }
         }
     }
@@ -973,7 +1148,7 @@ const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0;
 const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
 
 fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> i64 {
-    if !crate::security::capable(crate::process::CAP_SYS_BOOT) {
+    if !crate::security::capable(crate::process_model::CAP_SYS_BOOT) {
         return -1;
     }
     if (magic1 as u32) as u64 != LINUX_REBOOT_MAGIC1 {
@@ -1013,7 +1188,7 @@ fn sys_getrandom(buf: u64, count: u64, flags: u64) -> i64 {
     }
     let len = (count as usize).min(0x100_0000);
     let mut tmp = alloc::vec![0u8; len];
-    crate::random::fill(&mut tmp);
+    crate::device::random::fill(&mut tmp);
     if frame::user::copy_to_user(buf, &tmp).is_err() {
         return EFAULT;
     }
@@ -1022,14 +1197,14 @@ fn sys_getrandom(buf: u64, count: u64, flags: u64) -> i64 {
 
 #[allow(dead_code)]
 pub fn dispatch_pre_sched(tf: &mut TrapFrame) {
-    match tf.rax {
+    match tf.syscall_nr() {
         SYS_WRITE => {
-            tf.rax = sys_write_pre_sched(tf.rdi, tf.rsi, tf.rdx) as u64;
+            tf.set_ret(sys_write_pre_sched(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
         }
-        SYS_EXIT | SYS_EXIT_GROUP => sys_exit_simple(tf.rdi as i32),
+        SYS_EXIT | SYS_EXIT_GROUP => sys_exit_simple(tf.arg(0) as i32),
         n => {
             frame::println!("[syscall] unhandled #{n} -> -ENOSYS");
-            tf.rax = ENOSYS as u64;
+            tf.set_ret(ENOSYS as u64);
         }
     }
 }
@@ -1051,13 +1226,9 @@ fn sys_write_pre_sched(fd: u64, buf: u64, count: u64) -> i64 {
 }
 pub fn install() {
     frame::user::register_dispatcher(dispatch);
-    frame::user::register_user_fault_handler(user_fault_handler);
-    frame::user::register_user_pf_hook(crate::mmap_fault::try_handle);
-    frame::user::register_irq_notify_resume(crate::sched::irq_notify_resume_checkpoint);
-}
-
-fn user_fault_handler(addr: u64, vector: u8, error: u64) -> ! {
-    crate::sched::kill_user_fault(addr, vector, error)
+    frame::user::register_user_fault_signal(crate::core::deliver_user_fault);
+    frame::user::register_user_pf_hook(crate::mm::mmap_fault::try_handle);
+    frame::user::register_irq_notify_resume(crate::core::irq_notify_resume_checkpoint);
 }
 
 pub fn install_pre_sched() {

@@ -4,7 +4,6 @@
 
 extern crate alloc;
 
-pub mod bpf;
 pub mod errno;
 
 #[cfg(host_test)]
@@ -17,42 +16,39 @@ pub mod fs {
     pub mod ext4;
     pub mod tar;
 }
+#[cfg(host_test)]
+pub mod ipc {
+    pub mod futex;
+}
+#[cfg(host_test)]
+pub mod security {
+    pub mod bpf;
+}
+#[cfg(host_test)]
+pub mod device {
+    pub mod random;
+}
 
 #[cfg(host_test)]
-pub mod futex;
+#[path = "core/mod_host.rs"]
+pub mod core;
 #[cfg(host_test)]
-#[path = "process_host.rs"]
-pub mod process;
-#[cfg(host_test)]
-pub mod random;
-#[cfg(host_test)]
-#[path = "sched_host.rs"]
-pub mod sched;
-#[cfg(host_test)]
-pub mod sched_runqueue;
-#[cfg(host_test)]
-pub mod timeout;
-#[cfg(host_test)]
-pub mod wait;
+#[path = "process_model/mod_host.rs"]
+pub mod process_model;
+
+#[cfg(not(host_test))]
+pub mod core;
+#[cfg(not(host_test))]
+pub mod process_model;
 
 #[cfg(not(host_test))]
 pub mod cgroup;
 #[cfg(not(host_test))]
 pub mod console;
 #[cfg(not(host_test))]
-pub mod drm;
-#[cfg(not(host_test))]
-pub mod elf;
-#[cfg(not(host_test))]
-pub mod fdtypes;
+pub mod device;
 #[cfg(not(host_test))]
 pub mod fs;
-#[cfg(not(host_test))]
-pub mod futex;
-#[cfg(not(host_test))]
-pub mod init_exec;
-#[cfg(not(host_test))]
-pub mod input;
 #[cfg(not(host_test))]
 pub mod io;
 #[cfg(not(host_test))]
@@ -60,62 +56,58 @@ pub mod ipc;
 #[cfg(not(host_test))]
 pub mod klog;
 #[cfg(not(host_test))]
-pub mod mmap_fault;
+pub mod loader;
+#[cfg(not(host_test))]
+pub mod mm;
 #[cfg(not(host_test))]
 pub mod net;
 #[cfg(not(host_test))]
-pub mod process;
-#[cfg(not(host_test))]
 pub mod ptrace;
-#[cfg(not(host_test))]
-pub mod pty;
-#[cfg(not(host_test))]
-pub mod random;
-#[cfg(not(host_test))]
-pub mod sched;
-#[cfg(not(host_test))]
-pub mod sched_runqueue;
-#[cfg(not(host_test))]
-pub mod seccomp;
 #[cfg(not(host_test))]
 pub mod security;
 #[cfg(not(host_test))]
-pub mod signal;
-#[cfg(not(host_test))]
-pub mod stack_init;
-#[cfg(not(host_test))]
 pub mod syscall;
 #[cfg(not(host_test))]
-pub mod timeout;
-#[cfg(not(host_test))]
 pub mod vfs;
+
 #[cfg(not(host_test))]
-pub mod wait;
+fn task_exit_cleanup(
+    vmspace_id: u64,
+    pid: process_model::Pid,
+    clear_child_tid: u64,
+    robust_list: u64,
+) {
+    ipc::futex::clear_child_tid(vmspace_id, clear_child_tid);
+    ipc::futex::exit_robust_list(vmspace_id, robust_list);
+    ipc::futex::pi_owner_died(vmspace_id, pid);
+}
+
+#[cfg(not(host_test))]
+fn addr_space_release_cleanup(
+    addr_space: &alloc::sync::Arc<process_model::AddressSpace>,
+    ipc_ns: Option<&alloc::sync::Arc<process_model::IpcNamespace>>,
+) {
+    ipc::shm::detach_all_for(addr_space, ipc_ns);
+    mm::mmap_fault::detach_shared_file_for(addr_space);
+}
 
 #[cfg(not(host_test))]
 pub fn init() {
     frame::io::uart::set_klog_sink(klog::push_bytes);
 
     virtio::init();
-    random::init();
+    device::random::init();
     cgroup::init();
     init_vfs();
     frame::mm::heap::expand_full();
     net::init();
     syscall::install();
     ptrace::install_trap_hook();
-    frame::intr::lapic::register_tick_handler(sched::on_tick);
+    frame::intr::lapic::register_tick_handler(core::on_tick);
+    core::register_task_exit_hook(task_exit_cleanup);
+    core::register_addr_space_release_hook(addr_space_release_cleanup);
 
-    frame::arch::x86_64::smp::set_ap_main(sched::ap_main);
-    let apic_ids = frame::arch::x86_64::madt::parse_apic_ids(frame::boot::rsdp_paddr());
-    if !apic_ids.is_empty() {
-        frame::println!(
-            "madt: bringing up {} APs (apic_ids = {:?})",
-            apic_ids.len(),
-            apic_ids
-        );
-    }
-    frame::arch::x86_64::smp::bring_up(&apic_ids);
+    frame::cpu::bring_up_secondaries(core::ap_main);
 
     net::start_pump_kthread();
 }
@@ -145,7 +137,9 @@ fn init_vfs() {
     dev.attach("fb0", fs::devfs::fb0()).expect("attach fb0");
     if virtio::framebuffer_info().is_some() {
         let dri_dir = fs::tmpfs::TmpfsInode::new_dir();
-        dri_dir.attach("card0", drm::card0()).expect("attach card0");
+        dri_dir
+            .attach("card0", device::drm::card0())
+            .expect("attach card0");
         let dri_dyn: Arc<dyn Inode> = dri_dir;
         dev.attach("dri", dri_dyn).expect("attach /dev/dri");
     }

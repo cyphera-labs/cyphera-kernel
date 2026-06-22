@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
+use crate::core as sched;
 use crate::errno::{EFAULT, EINVAL};
-use crate::sched;
 use crate::vfs::{OpenFlags, TimeSpec};
 
 pub(super) fn write_timespec(user_ptr: u64, sec: i64, nsec: i64) -> Result<(), i64> {

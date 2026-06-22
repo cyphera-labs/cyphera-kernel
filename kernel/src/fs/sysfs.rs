@@ -4,14 +4,16 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, Stat};
+use cyphera_kapi::{Errno, KResult};
+
+use crate::vfs::{DirEntry, Inode, InodeKind, Stat};
 
 pub fn root() -> Arc<dyn Inode> {
     let kernel = StaticDir::new(alloc::vec![Entry::file("ostype", "Linux\n")]);
     let class_net_children = build_class_net();
     let class_net = StaticDir::new(class_net_children);
     let class = StaticDir::new(alloc::vec![Entry::dir("net", class_net)]);
-    let block = StaticDir::new(alloc::vec![]);
+    let block = StaticDir::new(build_block());
     let devices = StaticDir::new(alloc::vec![]);
     let fs_dir = StaticDir::new(alloc::vec![(
         "cgroup".to_string(),
@@ -58,6 +60,28 @@ fn build_class_net() -> Vec<(alloc::string::String, Entry)> {
     out
 }
 
+fn build_block() -> Vec<(alloc::string::String, Entry)> {
+    let mut out = Vec::new();
+    if let Some(sectors) = virtio::block_capacity_sectors() {
+        let size = alloc::format!("{}\n", sectors);
+        let size_leaked: &'static str = alloc::boxed::Box::leak(size.into_boxed_str());
+        let queue = StaticDir::new(alloc::vec![
+            Entry::file("logical_block_size", "512\n"),
+            Entry::file("physical_block_size", "512\n"),
+            Entry::file("hw_sector_size", "512\n"),
+        ]);
+        let vda = StaticDir::new(alloc::vec![
+            Entry::file_static("size", size_leaked),
+            Entry::file("ro", "0\n"),
+            Entry::file("removable", "0\n"),
+            Entry::file("dev", "254:0\n"),
+            Entry::dir("queue", queue),
+        ]);
+        out.push(("vda".to_string(), Entry::Dir(Arc::new(vda))));
+    }
+    out
+}
+
 enum Entry {
     File(StaticAttr),
     Dir(Arc<dyn Inode>),
@@ -92,7 +116,7 @@ impl Inode for StaticDir {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Directory, 0, 0o555)
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         for (n, e) in &self.entries {
             if n == name {
                 return Ok(match e {
@@ -101,9 +125,9 @@ impl Inode for StaticDir {
                 });
             }
         }
-        Err(FsError::NotFound)
+        Err(Errno::NOENT)
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(self
             .entries
             .iter()
@@ -137,7 +161,7 @@ impl Inode for StaticAttr {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, self.body.len() as u64, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let src = self.body.as_bytes();
         if offset >= src.len() as u64 {
             return Ok(0);

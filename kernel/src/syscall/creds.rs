@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 use frame::user::TrapFrame;
 
+use crate::core as sched;
 use crate::errno::{EFAULT, EINVAL, ENOSYS, EPERM, ESRCH};
-use crate::sched;
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
@@ -27,7 +27,7 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> i64 {
     let target_pid = if pid_arg == 0 {
         sched::current_pid()
     } else {
-        crate::process::Pid(pid_arg as u32)
+        crate::process_model::Pid(pid_arg as u32)
     };
     let snap = sched::with_target_creds(target_pid, |c| c.clone());
     let creds = match snap {
@@ -103,21 +103,21 @@ const SECCOMP_FILTER_FLAG_LOG: u64 = 2;
 const SECCOMP_FILTER_FLAG_SPEC_ALLOW: u64 = 4;
 
 pub(super) fn sys_seccomp(operation: u64, flags: u64, args: u64) -> i64 {
-    use crate::bpf::{BpfProgram, SockFilter};
+    use crate::security::bpf::{BpfProgram, SockFilter};
 
     match operation {
         SECCOMP_SET_MODE_STRICT => {
             let prog = strict_mode_program();
-            let prog = match BpfProgram::verify(prog, crate::seccomp::SeccompData::SIZE) {
+            let prog = match BpfProgram::verify(prog, crate::security::seccomp::SeccompData::SIZE) {
                 Ok(p) => p,
                 Err(_) => return EINVAL,
             };
             if !sched::current_no_new_privs()
-                && !crate::security::has_cap(crate::process::CAP_SYS_ADMIN)
+                && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN)
             {
                 return EPERM;
             }
-            crate::seccomp::install_filter(Arc::new(prog));
+            crate::security::seccomp::install_filter(Arc::new(prog));
             0
         }
         SECCOMP_SET_MODE_FILTER => {
@@ -130,7 +130,7 @@ pub(super) fn sys_seccomp(operation: u64, flags: u64, args: u64) -> i64 {
                 return EINVAL;
             }
             if !sched::current_no_new_privs()
-                && !crate::security::has_cap(crate::process::CAP_SYS_ADMIN)
+                && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN)
             {
                 return EPERM;
             }
@@ -161,15 +161,16 @@ pub(super) fn sys_seccomp(operation: u64, flags: u64, args: u64) -> i64 {
                     k: u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()),
                 });
             }
-            let prog = match BpfProgram::verify(insns, crate::seccomp::SeccompData::SIZE) {
+            let prog = match BpfProgram::verify(insns, crate::security::seccomp::SeccompData::SIZE)
+            {
                 Ok(p) => p,
                 Err(_) => return EINVAL,
             };
             let prog = Arc::new(prog);
             if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
-                crate::seccomp::install_filter_all_threads(prog);
+                crate::security::seccomp::install_filter_all_threads(prog);
             } else {
-                crate::seccomp::install_filter(prog);
+                crate::security::seccomp::install_filter(prog);
             }
             0
         }
@@ -180,12 +181,12 @@ pub(super) fn sys_seccomp(operation: u64, flags: u64, args: u64) -> i64 {
             }
             let action = u32::from_le_bytes(a);
             let supported = [
-                crate::seccomp::SECCOMP_RET_KILL_PROCESS,
-                crate::seccomp::SECCOMP_RET_KILL_THREAD,
-                crate::seccomp::SECCOMP_RET_TRAP,
-                crate::seccomp::SECCOMP_RET_ERRNO,
-                crate::seccomp::SECCOMP_RET_LOG,
-                crate::seccomp::SECCOMP_RET_ALLOW,
+                crate::security::seccomp::SECCOMP_RET_KILL_PROCESS,
+                crate::security::seccomp::SECCOMP_RET_KILL_THREAD,
+                crate::security::seccomp::SECCOMP_RET_TRAP,
+                crate::security::seccomp::SECCOMP_RET_ERRNO,
+                crate::security::seccomp::SECCOMP_RET_LOG,
+                crate::security::seccomp::SECCOMP_RET_ALLOW,
             ];
             if supported.contains(&action) {
                 0
@@ -198,10 +199,10 @@ pub(super) fn sys_seccomp(operation: u64, flags: u64, args: u64) -> i64 {
     }
 }
 
-fn strict_mode_program() -> Vec<crate::bpf::SockFilter> {
-    use crate::bpf::SockFilter;
-    let kill = crate::seccomp::SECCOMP_RET_KILL_PROCESS;
-    let allow = crate::seccomp::SECCOMP_RET_ALLOW;
+fn strict_mode_program() -> Vec<crate::security::bpf::SockFilter> {
+    use crate::security::bpf::SockFilter;
+    let kill = crate::security::seccomp::SECCOMP_RET_KILL_PROCESS;
+    let allow = crate::security::seccomp::SECCOMP_RET_ALLOW;
     alloc::vec![
         SockFilter {
             code: 0x20,
@@ -255,7 +256,7 @@ fn strict_mode_program() -> Vec<crate::bpf::SockFilter> {
 }
 
 pub(super) fn apply_seccomp(tf: &mut TrapFrame) -> bool {
-    use crate::seccomp::*;
+    use crate::security::seccomp::*;
     let r = evaluate_for_syscall(tf);
     let action = r & SECCOMP_RET_ACTION;
     let data = r & SECCOMP_RET_DATA;
@@ -266,21 +267,24 @@ pub(super) fn apply_seccomp(tf: &mut TrapFrame) -> bool {
         frame::println!(
             "[seccomp] log: pid={} nr={} action=LOG",
             sched::current_pid().raw(),
-            tf.rax
+            tf.syscall_nr()
         );
         return true;
     }
     if action == SECCOMP_RET_ERRNO {
         let errno = data.min(4095) as i64;
-        tf.rax = (-errno) as u64;
+        tf.set_ret((-errno) as u64);
         return false;
     }
     if action == SECCOMP_RET_TRAP {
         let pid = sched::current_pid();
-        let info =
-            crate::signal::SigInfo::for_seccomp(tf.rip_user, tf.orig_rax as u32, data as u16);
+        let info = crate::core::signal::SigInfo::for_seccomp(
+            tf.user_ip(),
+            tf.orig_nr() as u32,
+            data as u16,
+        );
         let _ = sched::send_signal_with_info(pid, 31, info);
-        tf.rax = ENOSYS as u64;
+        tf.set_ret(ENOSYS as u64);
         sched::deliver_pending_signals(tf);
         return false;
     }
@@ -294,7 +298,7 @@ pub(super) fn sys_sethostname(name: u64, len: u64) -> i64 {
     if len > 64 || name == 0 {
         return EINVAL;
     }
-    if !crate::security::capable(crate::process::CAP_SYS_ADMIN) {
+    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
         return EPERM;
     }
     let mut buf = [0u8; 64];
@@ -315,7 +319,7 @@ pub(super) fn sys_setdomainname(name: u64, len: u64) -> i64 {
     if len > 64 || name == 0 {
         return EINVAL;
     }
-    if !crate::security::capable(crate::process::CAP_SYS_ADMIN) {
+    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
         return EPERM;
     }
     let mut buf = [0u8; 64];
@@ -404,13 +408,13 @@ pub(super) fn sys_setgroups(size: u64, list: u64) -> i64 {
                 .load(core::sync::atomic::Ordering::Acquire),
             None => false,
         };
-        (c.has_cap(crate::process::CAP_SETGID), denied)
+        (c.has_cap(crate::process_model::CAP_SETGID), denied)
     });
     if gate_denied || !priv_ {
         return EPERM;
     }
     let n = size as usize;
-    if n > crate::process::MAX_SUPP_GROUPS {
+    if n > crate::process_model::MAX_SUPP_GROUPS {
         return EINVAL;
     }
     if n == 0 {

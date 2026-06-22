@@ -7,8 +7,10 @@ use alloc::vec::Vec;
 
 use frame::sync::SpinIrq;
 
-use crate::vfs::{FsError, Inode, InodeKind, OpenFile, OpenFlags, Stat};
-use crate::wait::WaitQueue;
+use cyphera_kapi::{Errno, KResult};
+
+use crate::core::wait::WaitQueue;
+use crate::vfs::{Inode, InodeKind, OpenFile, OpenFlags, Stat};
 
 const UNIX_CAPACITY: usize = 64 * 1024;
 
@@ -21,12 +23,76 @@ struct Ring {
     written: usize,
     read: usize,
     fds: VecDeque<FdBatch>,
+    bounds: VecDeque<usize>,
 }
 
 struct Channel {
     ring: SpinIrq<Ring>,
     read_waiters: WaitQueue,
     write_waiters: WaitQueue,
+    framed: bool,
+}
+
+impl Ring {
+    fn read_into(&mut self, framed: bool, buf: &mut [u8]) -> usize {
+        if framed {
+            let msg_len = match self.bounds.pop_front() {
+                Some(l) => l,
+                None => return 0,
+            };
+            let copy = msg_len.min(buf.len());
+            for slot in buf.iter_mut().take(copy) {
+                *slot = self.buf.pop_front().unwrap_or(0);
+            }
+            for _ in copy..msg_len {
+                self.buf.pop_front();
+            }
+            self.read += msg_len;
+            copy
+        } else {
+            let mut n = 0;
+            while n < buf.len() {
+                match self.buf.pop_front() {
+                    Some(b) => {
+                        buf[n] = b;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            self.read += n;
+            n
+        }
+    }
+
+    fn write_from(&mut self, framed: bool, buf: &[u8]) -> Option<usize> {
+        let room = UNIX_CAPACITY.saturating_sub(self.buf.len());
+        if framed {
+            if buf.len() > room {
+                return None;
+            }
+            self.buf.extend(buf.iter().copied());
+            self.bounds.push_back(buf.len());
+            self.written += buf.len();
+            Some(buf.len())
+        } else {
+            if room == 0 {
+                return None;
+            }
+            let n = buf.len().min(room);
+            self.buf.extend(buf[..n].iter().copied());
+            self.written += n;
+            Some(n)
+        }
+    }
+
+    fn has_unit(&self, framed: bool) -> bool {
+        if framed {
+            !self.bounds.is_empty()
+        } else {
+            !self.buf.is_empty()
+        }
+    }
 }
 
 pub struct UnixEnd {
@@ -35,7 +101,7 @@ pub struct UnixEnd {
 }
 
 impl UnixEnd {
-    pub fn pair() -> (Arc<Self>, Arc<Self>) {
+    pub fn pair(framed: bool) -> (Arc<Self>, Arc<Self>) {
         let a_chan = Arc::new(Channel {
             ring: SpinIrq::new(Ring {
                 buf: VecDeque::with_capacity(UNIX_CAPACITY),
@@ -44,9 +110,11 @@ impl UnixEnd {
                 written: 0,
                 read: 0,
                 fds: VecDeque::new(),
+                bounds: VecDeque::new(),
             }),
             read_waiters: WaitQueue::new(),
             write_waiters: WaitQueue::new(),
+            framed,
         });
         let b_chan = Arc::new(Channel {
             ring: SpinIrq::new(Ring {
@@ -56,9 +124,11 @@ impl UnixEnd {
                 written: 0,
                 read: 0,
                 fds: VecDeque::new(),
+                bounds: VecDeque::new(),
             }),
             read_waiters: WaitQueue::new(),
             write_waiters: WaitQueue::new(),
+            framed,
         });
         let a = Arc::new(Self {
             inbox: a_chan.clone(),
@@ -80,16 +150,11 @@ impl Inode for UnixEnd {
         Stat::fresh(InodeKind::Pipe, 0, 0o600)
     }
 
-    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> KResult<usize> {
         self.read_at_with_flags(off, buf, OpenFlags::empty())
     }
 
-    fn read_at_with_flags(
-        &self,
-        _off: u64,
-        buf: &mut [u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, _off: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
         crate::vfs::blocking::block_io(
             "unix_read",
@@ -98,18 +163,9 @@ impl Inode for UnixEnd {
             None,
             || {
                 let mut s = self.inbox.ring.lock();
-                if !s.buf.is_empty() {
-                    let mut n = 0;
-                    while n < buf.len() {
-                        match s.buf.pop_front() {
-                            Some(b) => {
-                                buf[n] = b;
-                                n += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    s.read += n;
+                let framed = self.inbox.framed;
+                if s.has_unit(framed) {
+                    let n = s.read_into(framed, buf);
                     while matches!(s.fds.front(), Some((pos, _)) if *pos < s.read) {
                         s.fds.pop_front();
                     }
@@ -125,16 +181,11 @@ impl Inode for UnixEnd {
         )
     }
 
-    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, off: u64, buf: &[u8]) -> KResult<usize> {
         self.write_at_with_flags(off, buf, OpenFlags::empty())
     }
 
-    fn write_at_with_flags(
-        &self,
-        _off: u64,
-        buf: &[u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, _off: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
         crate::vfs::blocking::block_io(
@@ -145,73 +196,71 @@ impl Inode for UnixEnd {
             || {
                 let mut s = self.peer_inbox.ring.lock();
                 if s.readers == 0 {
-                    return IoAttempt::Err(FsError::BrokenPipe);
+                    return IoAttempt::Err(Errno::PIPE);
                 }
-                let room = UNIX_CAPACITY.saturating_sub(s.buf.len());
-                if room == 0 {
-                    return IoAttempt::WouldBlock;
+                let framed = self.peer_inbox.framed;
+                match s.write_from(framed, buf) {
+                    Some(n) => {
+                        drop(s);
+                        self.peer_inbox.read_waiters.wake_one();
+                        IoAttempt::Ready(n)
+                    }
+                    None => IoAttempt::WouldBlock,
                 }
-                let n = buf.len().min(room);
-                s.buf.extend(buf[..n].iter().copied());
-                s.written += n;
-                drop(s);
-                self.peer_inbox.read_waiters.wake_one();
-                IoAttempt::Ready(n)
             },
         )
     }
 
-    fn write_with_fds(&self, buf: &[u8], mut fds: Vec<Arc<OpenFile>>) -> Result<usize, FsError> {
+    fn write_with_fds(
+        &self,
+        buf: &[u8],
+        mut fds: Vec<Arc<OpenFile>>,
+        nonblock: bool,
+    ) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         crate::vfs::blocking::block_io(
             "unix_write_fds",
             &self.peer_inbox.write_waiters,
-            false,
+            nonblock,
             None,
             || {
                 let mut s = self.peer_inbox.ring.lock();
                 if s.readers == 0 {
-                    return IoAttempt::Err(FsError::BrokenPipe);
+                    return IoAttempt::Err(Errno::PIPE);
                 }
-                let room = UNIX_CAPACITY.saturating_sub(s.buf.len());
-                if room == 0 {
-                    return IoAttempt::WouldBlock;
+                let framed = self.peer_inbox.framed;
+                let pos = s.written;
+                match s.write_from(framed, buf) {
+                    Some(n) => {
+                        if !fds.is_empty() {
+                            s.fds.push_back((pos, core::mem::take(&mut fds)));
+                        }
+                        drop(s);
+                        self.peer_inbox.read_waiters.wake_one();
+                        IoAttempt::Ready(n)
+                    }
+                    None => IoAttempt::WouldBlock,
                 }
-                let n = buf.len().min(room);
-                if !fds.is_empty() {
-                    let pos = s.written;
-                    s.fds.push_back((pos, core::mem::take(&mut fds)));
-                }
-                s.buf.extend(buf[..n].iter().copied());
-                s.written += n;
-                drop(s);
-                self.peer_inbox.read_waiters.wake_one();
-                IoAttempt::Ready(n)
             },
         )
     }
 
-    fn read_with_fds(&self, buf: &mut [u8]) -> Result<(usize, Vec<Arc<OpenFile>>), FsError> {
+    fn read_with_fds(
+        &self,
+        buf: &mut [u8],
+        nonblock: bool,
+    ) -> KResult<(usize, Vec<Arc<OpenFile>>)> {
         use crate::vfs::blocking::IoAttempt;
         crate::vfs::blocking::block_io(
             "unix_recvmsg",
             &self.inbox.read_waiters,
-            false,
+            nonblock,
             None,
             || {
                 let mut s = self.inbox.ring.lock();
-                if !s.buf.is_empty() {
-                    let mut n = 0;
-                    while n < buf.len() {
-                        match s.buf.pop_front() {
-                            Some(b) => {
-                                buf[n] = b;
-                                n += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    s.read += n;
+                let framed = self.inbox.framed;
+                if s.has_unit(framed) {
+                    let n = s.read_into(framed, buf);
                     let fds = match s.fds.front() {
                         Some((pos, _)) if *pos < s.read => {
                             s.fds.pop_front().map(|(_, f)| f).unwrap_or_default()
@@ -235,7 +284,7 @@ impl Inode for UnixEnd {
         let inbox = self.inbox.ring.lock();
         let peer = self.peer_inbox.ring.lock();
         let mut m = PollMask::empty();
-        if !inbox.buf.is_empty() || inbox.writers == 0 {
+        if inbox.has_unit(self.inbox.framed) || inbox.writers == 0 {
             m |= PollMask::IN;
         }
         if peer.buf.len() < UNIX_CAPACITY || peer.readers == 0 {
@@ -369,7 +418,7 @@ pub struct UnixSocket {
 
 impl UnixSocket {
     fn new(kind: UnixKind) -> Arc<Self> {
-        let ns = crate::sched::current_net_ns();
+        let ns = crate::core::current_net_ns();
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             ns,
@@ -466,9 +515,9 @@ impl UnixSocket {
         );
         let (sender, payload) = match got {
             Ok(d) => d,
-            Err(FsError::WouldBlock) => return crate::errno::EAGAIN,
-            Err(FsError::Interrupted) => return crate::errno::EINTR,
-            Err(e) => return e.errno(),
+            Err(Errno::AGAIN) => return crate::errno::EAGAIN,
+            Err(Errno::INTR) => return crate::errno::EINTR,
+            Err(e) => return e.as_neg_i64(),
         };
         let n = payload.len().min(buf.len());
         buf[..n].copy_from_slice(&payload[..n]);
@@ -510,11 +559,11 @@ impl UnixSocket {
         }
     }
 
-    pub fn try_accept(&self) -> Result<Arc<UnixEnd>, FsError> {
+    pub fn try_accept(&self) -> KResult<Arc<UnixEnd>> {
         let mut st = self.state.lock();
         match &mut *st {
-            SockState::Listening { backlog, .. } => backlog.pop_front().ok_or(FsError::WouldBlock),
-            _ => Err(FsError::InvalidArgument),
+            SockState::Listening { backlog, .. } => backlog.pop_front().ok_or(Errno::AGAIN),
+            _ => Err(Errno::INVAL),
         }
     }
 
@@ -526,7 +575,7 @@ impl UnixSocket {
             Some(l) => l,
             None => return Err(crate::errno::ECONNREFUSED),
         };
-        let (server, client) = UnixEnd::pair();
+        let (server, client) = UnixEnd::pair(false);
         client.on_open(OpenFlags::RDWR);
         server.on_open(OpenFlags::RDWR);
         {
@@ -566,58 +615,48 @@ impl Inode for UnixSocket {
         Stat::fresh(InodeKind::Pipe, 0, 0o600)
     }
 
-    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> KResult<usize> {
         self.read_at_with_flags(off, buf, OpenFlags::empty())
     }
 
-    fn read_at_with_flags(
-        &self,
-        off: u64,
-        buf: &mut [u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, off: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
         if self.kind == UnixKind::Dgram {
             let r = self.dgram_recv_from(buf, None, nonblock);
             return match r {
                 r if r >= 0 => Ok(r as usize),
-                e if e == crate::errno::EINTR => Err(FsError::Interrupted),
-                e if e == crate::errno::EAGAIN => Err(FsError::WouldBlock),
-                _ => Err(FsError::Io),
+                e if e == crate::errno::EINTR => Err(Errno::INTR),
+                e if e == crate::errno::EAGAIN => Err(Errno::AGAIN),
+                _ => Err(Errno::IO),
             };
         }
         match self.connected_end() {
             Some(end) => end.read_at_with_flags(off, buf, flags),
-            None => Err(FsError::InvalidArgument),
+            None => Err(Errno::INVAL),
         }
     }
 
-    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, off: u64, buf: &[u8]) -> KResult<usize> {
         self.write_at_with_flags(off, buf, OpenFlags::empty())
     }
 
-    fn write_at_with_flags(
-        &self,
-        off: u64,
-        buf: &[u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, off: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
         if self.kind == UnixKind::Dgram {
             let dest = match self.dgram_peer.lock().clone() {
                 Some(p) => p,
-                None => return Err(FsError::InvalidArgument),
+                None => return Err(Errno::INVAL),
             };
             let r = self.dgram_send_to(buf, &dest);
             return match r {
                 r if r >= 0 => Ok(r as usize),
-                e if e == crate::errno::EINTR => Err(FsError::Interrupted),
-                e if e == crate::errno::EAGAIN => Err(FsError::WouldBlock),
-                _ => Err(FsError::Io),
+                e if e == crate::errno::EINTR => Err(Errno::INTR),
+                e if e == crate::errno::EAGAIN => Err(Errno::AGAIN),
+                _ => Err(Errno::IO),
             };
         }
         match self.connected_end() {
             Some(end) => end.write_at_with_flags(off, buf, flags),
-            None => Err(FsError::InvalidArgument),
+            None => Err(Errno::INVAL),
         }
     }
 
@@ -659,17 +698,26 @@ impl Inode for UnixSocket {
         }
     }
 
-    fn write_with_fds(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> Result<usize, FsError> {
+    fn write_with_fds(
+        &self,
+        buf: &[u8],
+        fds: Vec<Arc<OpenFile>>,
+        nonblock: bool,
+    ) -> KResult<usize> {
         match self.connected_end() {
-            Some(end) => end.write_with_fds(buf, fds),
-            None => Err(FsError::InvalidArgument),
+            Some(end) => end.write_with_fds(buf, fds, nonblock),
+            None => Err(Errno::INVAL),
         }
     }
 
-    fn read_with_fds(&self, buf: &mut [u8]) -> Result<(usize, Vec<Arc<OpenFile>>), FsError> {
+    fn read_with_fds(
+        &self,
+        buf: &mut [u8],
+        nonblock: bool,
+    ) -> KResult<(usize, Vec<Arc<OpenFile>>)> {
         match self.connected_end() {
-            Some(end) => end.read_with_fds(buf),
-            None => Err(FsError::InvalidArgument),
+            Some(end) => end.read_with_fds(buf, nonblock),
+            None => Err(Errno::INVAL),
         }
     }
 
@@ -698,17 +746,17 @@ impl super::Socket for UnixSocket {
             let start = if path.starts_with('/') {
                 ctx.root.clone()
             } else {
-                crate::sched::with_current_cwd(|c| c.inode.clone())
+                crate::core::with_current_cwd(|c| c.inode.clone())
                     .unwrap_or_else(|| ctx.root.clone())
             };
             if let Ok((parent, leaf)) = crate::vfs::path::resolve_parent(&ctx, &start, &path) {
                 match parent.create(leaf, InodeKind::Socket) {
                     Ok(node) => {
-                        let (euid, egid) = crate::sched::with_current_creds(|c| (c.euid, c.egid));
+                        let (euid, egid) = crate::core::with_current_creds(|c| (c.euid, c.egid));
                         let _ = node.set_owner(Some(euid), Some(egid));
                     }
-                    Err(FsError::Exists) => return crate::errno::EADDRINUSE,
-                    Err(e) => return e.errno(),
+                    Err(Errno::EXIST) => return crate::errno::EADDRINUSE,
+                    Err(e) => return e.as_neg_i64(),
                 }
             }
         }
@@ -739,11 +787,11 @@ impl super::Socket for UnixSocket {
             None,
             || match self.try_accept() {
                 Ok(e) => crate::vfs::blocking::IoAttempt::Ready(e),
-                Err(FsError::WouldBlock) => crate::vfs::blocking::IoAttempt::WouldBlock,
+                Err(Errno::AGAIN) => crate::vfs::blocking::IoAttempt::WouldBlock,
                 Err(e) => crate::vfs::blocking::IoAttempt::Err(e),
             },
         )
-        .map_err(|e| e.errno())?;
+        .map_err(|e| e.as_neg_i64())?;
         if let Some((addr, addrlen)) = peer_out {
             if addr != 0 && addrlen != 0 {
                 let mut cap = [0u8; 4];

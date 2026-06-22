@@ -37,7 +37,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
 
     let mut vmspace = VmSpace::current();
 
-    let loaded = kernel::elf::load_static(HELLO_ELF, &mut vmspace).expect("load_static");
+    let loaded = kernel::loader::elf::load_static(HELLO_ELF, &mut vmspace).expect("load_static");
     println!("[test] user_elf: loaded; entry @ {:#x}", loaded.entry);
 
     let _stack = vmspace

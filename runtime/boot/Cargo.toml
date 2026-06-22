@@ -149,6 +149,21 @@ path = "tests/subsystem/fork.rs"
 harness = false
 
 [[test]]
+name = "fork_rlimit"
+path = "tests/subsystem/fork_rlimit.rs"
+harness = false
+
+[[test]]
+name = "oom"
+path = "tests/subsystem/oom.rs"
+harness = false
+
+[[test]]
+name = "oom_stack"
+path = "tests/subsystem/oom_stack.rs"
+harness = false
+
+[[test]]
 name = "fork_shared"
 path = "tests/subsystem/fork_shared.rs"
 harness = false
@@ -194,8 +209,23 @@ path = "tests/subsystem/signal.rs"
 harness = false
 
 [[test]]
+name = "rt_signal"
+path = "tests/subsystem/rt_signal.rs"
+harness = false
+
+[[test]]
+name = "sa_restart"
+path = "tests/subsystem/sa_restart.rs"
+harness = false
+
+[[test]]
 name = "select"
 path = "tests/subsystem/select.rs"
+harness = false
+
+[[test]]
+name = "pipe_size"
+path = "tests/subsystem/pipe_size.rs"
 harness = false
 
 [[test]]
@@ -251,6 +281,11 @@ harness = false
 [[test]]
 name = "loadtick"
 path = "tests/subsystem/loadtick.rs"
+harness = false
+
+[[test]]
+name = "itimer"
+path = "tests/subsystem/itimer.rs"
 harness = false
 
 [[test]]
@@ -404,6 +439,31 @@ path = "tests/subsystem/ptrace.rs"
 harness = false
 
 [[test]]
+name = "ptrace_segv"
+path = "tests/subsystem/ptrace_segv.rs"
+harness = false
+
+[[test]]
+name = "ptrace_singlestep"
+path = "tests/subsystem/ptrace_singlestep.rs"
+harness = false
+
+[[test]]
+name = "uid_sigpending"
+path = "tests/subsystem/uid_sigpending.rs"
+harness = false
+
+[[test]]
+name = "segv_handler"
+path = "tests/subsystem/segv_handler.rs"
+harness = false
+
+[[test]]
+name = "sigfpe_handler"
+path = "tests/subsystem/sigfpe_handler.rs"
+harness = false
+
+[[test]]
 name = "ptrace_attach_run"
 path = "tests/subsystem/ptrace_attach_run.rs"
 harness = false
@@ -521,6 +581,36 @@ harness = false
 [[test]]
 name = "cow_forkrace"
 path = "tests/subsystem/cow_forkrace.rs"
+harness = false
+
+[[test]]
+name = "cow_fork_mmrace"
+path = "tests/subsystem/cow_fork_mmrace.rs"
+harness = false
+
+[[test]]
+name = "fsync"
+path = "tests/subsystem/fsync.rs"
+harness = false
+
+[[test]]
+name = "mknod"
+path = "tests/subsystem/mknod.rs"
+harness = false
+
+[[test]]
+name = "mlock"
+path = "tests/subsystem/mlock.rs"
+harness = false
+
+[[test]]
+name = "msg_dontwait"
+path = "tests/subsystem/msg_dontwait.rs"
+harness = false
+
+[[test]]
+name = "signal_drain"
+path = "tests/subsystem/signal_drain.rs"
 harness = false
 
 [dependencies]

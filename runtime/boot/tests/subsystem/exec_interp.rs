@@ -61,7 +61,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     const MISSING: &[u8] = b"/nonexistent/ld-cyphera.so";
 
     let elf = build_elf(Some(MISSING));
-    let got = kernel::elf::interp_path(&elf);
+    let got = kernel::loader::elf::interp_path(&elf);
     assert_eq!(
         got.as_deref(),
         Some("/nonexistent/ld-cyphera.so"),
@@ -79,7 +79,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         "/dev should resolve"
     );
     assert_eq!(
-        kernel::elf::interp_path(&build_elf(None)),
+        kernel::loader::elf::interp_path(&build_elf(None)),
         None,
         "a static image has no PT_INTERP"
     );

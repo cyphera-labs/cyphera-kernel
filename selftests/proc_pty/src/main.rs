@@ -121,6 +121,24 @@ pub extern "C" fn _start() -> ! {
     }
     print(b"pty: slave open ok\n");
 
+    const TIOCSWINSZ: u64 = 0x5414;
+    const TIOCGWINSZ: u64 = 0x5413;
+    let ws_set: [u8; 8] = [50, 0, 200, 0, 0, 0, 0, 0];
+    if ioctl(m, TIOCSWINSZ, ws_set.as_ptr() as u64) < 0 {
+        print(b"FAIL TIOCSWINSZ\n");
+        exit(6);
+    }
+    let mut ws_get = [0u8; 8];
+    if ioctl(s, TIOCGWINSZ, ws_get.as_mut_ptr() as u64) < 0 {
+        print(b"FAIL TIOCGWINSZ\n");
+        exit(7);
+    }
+    if ws_get != ws_set {
+        print(b"FAIL winsize mismatch\n");
+        exit(8);
+    }
+    print(b"pty: winsize round-trip (master->slave) ok\n");
+
     write(m, b"hi\n");
     let mut buf = [0u8; 16];
     let r = read(s, &mut buf);

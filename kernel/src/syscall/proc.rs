@@ -3,26 +3,26 @@ use alloc::vec::Vec;
 use frame::io::qemu_exit::{ExitCode, exit};
 use frame::user::TrapFrame;
 
+use crate::core as sched;
 use crate::errno::{E2BIG, EBADF, ECHILD, EFAULT, EINVAL, ENAMETOOLONG, ENOEXEC, ENOSYS, EPERM};
-use crate::process::Rlimit;
-use crate::sched;
+use crate::process_model::Rlimit;
 
 use super::{AT_FDCWD, PATH_MAX, resolve_user_path};
 
 pub(super) fn sys_fork(tf: &TrapFrame) -> i64 {
-    match sched::fork_current(tf, false) {
+    match crate::process_model::fork_current(tf, false) {
         Ok(pid) => sched::host_to_caller_local(pid) as i64,
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 
 pub(super) fn sys_vfork(tf: &TrapFrame) -> i64 {
-    match sched::fork_current(tf, true) {
+    match crate::process_model::fork_current(tf, true) {
         Ok(child_host) => {
             sched::park_on_vfork_done(child_host);
             sched::host_to_caller_local(child_host) as i64
         }
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -85,7 +85,10 @@ pub(super) fn sys_uname(buf: u64) -> i64 {
 const RLIMIT_NOFILE: u64 = 7;
 const RLIMIT_STACK: u64 = 3;
 const RLIMIT_AS: u64 = 9;
+const RLIMIT_SIGPENDING: u64 = 11;
 const RLIMIT_INFINITY: u64 = u64::MAX;
+
+const DEFAULT_SIGPENDING: u64 = 4096;
 
 pub fn default_rlimit(resource: u64) -> Rlimit {
     match resource {
@@ -100,6 +103,10 @@ pub fn default_rlimit(resource: u64) -> Rlimit {
         RLIMIT_AS => Rlimit {
             cur: 1 << 47,
             max: RLIMIT_INFINITY,
+        },
+        RLIMIT_SIGPENDING => Rlimit {
+            cur: DEFAULT_SIGPENDING,
+            max: DEFAULT_SIGPENDING,
         },
         _ => Rlimit {
             cur: RLIMIT_INFINITY,
@@ -256,7 +263,7 @@ pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u
             if arg2 > 63 {
                 return EINVAL;
             }
-            if !crate::security::has_cap(crate::process::CAP_SETPCAP) {
+            if !crate::security::has_cap(crate::process_model::CAP_SETPCAP) {
                 return EPERM;
             }
             crate::security::capbset_drop(arg2 as u32);
@@ -330,15 +337,15 @@ const ARCH_GET_GS: u64 = 0x1004;
 pub(super) fn sys_arch_prctl(code: u64, addr: u64) -> i64 {
     match code {
         ARCH_SET_FS => {
-            frame::cpu::set_user_fs_base(addr);
-            sched::set_current_fs_base(addr);
+            frame::cpu::set_user_tls_base(addr);
+            sched::set_current_tls_base(addr);
             0
         }
         ARCH_GET_FS => {
             if addr == 0 {
                 return EFAULT;
             }
-            let v = frame::cpu::get_user_fs_base();
+            let v = frame::cpu::get_user_tls_base();
             if frame::user::copy_to_user(addr, &v.to_le_bytes()).is_err() {
                 return EFAULT;
             }
@@ -369,7 +376,7 @@ pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, _rusage: u64) -
     } else {
         raw
     };
-    match sched::wait4_current(target, options) {
+    match crate::process_model::wait4_current(target, options) {
         Ok(Some((_host, local_in_caller, status))) => {
             if status_ptr != 0 {
                 let bytes = status.to_le_bytes();
@@ -380,7 +387,7 @@ pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, _rusage: u64) -
             local_in_caller as i64
         }
         Ok(None) => 0,
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -413,7 +420,7 @@ pub(super) fn sys_waitid(idtype: u64, id: u64, info_ptr: u64, options: u64) -> i
         _ => return EINVAL,
     };
 
-    match sched::wait4_current(target, options) {
+    match crate::process_model::wait4_current(target, options) {
         Ok(Some((_host, local_in_caller, status))) => {
             if info_ptr != 0 {
                 let raw = status as u32;
@@ -422,8 +429,9 @@ pub(super) fn sys_waitid(idtype: u64, id: u64, info_ptr: u64, options: u64) -> i
                 } else {
                     (2i32, (raw & 0x7f) as i32)
                 };
-                let pinfo = crate::signal::SigInfo::for_child(local_in_caller, si_status, si_code);
-                let bytes = pinfo.expand(crate::process::SIGCHLD).to_bytes();
+                let pinfo =
+                    crate::core::signal::SigInfo::for_child(local_in_caller, si_status, si_code);
+                let bytes = pinfo.expand(crate::process_model::SIGCHLD).to_bytes();
                 if frame::user::copy_to_user(info_ptr, &bytes).is_err() {
                     return EFAULT;
                 }
@@ -431,7 +439,7 @@ pub(super) fn sys_waitid(idtype: u64, id: u64, info_ptr: u64, options: u64) -> i
             0
         }
         Ok(None) => 0,
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -443,7 +451,8 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     use alloc::vec;
 
     let mut path_buf = [0u8; PATH_MAX];
-    let len = frame::user::copy_cstr_from_user(tf.rdi, &mut path_buf).map_err(|_| ENAMETOOLONG)?;
+    let len =
+        frame::user::copy_cstr_from_user(tf.arg(0), &mut path_buf).map_err(|_| ENAMETOOLONG)?;
     let path = core::str::from_utf8(&path_buf[..len]).map_err(|_| EINVAL)?;
 
     let normalized = resolve_user_path(AT_FDCWD, path)?;
@@ -454,8 +463,8 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         return Err(-13);
     }
 
-    let argv: Vec<Vec<u8>> = read_user_string_vec(tf.rsi, EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
-    let envp: Vec<Vec<u8>> = read_user_string_vec(tf.rdx, EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
+    let argv: Vec<Vec<u8>> = read_user_string_vec(tf.arg(1), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
+    let envp: Vec<Vec<u8>> = read_user_string_vec(tf.arg(2), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
 
     let argv = if argv.is_empty() {
         alloc::vec![normalized.as_bytes().to_vec()]
@@ -475,7 +484,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     loop {
         let ctx = crate::vfs::path::Context::current();
         let inode =
-            crate::vfs::path::resolve(&ctx, &ctx.root, &normalized).map_err(|e| e.errno())?;
+            crate::vfs::path::resolve(&ctx, &ctx.root, &normalized).map_err(|e| e.as_neg_i64())?;
         let stat = inode.stat();
         let exec_ok =
             sched::with_current_creds(|c| c.can_access(stat.uid, stat.gid, stat.mode, 0o1));
@@ -494,7 +503,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         while total < size {
             let n = inode
                 .read_at(total as u64, &mut tmp[total..])
-                .map_err(|e| e.errno())?;
+                .map_err(|e| e.as_neg_i64())?;
             if n == 0 {
                 break;
             }
@@ -565,7 +574,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     let t = crate::security::setid::exec_transition(
         exe_mode, exe_uid, exe_gid, ruid, pre_euid, rgid, pre_egid, nosuid,
     );
-    sched::exec_current(
+    crate::process_model::exec_current(
         &buf,
         exe_for_proc,
         &argv_refs,
@@ -575,7 +584,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         t.secure,
         tf,
     )
-    .map_err(|e| e.errno())?;
+    .map_err(|e| e.as_neg_i64())?;
 
     {
         let base = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
@@ -594,11 +603,11 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
 pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
     use alloc::vec;
 
-    let dirfd = tf.rdi as i32;
-    let pathname_ptr = tf.rsi;
-    let argv_ptr = tf.rdx;
-    let envp_ptr = tf.r10;
-    let flags = tf.r8;
+    let dirfd = tf.arg(0) as i32;
+    let pathname_ptr = tf.arg(1);
+    let argv_ptr = tf.arg(2);
+    let envp_ptr = tf.arg(3);
+    let flags = tf.arg(4);
 
     const AT_EMPTY_PATH: u64 = 0x1000;
 
@@ -632,7 +641,7 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
         while total < size {
             let n = inode
                 .read_at(total as u64, &mut buf[total..])
-                .map_err(|e| e.errno())?;
+                .map_err(|e| e.as_neg_i64())?;
             if n == 0 {
                 break;
             }
@@ -649,7 +658,7 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
         let argv_refs: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
         let envp_refs: Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
         let (cur_euid, cur_egid) = sched::with_current_creds(|c| (c.euid, c.egid));
-        sched::exec_current(
+        crate::process_model::exec_current(
             &buf,
             argv_refs[0],
             &argv_refs,
@@ -659,7 +668,7 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
             false,
             tf,
         )
-        .map_err(|e| e.errno())?;
+        .map_err(|e| e.as_neg_i64())?;
         sched::with_current_lifecycle(|l| l.set_did_memfd_exec(true));
         return Ok(());
     }
@@ -712,7 +721,7 @@ const CLONE_NEWTIME: u64 = 0x0000_0080;
 const CLONE_NEWNET: u64 = 0x4000_0000;
 
 pub(super) fn sys_clone(tf: &TrapFrame) -> i64 {
-    do_clone(tf, tf.rdi, tf.rsi, tf.rdx, tf.r10, tf.r8)
+    do_clone(tf, tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3), tf.arg(4))
 }
 
 fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, tls: u64) -> i64 {
@@ -720,7 +729,7 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
     let is_pthread = (flags & pthread_bundle) == pthread_bundle;
 
     let child_pid_result = if is_pthread {
-        sched::clone_thread_current(tf, child_stack)
+        crate::process_model::clone_thread_current(tf, child_stack)
     } else {
         let is_vfork_via_clone = (flags & CLONE_VFORK) != 0
             && (flags & CLONE_VM) != 0
@@ -738,17 +747,17 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
             return ENOSYS;
         }
         if (flags & (CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)) != 0
-            && !crate::security::has_cap(crate::process::CAP_SYS_ADMIN)
+            && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN)
         {
             return EPERM;
         }
         if (flags & CLONE_NEWPID) != 0 {
             let parent_ns = sched::with_current_pid_ns(|p| p.clone());
-            let new_ns = crate::process::PidNamespace::child(parent_ns);
+            let new_ns = crate::process_model::PidNamespace::child(parent_ns);
             sched::set_current_pending_pid_ns(Some(new_ns));
         }
         if (flags & CLONE_NEWIPC) != 0 {
-            sched::set_current_pending_ipc_ns(Some(crate::process::IpcNamespace::fresh()));
+            sched::set_current_pending_ipc_ns(Some(crate::process_model::IpcNamespace::fresh()));
         }
         if (flags & CLONE_NEWNET) != 0 {
             sched::set_current_pending_net_ns(Some(crate::net::new_namespace()));
@@ -756,15 +765,15 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
         if child_stack != 0 {
             let mut tf_for_child = tf.clone();
             tf_for_child.rsp_user = child_stack;
-            sched::fork_current(&tf_for_child, is_vfork_via_clone)
+            crate::process_model::fork_current(&tf_for_child, is_vfork_via_clone)
         } else {
-            sched::fork_current(tf, is_vfork_via_clone)
+            crate::process_model::fork_current(tf, is_vfork_via_clone)
         }
     };
 
     let child_pid = match child_pid_result {
         Ok(p) => p,
-        Err(e) => return e.errno(),
+        Err(e) => return e.as_neg_i64(),
     };
 
     let tid_local = sched::host_to_caller_local(child_pid) as i32;
@@ -779,7 +788,7 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
         let _ = frame::user::copy_to_user(ctid, &tid_bytes);
     }
     if (flags & CLONE_SETTLS) != 0 {
-        sched::set_fs_base(child_pid, tls);
+        sched::set_tls_base(child_pid, tls);
     }
     if (flags & CLONE_VFORK) != 0 {
         sched::park_on_vfork_done(child_pid);
@@ -859,16 +868,16 @@ pub(super) fn sys_getrusage(who: u64, usage_ptr: u64) -> i64 {
     const RUSAGE_SELF: u64 = 0;
     const RUSAGE_THREAD: u64 = 1;
     const RUSAGE_CHILDREN: u64 = (-1i64) as u64;
-    let (utime_ns, stime_ns) = if who == RUSAGE_SELF || who == RUSAGE_THREAD {
+    let (utime_ns, stime_ns, minflt, majflt) = if who == RUSAGE_SELF || who == RUSAGE_THREAD {
         sched::cpu_accounting(sched::current_pid())
-            .map(|a| (a.utime_ns, a.stime_ns))
-            .unwrap_or((0, 0))
+            .map(|a| (a.utime_ns, a.stime_ns, a.minflt, a.majflt))
+            .unwrap_or((0, 0, 0, 0))
     } else if who == RUSAGE_CHILDREN {
         sched::cpu_accounting(sched::current_pid())
-            .map(|a| (a.cutime_ns, a.cstime_ns))
-            .unwrap_or((0, 0))
+            .map(|a| (a.cutime_ns, a.cstime_ns, 0, 0))
+            .unwrap_or((0, 0, 0, 0))
     } else {
-        (0, 0)
+        (0, 0, 0, 0)
     };
     let utime_sec = (utime_ns / 1_000_000_000) as i64;
     let utime_usec = ((utime_ns % 1_000_000_000) / 1_000) as i64;
@@ -879,6 +888,8 @@ pub(super) fn sys_getrusage(who: u64, usage_ptr: u64) -> i64 {
     buf[8..16].copy_from_slice(&utime_usec.to_ne_bytes());
     buf[16..24].copy_from_slice(&stime_sec.to_ne_bytes());
     buf[24..32].copy_from_slice(&stime_usec.to_ne_bytes());
+    buf[64..72].copy_from_slice(&(minflt as i64).to_ne_bytes());
+    buf[72..80].copy_from_slice(&(majflt as i64).to_ne_bytes());
     if frame::user::copy_to_user(usage_ptr, &buf).is_err() {
         return EFAULT;
     }
@@ -974,8 +985,8 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
             let parent = c
                 .user_ns
                 .clone()
-                .unwrap_or_else(crate::process::UserNamespace::host);
-            let new_ns = match crate::process::UserNamespace::new_child(parent, c.euid) {
+                .unwrap_or_else(crate::process_model::UserNamespace::host);
+            let new_ns = match crate::process_model::UserNamespace::new_child(parent, c.euid) {
                 Ok(n) => n,
                 Err(_) => {
                     err = EINVAL;
@@ -983,10 +994,10 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
                 }
             };
             c.user_ns = Some(new_ns);
-            c.caps_eff = crate::process::ALL_CAPS_MASK;
-            c.caps_perm = crate::process::ALL_CAPS_MASK;
-            c.caps_inh = crate::process::ALL_CAPS_MASK;
-            c.caps_bnd = crate::process::ALL_CAPS_MASK;
+            c.caps_eff = crate::process_model::ALL_CAPS_MASK;
+            c.caps_perm = crate::process_model::ALL_CAPS_MASK;
+            c.caps_inh = crate::process_model::ALL_CAPS_MASK;
+            c.caps_bnd = crate::process_model::ALL_CAPS_MASK;
         });
         if err != 0 {
             return err;
@@ -999,7 +1010,7 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
         | CLONE_NEWCGROUP
         | CLONE_NEWTIME
         | CLONE_NEWNET;
-    if flags & PRIV_NS != 0 && !crate::security::has_cap(crate::process::CAP_SYS_ADMIN) {
+    if flags & PRIV_NS != 0 && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN) {
         return EPERM;
     }
     if flags & CLONE_NEWNS != 0 {
@@ -1014,28 +1025,28 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
         sched::set_current_uts(Some(snap));
     }
     if flags & CLONE_NEWIPC != 0 {
-        sched::set_current_ipc(Some(crate::process::IpcNamespace::fresh()));
+        sched::set_current_ipc(Some(crate::process_model::IpcNamespace::fresh()));
     }
     if flags & CLONE_NEWNET != 0 {
         sched::set_current_net(Some(crate::net::new_namespace()));
     }
     if flags & CLONE_NEWPID != 0 {
         let parent = sched::with_current_pid_ns(|p| p.clone());
-        let new_ns = crate::process::PidNamespace::child(parent);
+        let new_ns = crate::process_model::PidNamespace::child(parent);
         sched::set_current_pending_pid_ns(Some(new_ns));
     }
     if flags & CLONE_NEWCGROUP != 0 {
         let root = sched::process_cgroup(sched::current_pid()).unwrap_or_else(crate::cgroup::root);
-        sched::set_current_cgroup_ns(Some(crate::process::CgroupNamespace::new(root)));
+        sched::set_current_cgroup_ns(Some(crate::process_model::CgroupNamespace::new(root)));
     }
     if flags & CLONE_NEWTIME != 0 {
-        sched::set_current_time_ns(Some(crate::process::TimeNamespace::fresh()));
+        sched::set_current_time_ns(Some(crate::process_model::TimeNamespace::fresh()));
     }
     0
 }
 
 pub(super) fn sys_setns(fd: u64, nstype: u64) -> i64 {
-    use crate::fdtypes::NamespaceHandle;
+    use crate::ipc::fdtypes::NamespaceHandle;
     let file = match sched::with_current_fds(|t| t.get(fd as i32)) {
         Some(f) => f,
         None => return EBADF,
@@ -1047,7 +1058,7 @@ pub(super) fn sys_setns(fd: u64, nstype: u64) -> i64 {
     if nstype != 0 && nstype != handle.type_flag() {
         return EINVAL;
     }
-    if !crate::security::has_cap(crate::process::CAP_SYS_ADMIN) {
+    if !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN) {
         return EPERM;
     }
     match handle {

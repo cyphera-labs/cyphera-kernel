@@ -12,6 +12,10 @@ const PRIO_PROCESS: u64 = 0;
 const SIGTERM: u64 = 15;
 const EINTR: i64 = -4;
 const EINVAL: i64 = -22;
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_ANONYMOUS: u64 = 0x20;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -72,6 +76,36 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1);
     }
     log("getrusage returns 0 + filled struct OK\n");
+
+    let minflt1 = i64::from_ne_bytes(buf[64..72].try_into().unwrap());
+    const NFAULT: usize = 16;
+    let m = sys_mmap(
+        0,
+        (NFAULT * 4096) as u64,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1i64 as u64,
+        0,
+    );
+    if m < 0 {
+        log("getrusage: mmap for fault test failed\n");
+        sys_exit(1);
+    }
+    let base = m as u64 as *mut u8;
+    for i in 0..NFAULT {
+        unsafe { core::ptr::write_volatile(base.add(i * 4096), 1u8) };
+    }
+    let mut buf2 = [0u8; 144];
+    if sys_getrusage(0, buf2.as_mut_ptr() as u64) != 0 {
+        log("getrusage second call failed\n");
+        sys_exit(1);
+    }
+    let minflt2 = i64::from_ne_bytes(buf2[64..72].try_into().unwrap());
+    if minflt2 < minflt1 + NFAULT as i64 {
+        log("getrusage ru_minflt did not track minor faults\n");
+        sys_exit(1);
+    }
+    log("getrusage: ru_minflt tracks minor faults OK\n");
 
     let mut tms = [0u8; 32];
     let r = sys_times(tms.as_mut_ptr() as u64);
@@ -198,6 +232,18 @@ fn sys_setpriority(which: u64, who: u64, niceval: u64) -> i64 {
 #[inline(never)]
 fn sys_getrusage(who: u64, buf: u64) -> i64 {
     syscall!(98, who, buf)
+}
+#[inline(never)]
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!(
+            "syscall", in("rax") 9u64, in("rdi") addr, in("rsi") len,
+            in("rdx") prot, in("r10") flags, in("r8") fd, in("r9") off,
+            lateout("rax") r, out("rcx") _, out("r11") _, options(nostack),
+        );
+    }
+    r
 }
 #[inline(never)]
 fn sys_times(buf: u64) -> i64 {

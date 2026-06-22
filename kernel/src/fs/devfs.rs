@@ -3,7 +3,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ::virtio;
 
-use crate::vfs::{FsError, Inode, InodeKind, Stat};
+use cyphera_kapi::{Errno, KResult};
+
+use crate::vfs::{Inode, InodeKind, Stat};
 
 pub fn null() -> Arc<dyn Inode> {
     Arc::new(Null)
@@ -45,6 +47,19 @@ pub fn tty() -> Arc<dyn Inode> {
     Arc::new(Console)
 }
 
+pub fn node_for_dev(major: u32, minor: u32) -> Option<Arc<dyn Inode>> {
+    Some(match (major, minor) {
+        (1, 3) => null(),
+        (1, 5) => zero(),
+        (1, 7) => full(),
+        (1, 8) => random(),
+        (1, 9) => urandom(),
+        (5, 0) => tty(),
+        (5, 1) => console(),
+        _ => return None,
+    })
+}
+
 fn char_stat() -> Stat {
     Stat::fresh(InodeKind::CharDevice, 0, 0o666)
 }
@@ -62,21 +77,21 @@ impl Inode for Vda {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
         crate::io::block_read(offset / 512, buf)
             .map(|()| buf.len())
-            .map_err(|_| FsError::Io)
+            .map_err(|_| Errno::IO)
     }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
         if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
         crate::io::block_write(offset / 512, buf)
             .map(|()| buf.len())
-            .map_err(|_| FsError::Io)
+            .map_err(|_| Errno::IO)
     }
 }
 
@@ -89,10 +104,10 @@ impl Inode for Null {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> KResult<usize> {
         Ok(0)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         Ok(buf.len())
     }
 }
@@ -106,13 +121,13 @@ impl Inode for Zero {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
         for b in buf.iter_mut() {
             *b = 0;
         }
         Ok(buf.len())
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         Ok(buf.len())
     }
 }
@@ -126,11 +141,11 @@ impl Inode for Urandom {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        crate::random::fill(buf);
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        crate::device::random::fill(buf);
         Ok(buf.len())
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         Ok(buf.len())
     }
 }
@@ -144,14 +159,14 @@ impl Inode for Full {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
         for b in buf.iter_mut() {
             *b = 0;
         }
         Ok(buf.len())
     }
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::NoSpace)
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> KResult<usize> {
+        Err(Errno::NOSPC)
     }
 }
 
@@ -164,7 +179,7 @@ impl Inode for Console {
     fn stat(&self) -> Stat {
         char_stat()
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
         Ok(crate::console::read_blocking(buf))
     }
     fn read_at_with_flags(
@@ -172,11 +187,11 @@ impl Inode for Console {
         _offset: u64,
         buf: &mut [u8],
         flags: crate::vfs::OpenFlags,
-    ) -> Result<usize, FsError> {
+    ) -> KResult<usize> {
         let nb = flags.contains(crate::vfs::OpenFlags::NONBLOCK);
         crate::console::read(buf, nb)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         frame::io::uart::write_bytes(buf);
         Ok(buf.len())
     }
@@ -187,7 +202,7 @@ impl Inode for Console {
         }
         m
     }
-    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
         crate::console::for_each_read_wq(f);
     }
 }
@@ -207,15 +222,15 @@ impl Inode for Fb {
         s.size = size;
         s
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         if virtio::framebuffer_info().is_none() {
-            return Err(FsError::NotSupported);
+            return Err(Errno::NOSYS);
         }
         Ok(virtio::fb_read(offset as usize, buf))
     }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
         if virtio::framebuffer_info().is_none() {
-            return Err(FsError::NotSupported);
+            return Err(Errno::NOSYS);
         }
         let n = virtio::fb_write(offset as usize, buf);
         let _ = virtio::gpu_flush();
@@ -271,10 +286,10 @@ impl Inode for Dsp {
     fn inode_id(&self) -> u64 {
         DSP_INODE_BIT | (self as *const Self as u64)
     }
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> KResult<usize> {
         Ok(0)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -286,16 +301,16 @@ impl Inode for Dsp {
             AFMT_U16_LE => ::virtio::sound::PcmFormat::U16,
             AFMT_S8 => ::virtio::sound::PcmFormat::S8,
             AFMT_U8 => ::virtio::sound::PcmFormat::U8,
-            _ => return Err(FsError::InvalidArgument),
+            _ => return Err(Errno::INVAL),
         };
         let (_negotiated_hz, pcm_rate) = nearest_supported_rate(rate_hz);
         let stream_id = match ::virtio::sound_output_streams() {
-            Ok(v) => *v.first().ok_or(FsError::NotSupported)?,
-            Err(_) => return Err(FsError::NotSupported),
+            Ok(v) => *v.first().ok_or(Errno::NOSYS)?,
+            Err(_) => return Err(Errno::NOSYS),
         };
         ::virtio::sound_play_blocking(stream_id, channels, format, pcm_rate, buf)
             .map(|()| buf.len())
-            .map_err(|_| FsError::Io)
+            .map_err(|_| Errno::IO)
     }
 }
 
@@ -310,14 +325,14 @@ impl Inode for InputEvent {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::CharDevice, 0, 0o600)
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
         const EV_SIZE: usize = 24;
         if buf.len() < EV_SIZE {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
-        let drained = crate::input::drain_for(self.idx);
+        let drained = crate::device::input::drain_for(self.idx);
         if drained.is_empty() {
-            return Ok(crate::input::read_blocking(self.idx, buf));
+            return crate::device::input::read_blocking(self.idx, buf);
         }
         let max = buf.len() / EV_SIZE;
         let n = drained.len().min(max);
@@ -334,19 +349,19 @@ impl Inode for InputEvent {
         }
         Ok(n * EV_SIZE)
     }
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> KResult<usize> {
+        Err(Errno::NOSYS)
     }
 
     fn poll(&self) -> crate::vfs::PollMask {
-        if crate::input::has_pending(self.idx) {
+        if crate::device::input::has_pending(self.idx) {
             crate::vfs::PollMask::IN
         } else {
             crate::vfs::PollMask::empty()
         }
     }
 
-    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
-        crate::input::for_each_evdev_wq(self.idx, f);
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
+        crate::device::input::for_each_evdev_wq(self.idx, f);
     }
 }

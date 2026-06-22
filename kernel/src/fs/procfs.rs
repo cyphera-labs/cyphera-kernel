@@ -3,17 +3,10 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::process::Pid;
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, Stat};
+use cyphera_kapi::{Errno, KResult};
 
-const CPUINFO: &str = "processor\t: 0\n\
-                       vendor_id\t: CypheraVM\n\
-                       cpu family\t: 6\n\
-                       model name\t: Cyphera virtual cpu\n\
-                       cpu MHz\t\t: 2000.000\n\
-                       cache size\t: 0 KB\n\
-                       flags\t\t: fpu pae nx lm rdtscp\n\
-                       \n";
+use crate::process_model::Pid;
+use crate::vfs::{DirEntry, Inode, InodeKind, Stat};
 
 pub fn root() -> Arc<dyn Inode> {
     Arc::new(ProcRoot)
@@ -29,9 +22,9 @@ impl Inode for ProcRoot {
         dir_stat()
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
-            "cpuinfo" => Ok(Arc::new(StaticFile::new(CPUINFO))),
+            "cpuinfo" => Ok(Arc::new(CpuInfoFile)),
             "meminfo" => Ok(Arc::new(MemInfoFile)),
             "uptime" => Ok(Arc::new(UptimeFile)),
             "self" => Ok(Arc::new(SelfDir)),
@@ -47,17 +40,17 @@ impl Inode for ProcRoot {
             _ => match name
                 .parse::<u32>()
                 .ok()
-                .and_then(crate::sched::caller_local_to_host)
+                .and_then(crate::core::caller_local_to_host)
             {
-                Some(host) if crate::sched::process_summary(host).is_some() => {
+                Some(host) if crate::core::process_summary(host).is_some() => {
                     Ok(Arc::new(PidDir { pid: host }))
                 }
-                _ => Err(FsError::NotFound),
+                _ => Err(Errno::NOENT),
             },
         }
     }
 
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         let mut out = Vec::new();
         for (name, kind) in [
             ("cpuinfo", InodeKind::Regular),
@@ -80,7 +73,7 @@ impl Inode for ProcRoot {
                 inode_id: hash_str(name),
             });
         }
-        for (host, local) in crate::sched::caller_visible_pids() {
+        for (host, local) in crate::core::caller_visible_pids() {
             out.push(DirEntry {
                 name: format!("{}", local),
                 kind: InodeKind::Directory,
@@ -102,7 +95,7 @@ impl Inode for PidDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "stat" => Ok(Arc::new(PidStatFile { pid: self.pid })),
             "cmdline" => Ok(Arc::new(PidCmdlineFile { pid: self.pid })),
@@ -120,17 +113,17 @@ impl Inode for PidDir {
                 pid: self.pid,
             })),
             "setgroups" => Ok(Arc::new(SetgroupsFile { pid: self.pid })),
-            "loginuid" => Ok(Arc::new(LoginuidFile {})),
+            "loginuid" => Ok(Arc::new(LoginuidFile { pid: self.pid })),
             "exe" => {
-                let target = crate::sched::process_exe(self.pid).ok_or(FsError::NotFound)?;
-                let s = alloc::string::String::from_utf8(target).map_err(|_| FsError::NotFound)?;
+                let target = crate::core::process_exe(self.pid).ok_or(Errno::NOENT)?;
+                let s = alloc::string::String::from_utf8(target).map_err(|_| Errno::NOENT)?;
                 Ok(crate::fs::tmpfs::TmpfsInode::new_symlink(s))
             }
             "ns" => Ok(Arc::new(PidNsDir { pid: self.pid })),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         let pid = self.pid.0 as u64;
         let mut entries = alloc::vec![
             DirEntry {
@@ -169,7 +162,7 @@ impl Inode for PidDir {
                 inode_id: 0xa800_0000_0000_0000 | pid,
             },
         ];
-        if crate::sched::process_exe(self.pid).is_some() {
+        if crate::core::process_exe(self.pid).is_some() {
             entries.push(DirEntry {
                 name: "exe".to_string(),
                 kind: InodeKind::Symlink,
@@ -205,16 +198,16 @@ impl Inode for PidNsDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         let ty = NS_ENTRIES
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, t)| *t)
-            .ok_or(FsError::NotFound)?;
-        let handle = crate::sched::ns_handle_for(self.pid, ty).ok_or(FsError::NotFound)?;
-        Ok(crate::fdtypes::NamespaceFdInode::new(handle))
+            .ok_or(Errno::NOENT)?;
+        let handle = crate::core::ns_handle_for(self.pid, ty).ok_or(Errno::NOENT)?;
+        Ok(crate::ipc::fdtypes::NamespaceFdInode::new(handle))
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(NS_ENTRIES
             .iter()
             .map(|(n, _)| DirEntry {
@@ -235,14 +228,14 @@ impl Inode for NetDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "dev" => Ok(Arc::new(NetDevFile)),
             "route" => Ok(Arc::new(NetRouteFile)),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(alloc::vec![
             DirEntry {
                 name: "dev".to_string(),
@@ -267,7 +260,7 @@ impl Inode for NetDevFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let mut body = alloc::string::String::new();
         body.push_str(
             "Inter-|   Receive                                                |  Transmit\n",
@@ -290,7 +283,7 @@ impl Inode for NetRouteFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let mut body = alloc::string::String::new();
         body.push_str(
             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
@@ -312,12 +305,12 @@ impl Inode for SelfDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let pid = crate::sched::current_pid();
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
+        let pid = crate::core::current_pid();
         PidDir { pid }.lookup(name)
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
-        let pid = crate::sched::current_pid();
+    fn list(&self) -> KResult<Vec<DirEntry>> {
+        let pid = crate::core::current_pid();
         PidDir { pid }.list()
     }
 }
@@ -339,7 +332,7 @@ impl Inode for StaticFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, self.body.len() as u64, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         slice_into(self.body.as_bytes(), offset, buf)
     }
 }
@@ -353,7 +346,7 @@ impl Inode for MemInfoFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let s = frame::mm::frame_alloc::stats();
         let total_kb = (s.total * 4) as u64;
         let used_kb = (s.in_use * 4) as u64;
@@ -379,11 +372,11 @@ impl Inode for UptimeFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let nanos = frame::cpu::nanos_since_boot();
         let up_int = nanos / 1_000_000_000;
         let up_frac = (nanos % 1_000_000_000) / 10_000_000;
-        let (_user, _nice, _system, idle_jiffies) = crate::sched::jiffies_summary();
+        let (_user, _nice, _system, idle_jiffies) = crate::core::jiffies_summary();
         let idle_int = idle_jiffies / 100;
         let idle_frac = idle_jiffies % 100;
         let body = format!("{up_int}.{up_frac:02} {idle_int}.{idle_frac:02}\n");
@@ -402,8 +395,8 @@ impl Inode for PidCmdlineFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let body = crate::sched::process_cmdline(self.pid).unwrap_or_default();
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let body = crate::core::process_cmdline(self.pid).unwrap_or_default();
         slice_into(&body, offset, buf)
     }
 }
@@ -419,16 +412,16 @@ impl Inode for PidMapsFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         use frame::mm::vm::Perms;
-        let snap = match crate::sched::process_maps(self.pid) {
+        let snap = match crate::core::process_maps(self.pid) {
             Some(s) => s,
-            None => return Err(FsError::NotFound),
+            None => return Err(Errno::NOENT),
         };
         let mut lines: alloc::vec::Vec<(u64, u64, Perms, bool, &str)> = alloc::vec::Vec::new();
         for (start, end, prot, label) in &snap.segments {
             let name = match label {
-                crate::process::MapSegLabel::Stack => "[stack]",
+                crate::process_model::MapSegLabel::Stack => "[stack]",
                 _ => "",
             };
             lines.push((*start, *end, *prot, false, name));
@@ -444,8 +437,8 @@ impl Inode for PidMapsFile {
         }
         for (start, end, prot, shared, label) in &snap.vmas {
             let name = match label {
-                crate::sched::MapVmaLabel::Heap => "[heap]",
-                crate::sched::MapVmaLabel::Stack => "[stack]",
+                crate::core::MapVmaLabel::Heap => "[heap]",
+                crate::core::MapVmaLabel::Stack => "[stack]",
                 _ => "",
             };
             lines.push((*start, *end, *prot, *shared, name));
@@ -492,14 +485,14 @@ impl Inode for PidFdDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let fd: i32 = name.parse().map_err(|_| FsError::NotFound)?;
-        let inode_opt = if self.pid == crate::sched::current_pid() {
-            crate::sched::with_current_fds(|t| t.get(fd)).map(|f| f.inode.clone())
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
+        let fd: i32 = name.parse().map_err(|_| Errno::NOENT)?;
+        let inode_opt = if self.pid == crate::core::current_pid() {
+            crate::core::with_current_fds(|t| t.get(fd)).map(|f| f.inode.clone())
         } else {
-            let fds = crate::sched::process_open_fds(self.pid).ok_or(FsError::NotFound)?;
+            let fds = crate::core::process_open_fds(self.pid).ok_or(Errno::NOENT)?;
             if !fds.contains(&fd) {
-                return Err(FsError::NotFound);
+                return Err(Errno::NOENT);
             }
             None
         };
@@ -512,8 +505,8 @@ impl Inode for PidFdDir {
             underlying: inode_opt,
         }))
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
-        let fds = crate::sched::process_open_fds(self.pid).ok_or(FsError::NotFound)?;
+    fn list(&self) -> KResult<Vec<DirEntry>> {
+        let fds = crate::core::process_open_fds(self.pid).ok_or(Errno::NOENT)?;
         Ok(fds
             .into_iter()
             .map(|fd| DirEntry {
@@ -534,14 +527,14 @@ impl Inode for SysDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "kernel" => Ok(Arc::new(SysKernelDir)),
             "fs" => Ok(Arc::new(SysFsDir)),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(alloc::vec![
             DirEntry {
                 name: "kernel".to_string(),
@@ -566,7 +559,7 @@ impl Inode for SysKernelDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "cap_last_cap" => Ok(Arc::new(StaticFile::new("40\n"))),
             "ostype" => Ok(Arc::new(StaticFile::new("Linux\n"))),
@@ -581,10 +574,10 @@ impl Inode for SysKernelDir {
             "random" => Ok(Arc::new(SysKernelRandomDir)),
             "sched_rt_period_us" => Ok(Arc::new(SchedRtPeriodFile)),
             "sched_rt_runtime_us" => Ok(Arc::new(SchedRtRuntimeFile)),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(alloc::vec![
             entry("cap_last_cap", InodeKind::Regular, 0xc101_0001),
             entry("ostype", InodeKind::Regular, 0xc101_0002),
@@ -608,17 +601,17 @@ impl Inode for SchedRtPeriodFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o644)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let (period_ns, _runtime_ns) = crate::sched::rt_bandwidth_cfg();
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let (period_ns, _runtime_ns) = crate::core::rt_bandwidth_cfg();
         let body = format!("{}\n", period_ns / 1_000);
         slice_into(body.as_bytes(), offset, buf)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidArgument)?;
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        let s = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
         let trimmed = s.trim();
-        let us: u64 = trimmed.parse().map_err(|_| FsError::InvalidArgument)?;
-        if !crate::sched::set_rt_period_ns(us.saturating_mul(1_000)) {
-            return Err(FsError::InvalidArgument);
+        let us: u64 = trimmed.parse().map_err(|_| Errno::INVAL)?;
+        if !crate::core::set_rt_period_ns(us.saturating_mul(1_000)) {
+            return Err(Errno::INVAL);
         }
         Ok(buf.len())
     }
@@ -633,8 +626,8 @@ impl Inode for SchedRtRuntimeFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o644)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let (_period_ns, runtime_ns) = crate::sched::rt_bandwidth_cfg();
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let (_period_ns, runtime_ns) = crate::core::rt_bandwidth_cfg();
         let body = if runtime_ns == u64::MAX {
             "-1\n".to_string()
         } else {
@@ -642,17 +635,17 @@ impl Inode for SchedRtRuntimeFile {
         };
         slice_into(body.as_bytes(), offset, buf)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidArgument)?;
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        let s = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
         let trimmed = s.trim();
         if trimmed == "-1" {
-            crate::sched::set_rt_runtime_ns(u64::MAX);
+            crate::core::set_rt_runtime_ns(u64::MAX);
         } else {
-            let us: i64 = trimmed.parse().map_err(|_| FsError::InvalidArgument)?;
+            let us: i64 = trimmed.parse().map_err(|_| Errno::INVAL)?;
             if us < 0 {
-                crate::sched::set_rt_runtime_ns(u64::MAX);
+                crate::core::set_rt_runtime_ns(u64::MAX);
             } else {
-                crate::sched::set_rt_runtime_ns((us as u64).saturating_mul(1_000));
+                crate::core::set_rt_runtime_ns((us as u64).saturating_mul(1_000));
             }
         }
         Ok(buf.len())
@@ -668,15 +661,15 @@ impl Inode for SysKernelRandomDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "boot_id" => Ok(Arc::new(UuidFile::boot_id())),
             "uuid" => Ok(Arc::new(UuidFile::new())),
             "entropy_avail" => Ok(Arc::new(StaticFile::new("4096\n"))),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(alloc::vec![
             entry("boot_id", InodeKind::Regular, 0xc102_0001),
             entry("uuid", InodeKind::Regular, 0xc102_0002),
@@ -712,7 +705,7 @@ impl UuidFile {
 fn random_uuid_string() -> alloc::string::String {
     use core::fmt::Write;
     let mut raw = [0u8; 16];
-    crate::random::fill(&mut raw);
+    crate::device::random::fill(&mut raw);
     raw[6] = (raw[6] & 0x0f) | 0x40;
     raw[8] = (raw[8] & 0x3f) | 0x80;
     let mut body = alloc::string::String::with_capacity(37);
@@ -733,7 +726,7 @@ impl Inode for UuidFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, self.body.len() as u64, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         slice_into(self.body.as_bytes(), offset, buf)
     }
 }
@@ -747,14 +740,14 @@ impl Inode for SysFsDir {
     fn stat(&self) -> Stat {
         dir_stat()
     }
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         match name {
             "nr_open" => Ok(Arc::new(StaticFile::new("1048576\n"))),
             "file-max" => Ok(Arc::new(StaticFile::new("65536\n"))),
-            _ => Err(FsError::NotFound),
+            _ => Err(Errno::NOENT),
         }
     }
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         Ok(alloc::vec![
             entry("nr_open", InodeKind::Regular, 0xc201_0001),
             entry("file-max", InodeKind::Regular, 0xc201_0002),
@@ -782,8 +775,8 @@ struct IdMapFile {
 }
 
 impl IdMapFile {
-    fn target_ns(&self) -> Option<Arc<crate::process::UserNamespace>> {
-        crate::sched::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
+    fn target_ns(&self) -> Option<Arc<crate::process_model::UserNamespace>> {
+        crate::core::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
     }
 }
 
@@ -796,7 +789,7 @@ impl Inode for IdMapFile {
         st.uid = self.target_ns().map(|ns| ns.creator_uid).unwrap_or(0);
         st
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let mut body = alloc::string::String::new();
         if let Some(ns) = self.target_ns() {
             let map = match self.kind {
@@ -812,12 +805,12 @@ impl Inode for IdMapFile {
         }
         slice_into(body.as_bytes(), offset, buf)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        use crate::process::{CAP_SETGID, CAP_SETUID, IdMapping};
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        use crate::process_model::{CAP_SETGID, CAP_SETUID, IdMapping};
 
         let ns = match self.target_ns() {
             Some(ns) if ns.level > 0 => ns,
-            _ => return Err(FsError::PermissionDenied),
+            _ => return Err(Errno::ACCES),
         };
         let is_uid = matches!(self.kind, IdMapKind::Uid);
 
@@ -828,11 +821,11 @@ impl Inode for IdMapFile {
                 ns.gid_map.lock()
             };
             if !existing.is_empty() {
-                return Err(FsError::PermissionDenied);
+                return Err(Errno::ACCES);
             }
         }
 
-        let text = core::str::from_utf8(buf).map_err(|_| FsError::InvalidArgument)?;
+        let text = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
         let mut parsed: Vec<IdMapping> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -845,36 +838,36 @@ impl Inode for IdMapFile {
             let length = it.next().and_then(|s| s.parse::<u32>().ok());
             match (inside, outside, length) {
                 (Some(i), Some(o), Some(l)) if l > 0 && it.next().is_none() => {
-                    i.checked_add(l).ok_or(FsError::InvalidArgument)?;
-                    o.checked_add(l).ok_or(FsError::InvalidArgument)?;
+                    i.checked_add(l).ok_or(Errno::INVAL)?;
+                    o.checked_add(l).ok_or(Errno::INVAL)?;
                     parsed.push(IdMapping {
                         inside_start: i,
                         outside_start: o,
                         length: l,
                     });
                 }
-                _ => return Err(FsError::InvalidArgument),
+                _ => return Err(Errno::INVAL),
             }
         }
         if parsed.is_empty() {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
 
         let cap = if is_uid { CAP_SETUID } else { CAP_SETGID };
-        let (writer_id, privileged) = crate::sched::with_current_creds(|c| {
+        let (writer_id, privileged) = crate::core::with_current_creds(|c| {
             let id = if is_uid { c.euid } else { c.egid };
             (id, c.capable_host(cap))
         });
         if !privileged {
             if parsed.len() != 1 || parsed[0].length != 1 || parsed[0].outside_start != writer_id {
-                return Err(FsError::PermissionDenied);
+                return Err(Errno::ACCES);
             }
             if !is_uid
                 && ns
                     .setgroups_allowed
                     .load(core::sync::atomic::Ordering::Acquire)
             {
-                return Err(FsError::PermissionDenied);
+                return Err(Errno::ACCES);
             }
         }
 
@@ -892,8 +885,8 @@ struct SetgroupsFile {
 }
 
 impl SetgroupsFile {
-    fn target_ns(&self) -> Option<Arc<crate::process::UserNamespace>> {
-        crate::sched::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
+    fn target_ns(&self) -> Option<Arc<crate::process_model::UserNamespace>> {
+        crate::core::with_target_creds(self.pid, |c| c.user_ns.clone()).flatten()
     }
 }
 
@@ -906,7 +899,7 @@ impl Inode for SetgroupsFile {
         st.uid = self.target_ns().map(|ns| ns.creator_uid).unwrap_or(0);
         st
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let allowed = match self.target_ns() {
             Some(ns) => ns
                 .setgroups_allowed
@@ -915,21 +908,19 @@ impl Inode for SetgroupsFile {
         };
         slice_into(if allowed { b"allow\n" } else { b"deny\n" }, offset, buf)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
         let ns = match self.target_ns() {
             Some(ns) if ns.level > 0 => ns,
-            _ => return Err(FsError::PermissionDenied),
+            _ => return Err(Errno::ACCES),
         };
         if !ns.gid_map.lock().is_empty() {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
-        let word = core::str::from_utf8(buf)
-            .map_err(|_| FsError::InvalidArgument)?
-            .trim();
+        let word = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?.trim();
         let allow = match word {
             "allow" => true,
             "deny" => false,
-            _ => return Err(FsError::InvalidArgument),
+            _ => return Err(Errno::INVAL),
         };
         ns.setgroups_allowed
             .store(allow, core::sync::atomic::Ordering::Release);
@@ -937,7 +928,9 @@ impl Inode for SetgroupsFile {
     }
 }
 
-struct LoginuidFile {}
+struct LoginuidFile {
+    pid: Pid,
+}
 
 impl Inode for LoginuidFile {
     fn kind(&self) -> InodeKind {
@@ -946,11 +939,25 @@ impl Inode for LoginuidFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o644)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        slice_into(b"4294967295\n", offset, buf)
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let v = crate::core::with_target_creds(self.pid, |c| c.loginuid).unwrap_or(u32::MAX);
+        let s = alloc::format!("{}\n", v);
+        slice_into(s.as_bytes(), offset, buf)
     }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        Ok(buf.len())
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        if self.pid != crate::core::current_pid() {
+            return Err(Errno::ACCES);
+        }
+        let s = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
+        let val: u32 = s.trim().parse().map_err(|_| Errno::INVAL)?;
+        let ok = crate::core::with_current_creds_mut(|c| {
+            if !c.has_cap(crate::process_model::CAP_AUDIT_CONTROL) {
+                return false;
+            }
+            c.loginuid = val;
+            true
+        });
+        if ok { Ok(buf.len()) } else { Err(Errno::ACCES) }
     }
 }
 
@@ -965,12 +972,12 @@ impl Inode for PidStatFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let s = match crate::sched::process_summary(self.pid) {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let s = match crate::core::process_summary(self.pid) {
             Some(s) => s,
-            None => return Err(FsError::NotFound),
+            None => return Err(Errno::NOENT),
         };
-        let comm = crate::sched::process_name(self.pid);
+        let comm = crate::core::process_name(self.pid);
         let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(16);
         let comm_str = core::str::from_utf8(&comm[..comm_end]).unwrap_or("cyphera");
         let comm_str = if comm_str.is_empty() {
@@ -980,12 +987,12 @@ impl Inode for PidStatFile {
         };
         let body = format!(
             "{} ({}) {} {} {} {} 0 0 0 {} 0 {} 0 {} {} {} {} {} {} {} 0 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 17 {} {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
-            crate::sched::host_to_caller_local(s.pid),
+            crate::core::host_to_caller_local(s.pid),
             comm_str,
             s.state_char,
-            crate::sched::host_to_caller_local(Pid(s.parent_pid)),
-            crate::sched::host_to_caller_local(Pid(s.pgrp)),
-            crate::sched::host_to_caller_local(Pid(s.session)),
+            crate::core::host_to_caller_local(Pid(s.parent_pid)),
+            crate::core::host_to_caller_local(Pid(s.pgrp)),
+            crate::core::host_to_caller_local(Pid(s.session)),
             s.minflt,
             s.majflt,
             s.utime_clk,
@@ -1018,7 +1025,7 @@ impl Inode for MagicFdLink {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Symlink, self.target.len() as u64, 0o777)
     }
-    fn read_link(&self) -> Result<alloc::string::String, FsError> {
+    fn read_link(&self) -> KResult<alloc::string::String> {
         Ok(self.target.clone())
     }
     fn magic_resolve(&self) -> Option<Arc<dyn Inode>> {
@@ -1041,7 +1048,7 @@ fn dir_stat() -> Stat {
     Stat::fresh(InodeKind::Directory, 0, 0o555)
 }
 
-fn slice_into(src: &[u8], offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+fn slice_into(src: &[u8], offset: u64, buf: &mut [u8]) -> KResult<usize> {
     if offset >= src.len() as u64 {
         return Ok(0);
     }
@@ -1060,6 +1067,43 @@ fn hash_str(s: &str) -> u64 {
     h
 }
 
+struct CpuInfoFile;
+
+impl Inode for CpuInfoFile {
+    fn kind(&self) -> InodeKind {
+        InodeKind::Regular
+    }
+    fn stat(&self) -> Stat {
+        Stat::fresh(InodeKind::Regular, 0, 0o444)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        use core::fmt::Write;
+        let mask = frame::cpu::online_mask();
+        let count = mask.count_ones();
+        let mut body = alloc::string::String::new();
+        for cpu in 0..frame::cpu::per_cpu::MAX_CPUS as u32 {
+            if mask & (1u64 << cpu) == 0 {
+                continue;
+            }
+            let _ = writeln!(body, "processor\t: {cpu}");
+            let _ = writeln!(body, "vendor_id\t: CypheraVM");
+            let _ = writeln!(body, "cpu family\t: 6");
+            let _ = writeln!(body, "model\t\t: 1");
+            let _ = writeln!(body, "model name\t: Cyphera virtual cpu");
+            let _ = writeln!(body, "cpu MHz\t\t: 2000.000");
+            let _ = writeln!(body, "cache size\t: 0 KB");
+            let _ = writeln!(body, "physical id\t: 0");
+            let _ = writeln!(body, "siblings\t: {count}");
+            let _ = writeln!(body, "core id\t\t: {cpu}");
+            let _ = writeln!(body, "cpu cores\t: {count}");
+            let _ = writeln!(body, "apicid\t\t: {cpu}");
+            let _ = writeln!(body, "flags\t\t: fpu pae nx lm rdtscp");
+            let _ = writeln!(body);
+        }
+        slice_into(body.as_bytes(), offset, buf)
+    }
+}
+
 struct StatFile;
 
 impl Inode for StatFile {
@@ -1069,31 +1113,31 @@ impl Inode for StatFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         use core::fmt::Write;
-        let (user_total, nice_total, system_total, idle_total) = crate::sched::jiffies_summary();
+        let (user_total, nice_total, system_total, idle_total) = crate::core::jiffies_summary();
         let mut body = alloc::string::String::new();
         let _ = writeln!(
             body,
             "cpu  {user_total} {nice_total} {system_total} {idle_total} 0 0 0 0 0 0"
         );
         for cpu in 0..frame::cpu::per_cpu::MAX_CPUS {
-            if let Some((u, n, s, i)) = crate::sched::jiffies_for_cpu(cpu) {
+            if let Some((u, n, s, i)) = crate::core::jiffies_for_cpu(cpu) {
                 if u == 0 && n == 0 && s == 0 && i == 0 {
                     continue;
                 }
                 let _ = writeln!(body, "cpu{cpu} {u} {n} {s} {i} 0 0 0 0 0 0");
             }
         }
-        let _ = writeln!(body, "intr {}", crate::sched::intr_count());
-        let _ = writeln!(body, "ctxt {}", crate::sched::ctxt_switches());
+        let _ = writeln!(body, "intr {}", crate::core::intr_count());
+        let _ = writeln!(body, "ctxt {}", crate::core::ctxt_switches());
         let btime = frame::cpu::clock::wall_clock_nanos()
             .saturating_sub(frame::cpu::clock::nanos_since_boot())
             / 1_000_000_000;
         let _ = writeln!(body, "btime {btime}");
-        let total = crate::sched::all_pids().len() as u64;
+        let total = crate::core::all_pids().len() as u64;
         let _ = writeln!(body, "processes {total}");
-        let (running, blocked) = crate::sched::procs_running_blocked();
+        let (running, blocked) = crate::core::procs_running_blocked();
         let _ = writeln!(body, "procs_running {running}");
         let _ = writeln!(body, "procs_blocked {blocked}");
         slice_into(body.as_bytes(), offset, buf)
@@ -1109,9 +1153,9 @@ impl Inode for MountsFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         use core::fmt::Write;
-        let table = crate::sched::with_current_mount_table(|m| m.clone())
+        let table = crate::core::with_current_mount_table(|m| m.clone())
             .flatten()
             .unwrap_or_else(crate::vfs::global_mount_table);
         let mut entries = table.collect_subtree("/");
@@ -1144,12 +1188,12 @@ impl Inode for PidStatusFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let s = match crate::sched::process_summary(self.pid) {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let s = match crate::core::process_summary(self.pid) {
             Some(s) => s,
-            None => return Err(FsError::NotFound),
+            None => return Err(Errno::NOENT),
         };
-        let name = crate::sched::process_name(self.pid);
+        let name = crate::core::process_name(self.pid);
         let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         let name_str = core::str::from_utf8(&name[..n]).unwrap_or("?");
         let state_str = match s.state_char {
@@ -1159,16 +1203,16 @@ impl Inode for PidStatusFile {
             'T' => "T (stopped)",
             _ => "? (unknown)",
         };
-        let creds = crate::sched::with_target_creds(self.pid, |c| c.clone())
-            .unwrap_or_else(crate::process::Credentials::root);
-        let no_new_privs = crate::sched::process_no_new_privs(self.pid);
-        let seccomp_mode = if crate::sched::process_seccomp_active(self.pid) {
+        let creds = crate::core::with_target_creds(self.pid, |c| c.clone())
+            .unwrap_or_else(crate::process_model::Credentials::root);
+        let no_new_privs = crate::core::process_no_new_privs(self.pid);
+        let seccomp_mode = if crate::core::process_seccomp_active(self.pid) {
             2
         } else {
             0
         };
         let (vis_ruid, vis_euid, vis_suid, vis_fsuid, vis_rgid, vis_egid, vis_sgid, vis_fsgid) =
-            crate::sched::with_current_creds(|r| {
+            crate::core::with_current_creds(|r| {
                 (
                     r.uid_from_kernel(creds.ruid),
                     r.uid_from_kernel(creds.euid),
@@ -1180,6 +1224,7 @@ impl Inode for PidStatusFile {
                     r.gid_from_kernel(creds.fsgid),
                 )
             });
+        let fd_size = crate::core::process_fd_size(self.pid).unwrap_or(crate::vfs::fd::MAX_FDS);
         let body = format!(
             "Name:\t{name_str}\n\
              Umask:\t{:04o}\n\
@@ -1191,7 +1236,7 @@ impl Inode for PidStatusFile {
              TracerPid:\t0\n\
              Uid:\t{}\t{}\t{}\t{}\n\
              Gid:\t{}\t{}\t{}\t{}\n\
-             FDSize:\t1024\n\
+             FDSize:\t{}\n\
              Groups:\t\n\
              VmRSS:\t{} kB\n\
              Threads:\t1\n\
@@ -1208,10 +1253,10 @@ impl Inode for PidStatusFile {
              Cpus_allowed_list:\t0-7\n\
              voluntary_ctxt_switches:\t0\n\
              nonvoluntary_ctxt_switches:\t0\n",
-            crate::sched::process_umask(self.pid),
-            crate::sched::host_to_caller_local(s.pid),
-            crate::sched::host_to_caller_local(s.pid),
-            crate::sched::host_to_caller_local(Pid(s.parent_pid)),
+            crate::core::process_umask(self.pid),
+            crate::core::host_to_caller_local(s.pid),
+            crate::core::host_to_caller_local(s.pid),
+            crate::core::host_to_caller_local(Pid(s.parent_pid)),
             vis_ruid,
             vis_euid,
             vis_suid,
@@ -1220,6 +1265,7 @@ impl Inode for PidStatusFile {
             vis_egid,
             vis_sgid,
             vis_fsgid,
+            fd_size,
             s.brk_bytes / 1024,
             creds.caps_inh,
             creds.caps_perm,
@@ -1243,9 +1289,9 @@ impl Inode for PidCgroupFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let target = crate::sched::process_cgroup(self.pid).ok_or(FsError::NotFound)?;
-        let root = crate::sched::current_cgroup_ns_root();
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let target = crate::core::process_cgroup(self.pid).ok_or(Errno::NOENT)?;
+        let root = crate::core::current_cgroup_ns_root();
         let target_path = target.path();
         let root_path = root.path();
         let rel = if root_path == "/" {
@@ -1274,8 +1320,8 @@ impl Inode for PidCommFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o644)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let name = crate::sched::process_name(self.pid);
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let name = crate::core::process_name(self.pid);
         let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         let mut body = alloc::string::String::from(core::str::from_utf8(&name[..n]).unwrap_or(""));
         body.push('\n');
@@ -1297,12 +1343,12 @@ impl Inode for LoadavgFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         use core::fmt::Write;
-        let (l1, l5, l15) = crate::sched::loadavg_fp();
-        let (running, _blocked) = crate::sched::procs_running_blocked();
-        let total = crate::sched::all_pids().len() as u64;
-        let last_pid = crate::sched::last_pid();
+        let (l1, l5, l15) = crate::core::loadavg_fp();
+        let (running, _blocked) = crate::core::procs_running_blocked();
+        let total = crate::core::all_pids().len() as u64;
+        let last_pid = crate::core::last_pid();
         let mut body = alloc::string::String::new();
         let _ = writeln!(
             body,
@@ -1329,11 +1375,11 @@ impl Inode for SchedStatFile {
     fn stat(&self) -> Stat {
         Stat::fresh(InodeKind::Regular, 0, 0o444)
     }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         use core::fmt::Write;
-        let load_ticks = crate::sched::loadavg_tick_count();
+        let load_ticks = crate::core::loadavg_tick_count();
         let jiffies = frame::intr::lapic::ticks();
-        let resched_ticks = crate::sched::resched_tick_count();
+        let resched_ticks = crate::core::resched_tick_count();
         let mut body = alloc::string::String::new();
         let _ = writeln!(body, "version 15");
         let _ = writeln!(body, "loadavg_ticks {load_ticks}");

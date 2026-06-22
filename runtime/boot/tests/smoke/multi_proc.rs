@@ -44,7 +44,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     kernel::init();
 
     let mut a_vm = VmSpace::new_user().expect("alloc proc_a vmspace");
-    let a = kernel::elf::load_static(PROC_A_ELF, &mut a_vm).expect("load proc_a");
+    let a = kernel::loader::elf::load_static(PROC_A_ELF, &mut a_vm).expect("load proc_a");
     let _ = a_vm
         .map_anon(
             VirtAddr::new(PROC_A_STACK_VADDR),
@@ -52,7 +52,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
             Perms::READ | Perms::WRITE | Perms::USER,
         )
         .expect("map proc_a stack");
-    let pid_a = kernel::sched::register_with_vmspace(
+    let pid_a = kernel::process_model::register_with_vmspace(
         Some(a_vm),
         a.entry,
         PROC_A_STACK_VADDR + (STACK_PAGES * 4096) as u64,
@@ -60,7 +60,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     );
 
     let mut b_vm = VmSpace::new_user().expect("alloc proc_b vmspace");
-    let b = kernel::elf::load_static(PROC_B_ELF, &mut b_vm).expect("load proc_b");
+    let b = kernel::loader::elf::load_static(PROC_B_ELF, &mut b_vm).expect("load proc_b");
     let _ = b_vm
         .map_anon(
             VirtAddr::new(PROC_B_STACK_VADDR),
@@ -68,7 +68,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
             Perms::READ | Perms::WRITE | Perms::USER,
         )
         .expect("map proc_b stack");
-    let pid_b = kernel::sched::register_with_vmspace(
+    let pid_b = kernel::process_model::register_with_vmspace(
         Some(b_vm),
         b.entry,
         PROC_B_STACK_VADDR + (STACK_PAGES * 4096) as u64,
@@ -84,5 +84,5 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     );
     println!("------ user output ------");
 
-    kernel::sched::start_first()
+    kernel::core::start_first()
 }

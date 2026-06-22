@@ -67,5 +67,5 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32, protocol_raw: u32) -> ! {
         cpu::halt();
     }
     println!("init: handing off to PID 1 via exec_init");
-    kernel::init_exec::exec_init();
+    kernel::loader::init_exec::exec_init();
 }

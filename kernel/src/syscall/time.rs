@@ -1,5 +1,5 @@
+use crate::core as sched;
 use crate::errno::{EFAULT, EINTR, EINVAL, EPERM};
-use crate::sched;
 
 use super::util::{caller_can_set_time, split_secs_nsecs, write_timespec};
 
@@ -69,21 +69,21 @@ fn encode_itimerval(interval_ns: u64, value_ns: u64) -> [u8; 32] {
     buf
 }
 
-fn itimer_real_key(pid: crate::process::Pid) -> u64 {
+fn itimer_real_key(pid: crate::process_model::Pid) -> u64 {
     (pid.raw() as u64) | (1u64 << 63)
 }
 
 fn itimer_real_fire(key: u64) {
     let pid_raw = (key & !(1u64 << 63)) as u32;
-    let target = crate::process::Pid::from_raw(pid_raw);
+    let target = crate::process_model::Pid::from_raw(pid_raw);
     const SIGALRM: u32 = 14;
-    let info = crate::signal::SigInfo::for_kill(SIGALRM, 0);
+    let info = crate::core::signal::SigInfo::for_kernel(SIGALRM);
     let _ = sched::send_signal_with_info(target, SIGALRM, info);
     sched::with_signal_mut(target, |s| {
         if s.itimer_interval() != 0 {
             let now = frame::cpu::clock::nanos_since_boot();
             s.set_itimer_deadline(now.saturating_add(s.itimer_interval()));
-            crate::timeout::register_callback(s.itimer_deadline(), key, itimer_real_fire);
+            crate::core::timeout::register_callback(s.itimer_deadline(), key, itimer_real_fire);
         } else {
             s.set_itimer_deadline(0);
         }
@@ -280,7 +280,7 @@ pub(super) fn sys_nanosleep(req: u64, rem: u64) -> i64 {
     let now = frame::cpu::clock::nanos_since_boot();
     let deadline = now.saturating_add(total_ns);
     let pid = sched::current_pid();
-    crate::timeout::register(deadline, pid);
+    crate::core::timeout::register(deadline, pid);
     let signaled = loop {
         if frame::cpu::clock::nanos_since_boot() >= deadline {
             break false;
@@ -288,11 +288,11 @@ pub(super) fn sys_nanosleep(req: u64, rem: u64) -> i64 {
         if sched::current_signal_pending() {
             break true;
         }
-        sched::park_self_at_guarded("nanosleep", &|| {
+        let _ = crate::core::wait::wait_guarded("nanosleep", Some(deadline), &|| {
             frame::cpu::clock::nanos_since_boot() < deadline
         });
     };
-    let _ = crate::timeout::unregister(pid);
+    let _ = crate::core::timeout::unregister(pid);
     if signaled {
         let now2 = frame::cpu::clock::nanos_since_boot();
         let remaining = deadline.saturating_sub(now2);
@@ -365,15 +365,21 @@ pub(super) fn sys_getitimer(which: u64, curr_ptr: u64) -> i64 {
     if curr_ptr == 0 {
         return EFAULT;
     }
-    let (interval, value) = if which == ITIMER_REAL {
-        sched::with_signal(sched::current_pid(), |s| {
-            let now = frame::cpu::clock::nanos_since_boot();
-            let remaining = s.itimer_deadline().saturating_sub(now);
-            (s.itimer_interval(), remaining)
+    let pid = sched::current_pid();
+    let (interval, value) = match which {
+        ITIMER_VIRTUAL => sched::with_signal(pid, |s| {
+            (s.itimer_virtual_interval(), s.itimer_virtual_value())
         })
-        .unwrap_or((0, 0))
-    } else {
-        (0, 0)
+        .unwrap_or((0, 0)),
+        ITIMER_PROF => {
+            sched::with_signal(pid, |s| (s.itimer_prof_interval(), s.itimer_prof_value()))
+                .unwrap_or((0, 0))
+        }
+        _ => sched::with_signal(pid, |s| {
+            let now = frame::cpu::clock::nanos_since_boot();
+            (s.itimer_interval(), s.itimer_deadline().saturating_sub(now))
+        })
+        .unwrap_or((0, 0)),
     };
     let buf = encode_itimerval(interval, value);
     if frame::user::copy_to_user(curr_ptr, &buf).is_err() {
@@ -396,31 +402,45 @@ pub(super) fn sys_setitimer(which: u64, new_ptr: u64, old_ptr: u64) -> i64 {
     let (interval_ns, value_ns) = decode_itimerval(&new_buf);
 
     let target = sched::current_pid();
-    let old = sched::with_signal(target, |s| {
-        let now = frame::cpu::clock::nanos_since_boot();
-        let remaining = s.itimer_deadline().saturating_sub(now);
-        (s.itimer_interval(), remaining)
-    })
-    .unwrap_or((0, 0));
-
-    if which == ITIMER_REAL {
-        crate::timeout::cancel_callback(itimer_real_key(target));
-        sched::with_signal_mut(target, |s| {
-            if value_ns == 0 {
-                s.set_itimer_interval(0);
-                s.set_itimer_deadline(0);
-            } else {
+    let old = match which {
+        ITIMER_VIRTUAL => sched::with_signal_mut(target, |s| {
+            let old = (s.itimer_virtual_interval(), s.itimer_virtual_value());
+            s.set_itimer_virtual(interval_ns, value_ns);
+            old
+        })
+        .unwrap_or((0, 0)),
+        ITIMER_PROF => sched::with_signal_mut(target, |s| {
+            let old = (s.itimer_prof_interval(), s.itimer_prof_value());
+            s.set_itimer_prof(interval_ns, value_ns);
+            old
+        })
+        .unwrap_or((0, 0)),
+        _ => {
+            let old = sched::with_signal(target, |s| {
                 let now = frame::cpu::clock::nanos_since_boot();
-                s.set_itimer_interval(interval_ns);
-                s.set_itimer_deadline(now.saturating_add(value_ns));
-                crate::timeout::register_callback(
-                    s.itimer_deadline(),
-                    itimer_real_key(target),
-                    itimer_real_fire,
-                );
-            }
-        });
-    }
+                let remaining = s.itimer_deadline().saturating_sub(now);
+                (s.itimer_interval(), remaining)
+            })
+            .unwrap_or((0, 0));
+            crate::core::timeout::cancel_callback(itimer_real_key(target));
+            sched::with_signal_mut(target, |s| {
+                if value_ns == 0 {
+                    s.set_itimer_interval(0);
+                    s.set_itimer_deadline(0);
+                } else {
+                    let now = frame::cpu::clock::nanos_since_boot();
+                    s.set_itimer_interval(interval_ns);
+                    s.set_itimer_deadline(now.saturating_add(value_ns));
+                    crate::core::timeout::register_callback(
+                        s.itimer_deadline(),
+                        itimer_real_key(target),
+                        itimer_real_fire,
+                    );
+                }
+            });
+            old
+        }
+    };
 
     if old_ptr != 0 {
         let old_buf = encode_itimerval(old.0, old.1);
@@ -449,7 +469,7 @@ pub(super) fn sys_alarm(seconds: u64) -> i64 {
             s.set_itimer_interval(0);
             s.set_itimer_deadline(0);
         });
-        crate::timeout::cancel_callback(key);
+        crate::core::timeout::cancel_callback(key);
         return prev_remaining_sec as i64;
     }
 
@@ -459,7 +479,7 @@ pub(super) fn sys_alarm(seconds: u64) -> i64 {
         s.set_itimer_interval(0);
         s.set_itimer_deadline(deadline);
     });
-    crate::timeout::cancel_callback(key);
-    crate::timeout::register_callback(deadline, key, itimer_real_fire);
+    crate::core::timeout::cancel_callback(key);
+    crate::core::timeout::register_callback(deadline, key, itimer_real_fire);
     prev_remaining_sec as i64
 }

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use frame::sync::SpinIrq;
 
-use crate::wait::WaitQueue;
+use crate::core::wait::WaitQueue;
 
 pub const LOCK_SH: u32 = 1;
 pub const LOCK_EX: u32 = 2;
@@ -56,7 +56,7 @@ pub fn try_op(inode_id: u64, ofd_key: u64, op: u32) -> FlockOutcome {
         _ => (FlockOutcome::Conflict, Vec::new()),
     });
     for p in drained {
-        let _ = crate::sched::wake_pid(p);
+        let _ = crate::core::wait::wake(p);
     }
     outcome
 }
@@ -65,7 +65,7 @@ fn acquire_shared(
     entry: &mut InodeEntry,
     inode_id: u64,
     ofd_key: u64,
-) -> (FlockOutcome, Vec<crate::process::Pid>) {
+) -> (FlockOutcome, Vec<crate::process_model::Pid>) {
     match &mut entry.state {
         FlockState::Unlocked => {
             let mut s = BTreeSet::new();
@@ -98,7 +98,7 @@ fn acquire_exclusive(
     inode_id: u64,
     ofd_key: u64,
     blocking: bool,
-) -> (FlockOutcome, Vec<crate::process::Pid>) {
+) -> (FlockOutcome, Vec<crate::process_model::Pid>) {
     match &mut entry.state {
         FlockState::Unlocked => {
             entry.state = FlockState::Exclusive(ofd_key);
@@ -129,7 +129,7 @@ fn acquire_exclusive(
     }
 }
 
-fn release_in_entry(entry: &mut InodeEntry, ofd_key: u64) -> Vec<crate::process::Pid> {
+fn release_in_entry(entry: &mut InodeEntry, ofd_key: u64) -> Vec<crate::process_model::Pid> {
     let mut woke = false;
     match &mut entry.state {
         FlockState::Unlocked => {}
@@ -162,7 +162,7 @@ pub fn drop_ofd(ofd_key: u64) {
     };
     let drained = inode_with(inode_id, |entry| release_in_entry(entry, ofd_key));
     for p in drained {
-        let _ = crate::sched::wake_pid(p);
+        let _ = crate::core::wait::wake(p);
     }
 }
 

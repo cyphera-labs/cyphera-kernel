@@ -100,7 +100,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$REF_NAME" \
-            cyphera-kernel-*-sbom.*.json \
+            cyphera-kernel-*-sbom.cdx.json \
+            cyphera-kernel-*-sbom.spdx.json \
             cyphera-kernel-*-sbom.*.json.sigstore.json \
             cyphera-kernel-*.provenance.intoto.jsonl \
             --clobber

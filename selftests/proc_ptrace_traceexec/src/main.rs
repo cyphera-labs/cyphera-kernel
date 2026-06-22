@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unexpected_cfgs)]
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -50,6 +51,9 @@ const CLONE_THREAD: u64 = 0x0001_0000;
 const PAGE: u64 = 4096;
 const REGION_BYTES: u64 = 16 * PAGE;
 
+#[cfg(cyphera_reduced)]
+const ITERS: u32 = 64;
+#[cfg(not(cyphera_reduced))]
 const ITERS: u32 = 200;
 const GC_PEERS: u32 = 4;
 

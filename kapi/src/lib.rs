@@ -15,6 +15,12 @@ impl Pid {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WaitKey {
+    pub vmspace_id: u64,
+    pub vaddr: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Errno(pub u16);
 
 impl Errno {
@@ -102,3 +108,40 @@ impl Errno {
 }
 
 pub type KResult<T> = Result<T, Errno>;
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct PollMask: u32 {
+        const IN  = 0x001;
+        const OUT = 0x004;
+        const ERR = 0x008;
+        const HUP = 0x010;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct OpenFlags: u32 {
+        const RDONLY    = 0o0;
+        const WRONLY    = 0o1;
+        const RDWR      = 0o2;
+        const CREAT     = 0o100;
+        const EXCL      = 0o200;
+        const TRUNC     = 0o1000;
+        const APPEND    = 0o2000;
+        const NONBLOCK  = 0o4000;
+        const DIRECTORY = 0o200000;
+        const NOFOLLOW  = 0o400000;
+        const CLOEXEC   = 0o2000000;
+        const PATH      = 0o10000000;
+    }
+}
+
+impl OpenFlags {
+    pub fn is_writable(self) -> bool {
+        self.contains(OpenFlags::WRONLY) || self.contains(OpenFlags::RDWR)
+    }
+    pub fn is_readable(self) -> bool {
+        !self.contains(OpenFlags::WRONLY)
+    }
+}

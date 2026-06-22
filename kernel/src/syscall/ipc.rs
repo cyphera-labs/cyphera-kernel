@@ -1,5 +1,5 @@
+use crate::core as sched;
 use crate::errno::{EFAULT, EINVAL, ENOMEM, ENOSYS};
-use crate::sched;
 
 use super::util::{
     decode_timespec_absolute_or_relative, decode_timespec_relative_deadline, validate_futex2_flags,
@@ -38,21 +38,23 @@ pub(super) fn sys_futex(
                 Ok(d) => d,
                 Err(e) => return e,
             };
-            crate::futex::wait(vmspace_id, uaddr, val as i32, deadline)
+            crate::ipc::futex::wait(vmspace_id, uaddr, val as i32, deadline)
         }
-        FUTEX_WAKE => crate::futex::wake(vmspace_id, uaddr, val as u32),
+        FUTEX_WAKE => crate::ipc::futex::wake(vmspace_id, uaddr, val as u32),
         FUTEX_WAIT_BITSET => {
             let deadline = match decode_timespec_relative_deadline(timeout) {
                 Ok(d) => d,
                 Err(e) => return e,
             };
-            crate::futex::wait_bitset(vmspace_id, uaddr, val as i32, val3 as u32, deadline)
+            crate::ipc::futex::wait_bitset(vmspace_id, uaddr, val as i32, val3 as u32, deadline)
         }
-        FUTEX_WAKE_BITSET => crate::futex::wake_bitset(vmspace_id, uaddr, val as u32, val3 as u32),
+        FUTEX_WAKE_BITSET => {
+            crate::ipc::futex::wake_bitset(vmspace_id, uaddr, val as u32, val3 as u32)
+        }
         FUTEX_REQUEUE => {
-            crate::futex::requeue(vmspace_id, uaddr, uaddr2, val as u32, timeout as u32, None)
+            crate::ipc::futex::requeue(vmspace_id, uaddr, uaddr2, val as u32, timeout as u32, None)
         }
-        FUTEX_CMP_REQUEUE => crate::futex::requeue(
+        FUTEX_CMP_REQUEUE => crate::ipc::futex::requeue(
             vmspace_id,
             uaddr,
             uaddr2,
@@ -60,7 +62,7 @@ pub(super) fn sys_futex(
             timeout as u32,
             Some(val3 as i32),
         ),
-        FUTEX_WAKE_OP => crate::futex::wake_op(
+        FUTEX_WAKE_OP => crate::ipc::futex::wake_op(
             vmspace_id,
             uaddr,
             uaddr2,
@@ -74,19 +76,19 @@ pub(super) fn sys_futex(
                 Ok(d) => d,
                 Err(e) => return e,
             };
-            crate::futex::lock_pi(vmspace_id, uaddr, deadline)
+            crate::ipc::futex::lock_pi(vmspace_id, uaddr, deadline)
         }
-        FUTEX_UNLOCK_PI => crate::futex::unlock_pi(vmspace_id, uaddr),
-        FUTEX_TRYLOCK_PI => crate::futex::trylock_pi(vmspace_id, uaddr),
+        FUTEX_UNLOCK_PI => crate::ipc::futex::unlock_pi(vmspace_id, uaddr),
+        FUTEX_TRYLOCK_PI => crate::ipc::futex::trylock_pi(vmspace_id, uaddr),
         FUTEX_WAIT_REQUEUE_PI => {
             let clockid = if op & FUTEX_CLOCK_REALTIME != 0 { 0 } else { 1 };
             let deadline = match decode_timespec_absolute_or_relative(timeout, clockid) {
                 Ok(d) => d,
                 Err(e) => return e,
             };
-            crate::futex::wait_requeue_pi(vmspace_id, uaddr, val as i32, deadline, uaddr2)
+            crate::ipc::futex::wait_requeue_pi(vmspace_id, uaddr, val as i32, deadline, uaddr2)
         }
-        FUTEX_CMP_REQUEUE_PI => crate::futex::cmp_requeue_pi(
+        FUTEX_CMP_REQUEUE_PI => crate::ipc::futex::cmp_requeue_pi(
             vmspace_id,
             uaddr,
             val as u32,
@@ -106,7 +108,7 @@ pub(super) fn sys_futex_wake(uaddr: u64, mask: u64, nr: u64, flags: u64) -> i64 
         return EINVAL;
     }
     let vmspace_id = sched::current_vmspace_id();
-    crate::futex::wake_bitset(vmspace_id, uaddr, nr as u32, mask as u32)
+    crate::ipc::futex::wake_bitset(vmspace_id, uaddr, nr as u32, mask as u32)
 }
 
 pub(super) fn sys_futex_wait(
@@ -128,7 +130,7 @@ pub(super) fn sys_futex_wait(
         Err(e) => return e,
     };
     let vmspace_id = sched::current_vmspace_id();
-    crate::futex::wait_bitset(vmspace_id, uaddr, val as i32, mask as u32, deadline)
+    crate::ipc::futex::wait_bitset(vmspace_id, uaddr, val as i32, mask as u32, deadline)
 }
 
 pub(super) fn sys_futex_requeue(
@@ -151,7 +153,7 @@ pub(super) fn sys_futex_requeue(
     let uaddr_dst = u64::from_le_bytes(buf[32..40].try_into().unwrap());
     let _flags_dst = u32::from_le_bytes(buf[40..44].try_into().unwrap());
     let vmspace_id = sched::current_vmspace_id();
-    crate::futex::requeue(
+    crate::ipc::futex::requeue(
         vmspace_id,
         uaddr_src,
         uaddr_dst,
@@ -196,7 +198,7 @@ pub(super) fn sys_futex_waitv(
         Ok(d) => d,
         Err(e) => return e,
     };
-    crate::futex::wait_multi(&entries, deadline)
+    crate::ipc::futex::wait_multi(&entries, deadline)
 }
 
 pub(super) fn sys_keyctl(option: u64, _arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {

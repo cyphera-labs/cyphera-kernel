@@ -6,8 +6,10 @@ use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
 
-use crate::cgroup::{Cgroup, CgroupError};
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, Stat};
+use cyphera_kapi::{Errno, KResult};
+
+use crate::cgroup::Cgroup;
+use crate::vfs::{DirEntry, Inode, InodeKind, Stat};
 
 #[derive(Copy, Clone)]
 enum ControlFile {
@@ -86,7 +88,7 @@ impl Inode for CgroupDir {
         Arc::as_ptr(&self.cg) as *const () as u64
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         if let Some(child) = self.cg.children.lock().get(name).cloned() {
             return Ok(CgroupDir::new(child));
         }
@@ -96,10 +98,10 @@ impl Inode for CgroupDir {
                 file: cf,
             }));
         }
-        Err(FsError::NotFound)
+        Err(Errno::NOENT)
     }
 
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         let mut out: Vec<DirEntry> = Vec::new();
         for name in self.cg.children.lock().keys() {
             out.push(DirEntry {
@@ -118,34 +120,23 @@ impl Inode for CgroupDir {
         Ok(out)
     }
 
-    fn create(&self, name: &str, kind: InodeKind) -> Result<Arc<dyn Inode>, FsError> {
+    fn create(&self, name: &str, kind: InodeKind) -> KResult<Arc<dyn Inode>> {
         if kind != InodeKind::Directory {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
-        let child = Cgroup::create_child(&self.cg, name).map_err(map_err)?;
+        let child = Cgroup::create_child(&self.cg, name)?;
         Ok(CgroupDir::new(child))
     }
 
-    fn unlink(&self, name: &str) -> Result<(), FsError> {
+    fn unlink(&self, name: &str) -> KResult<()> {
         if lookup_control(name).is_some() {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
-        Cgroup::remove_child(&self.cg, name).map_err(map_err)
+        Cgroup::remove_child(&self.cg, name)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), FsError> {
-        Cgroup::remove_child(&self.cg, name).map_err(map_err)
-    }
-}
-
-fn map_err(e: CgroupError) -> FsError {
-    match e {
-        CgroupError::InvalidName => FsError::InvalidArgument,
-        CgroupError::Exists => FsError::Exists,
-        CgroupError::NotFound => FsError::NotFound,
-        CgroupError::Busy => FsError::NotEmpty,
-        CgroupError::PidsLimit => FsError::WouldBlock,
-        CgroupError::MemoryLimit => FsError::NoSpace,
+    fn rmdir(&self, name: &str) -> KResult<()> {
+        Cgroup::remove_child(&self.cg, name)
     }
 }
 
@@ -162,7 +153,7 @@ impl Inode for CgroupFile {
         Stat::fresh(InodeKind::Regular, 0, 0o644)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let body = self.render();
         let bytes = body.as_bytes();
         if offset as usize >= bytes.len() {
@@ -174,13 +165,13 @@ impl Inode for CgroupFile {
         Ok(n)
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let s = core::str::from_utf8(buf).map_err(|_| FsError::InvalidArgument)?;
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        let s = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
         self.handle_write(s.trim())?;
         Ok(buf.len())
     }
 
-    fn truncate(&self, _len: u64) -> Result<(), FsError> {
+    fn truncate(&self, _len: u64) -> KResult<()> {
         Ok(())
     }
 }
@@ -197,7 +188,7 @@ impl CgroupFile {
                 let pids = self.cg.pids.lock();
                 let mut out = String::new();
                 for p in pids.iter() {
-                    let local = crate::sched::host_to_caller_local(*p);
+                    let local = crate::core::host_to_caller_local(*p);
                     if local != 0 {
                         out.push_str(&format!("{}\n", local));
                     }
@@ -209,7 +200,7 @@ impl CgroupFile {
                 let pids = self.cg.pids.lock();
                 let mut out = String::new();
                 for p in pids.iter() {
-                    let local = crate::sched::host_to_caller_local(*p);
+                    let local = crate::core::host_to_caller_local(*p);
                     if local != 0 {
                         out.push_str(&format!("{}\n", local));
                     }
@@ -319,12 +310,12 @@ impl CgroupFile {
         }
     }
 
-    fn handle_write(&self, text: &str) -> Result<(), FsError> {
+    fn handle_write(&self, text: &str) -> KResult<()> {
         match self.file {
             ControlFile::CgroupProcs | ControlFile::CgroupThreads => {
-                let local: u32 = text.parse().map_err(|_| FsError::InvalidArgument)?;
-                let host = crate::sched::caller_local_to_host(local).ok_or(FsError::NotFound)?;
-                migrate_pid(host, self.cg.clone()).map_err(map_err)?;
+                let local: u32 = text.parse().map_err(|_| Errno::INVAL)?;
+                let host = crate::core::caller_local_to_host(local).ok_or(Errno::NOENT)?;
+                migrate_pid(host, self.cg.clone())?;
                 Ok(())
             }
             ControlFile::MemoryMax => {
@@ -336,7 +327,7 @@ impl CgroupFile {
                 Ok(())
             }
             ControlFile::MemoryLow => {
-                self.cg.memory.lock().low = text.parse().map_err(|_| FsError::InvalidArgument)?;
+                self.cg.memory.lock().low = text.parse().map_err(|_| Errno::INVAL)?;
                 Ok(())
             }
             ControlFile::PidsMax => {
@@ -345,43 +336,43 @@ impl CgroupFile {
             }
             ControlFile::CpuMax => {
                 let mut parts = text.split_ascii_whitespace();
-                let q_str = parts.next().ok_or(FsError::InvalidArgument)?;
+                let q_str = parts.next().ok_or(Errno::INVAL)?;
                 let p_str = parts.next().unwrap_or("100000");
-                let period: u64 = p_str.parse().map_err(|_| FsError::InvalidArgument)?;
+                let period: u64 = p_str.parse().map_err(|_| Errno::INVAL)?;
                 let mut c = self.cg.cpu.lock();
                 if q_str == "max" {
                     c.max = None;
                 } else {
-                    let quota: u64 = q_str.parse().map_err(|_| FsError::InvalidArgument)?;
+                    let quota: u64 = q_str.parse().map_err(|_| Errno::INVAL)?;
                     c.max = Some((quota, period));
                 }
                 Ok(())
             }
             ControlFile::CpuWeight => {
-                let w: u64 = text.parse().map_err(|_| FsError::InvalidArgument)?;
+                let w: u64 = text.parse().map_err(|_| Errno::INVAL)?;
                 if !(1..=10_000).contains(&w) {
-                    return Err(FsError::InvalidArgument);
+                    return Err(Errno::INVAL);
                 }
                 self.cg.cpu.lock().weight = w;
                 Ok(())
             }
             ControlFile::IoMax => {
                 let mut parts = text.split_ascii_whitespace();
-                let _device = parts.next().ok_or(FsError::InvalidArgument)?;
+                let _device = parts.next().ok_or(Errno::INVAL)?;
                 let mut io = self.cg.io.lock();
                 for kv in parts {
-                    let (k, v) = kv.split_once('=').ok_or(FsError::InvalidArgument)?;
+                    let (k, v) = kv.split_once('=').ok_or(Errno::INVAL)?;
                     let parsed: Option<u64> = if v == "max" {
                         None
                     } else {
-                        Some(v.parse().map_err(|_| FsError::InvalidArgument)?)
+                        Some(v.parse().map_err(|_| Errno::INVAL)?)
                     };
                     match k {
                         "rbps" => io.max_rbps = parsed,
                         "wbps" => io.max_wbps = parsed,
                         "riops" => io.max_riops = parsed,
                         "wiops" => io.max_wiops = parsed,
-                        _ => return Err(FsError::InvalidArgument),
+                        _ => return Err(Errno::INVAL),
                     }
                 }
                 Ok(())
@@ -392,31 +383,29 @@ impl CgroupFile {
                     .strip_prefix("default ")
                     .map(|s| s.trim())
                     .unwrap_or(trimmed);
-                let w: u64 = val_str.parse().map_err(|_| FsError::InvalidArgument)?;
+                let w: u64 = val_str.parse().map_err(|_| Errno::INVAL)?;
                 if !(1..=10_000).contains(&w) {
-                    return Err(FsError::InvalidArgument);
+                    return Err(Errno::INVAL);
                 }
                 self.cg.io.lock().weight = w;
                 Ok(())
             }
-            _ => Err(FsError::PermissionDenied),
+            _ => Err(Errno::ACCES),
         }
     }
 }
 
-fn parse_max(text: &str) -> Result<Option<u64>, FsError> {
+fn parse_max(text: &str) -> KResult<Option<u64>> {
     if text == "max" {
         return Ok(None);
     }
-    text.parse::<u64>()
-        .map(Some)
-        .map_err(|_| FsError::InvalidArgument)
+    text.parse::<u64>().map(Some).map_err(|_| Errno::INVAL)
 }
 
-fn migrate_pid(pid: crate::process::Pid, target: Arc<Cgroup>) -> Result<(), CgroupError> {
-    let old = match crate::sched::process_cgroup(pid) {
+fn migrate_pid(pid: crate::process_model::Pid, target: Arc<Cgroup>) -> KResult<()> {
+    let old = match crate::core::process_cgroup(pid) {
         Some(c) => c,
-        None => return Err(CgroupError::NotFound),
+        None => return Err(Errno::NOENT),
     };
     if Arc::ptr_eq(&old, &target) {
         return Ok(());
@@ -426,7 +415,7 @@ fn migrate_pid(pid: crate::process::Pid, target: Arc<Cgroup>) -> Result<(), Cgro
         let _ = old.attach_pid(pid);
         return Err(e);
     }
-    let charged = crate::sched::process_charged_bytes(pid);
+    let charged = crate::core::process_charged_bytes(pid);
     if charged > 0 {
         old.uncharge_memory(charged);
         if let Err(e) = target.try_charge_memory(charged) {
@@ -436,7 +425,7 @@ fn migrate_pid(pid: crate::process::Pid, target: Arc<Cgroup>) -> Result<(), Cgro
             return Err(e);
         }
     }
-    crate::sched::set_process_cgroup(pid, target);
+    crate::core::set_process_cgroup(pid, target);
     Ok(())
 }
 

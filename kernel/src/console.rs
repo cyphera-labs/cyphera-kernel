@@ -2,8 +2,8 @@ use alloc::vec::Vec;
 
 use frame::sync::SpinIrq;
 
-use crate::process::Pid;
-use crate::wait::WaitQueue;
+use crate::core::wait::WaitQueue;
+use crate::process_model::Pid;
 
 mod fb;
 mod font;
@@ -163,10 +163,10 @@ fn process_input(b: u8, t: &[u8; 36], st: &mut State) {
         const SIGINT: u32 = 2;
         let fg = crate::syscall::console_fg_pgrp();
         if fg != 0 {
-            crate::sched::signal_pgrp(Pid(fg), SIGINT);
+            crate::core::signal_pgrp(Pid(fg), SIGINT);
         } else if let Some(pid) = st.last_reader {
-            let info = crate::signal::SigInfo::for_fault(SIGINT, 0);
-            let _ = crate::sched::send_signal_with_info(pid, SIGINT, info);
+            let info = crate::core::signal::SigInfo::for_fault(SIGINT, 0);
+            let _ = crate::core::send_signal_with_info(pid, SIGINT, info);
         }
         st.line.clear();
         if echo_on {
@@ -254,10 +254,7 @@ pub fn poll_rx_from_tick() {
         let _ = &mut st.raw;
     }
     if woke {
-        let waiters = READERS.drain();
-        for pid in waiters {
-            let _ = crate::sched::wake_pid(pid);
-        }
+        READERS.wake_all();
     }
 }
 
@@ -378,13 +375,11 @@ pub(crate) fn feed_keycode(keycode: u16, press: bool) {
         }
     }
     if woke {
-        for pid in READERS.drain() {
-            let _ = crate::sched::wake_pid(pid);
-        }
+        READERS.wake_all();
     }
 }
 
-pub fn read(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError> {
+pub fn read(out: &mut [u8], nonblock: bool) -> cyphera_kapi::KResult<usize> {
     if out.is_empty() {
         return Ok(0);
     }
@@ -394,7 +389,7 @@ pub fn read(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError
     use crate::vfs::blocking::IoAttempt;
     crate::vfs::blocking::block_io("console_read", &READERS, nonblock, None, || {
         let mut st = STATE.lock();
-        st.last_reader = Some(crate::sched::current_pid());
+        st.last_reader = Some(crate::core::current_pid());
         if !st.cooked.is_empty() {
             IoAttempt::Ready(st.cooked.pop_into(out))
         } else if st.eof_pending {
@@ -406,18 +401,11 @@ pub fn read(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError
     })
 }
 
-fn read_kbd(out: &mut [u8], nonblock: bool) -> Result<usize, crate::vfs::FsError> {
-    loop {
-        if let Some(ev) = crate::input::pop_kbd_event() {
-            let kc = (ev.keycode & 0x7f) as u8;
-            out[0] = if ev.press { kc } else { kc | 0x80 };
-            return Ok(1);
-        }
-        if nonblock {
-            return Err(crate::vfs::FsError::WouldBlock);
-        }
-        crate::input::park_on_kbd();
-    }
+fn read_kbd(out: &mut [u8], nonblock: bool) -> cyphera_kapi::KResult<usize> {
+    let ev = crate::device::input::read_kbd_event_blocking(nonblock)?;
+    let kc = (ev.keycode & 0x7f) as u8;
+    out[0] = if ev.press { kc } else { kc | 0x80 };
+    Ok(1)
 }
 
 pub fn read_blocking(out: &mut [u8]) -> usize {
@@ -426,7 +414,7 @@ pub fn read_blocking(out: &mut [u8]) -> usize {
 
 pub fn poll_readable() -> bool {
     if kbd_mode_get() == K_MEDIUMRAW {
-        crate::input::kbd_has_event()
+        crate::device::input::kbd_has_event()
     } else {
         let st = STATE.lock();
         !st.cooked.is_empty() || st.eof_pending
@@ -435,5 +423,5 @@ pub fn poll_readable() -> bool {
 
 pub fn for_each_read_wq(f: &mut dyn FnMut(&WaitQueue)) {
     f(&READERS);
-    crate::input::for_each_kbd_wq(f);
+    crate::device::input::for_each_kbd_wq(f);
 }

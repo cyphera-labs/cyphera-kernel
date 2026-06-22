@@ -223,7 +223,7 @@ pub fn writeback(
     start: u64,
     end: u64,
     inode: &dyn crate::vfs::Inode,
-) -> Result<usize, crate::vfs::FsError> {
+) -> cyphera_kapi::KResult<usize> {
     let page_start = start & !0xfff;
     let page_end = end.saturating_add(0xfff) & !0xfff;
     let dirty: Vec<(u64, Vec<u8>)> = {

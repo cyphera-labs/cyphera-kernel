@@ -82,16 +82,35 @@ pub fn irqs_enabled() -> bool {
 }
 
 #[inline]
-pub fn set_user_fs_base(addr: u64) {
+pub fn set_user_tls_base(addr: u64) {
     use x86_64::VirtAddr;
     use x86_64::registers::model_specific::FsBase;
     FsBase::write(VirtAddr::new(addr));
 }
 
 #[inline]
-pub fn get_user_fs_base() -> u64 {
+pub fn get_user_tls_base() -> u64 {
     use x86_64::registers::model_specific::FsBase;
     FsBase::read().as_u64()
+}
+
+pub type SecondaryEntry = extern "C" fn(cpu_id: u64) -> !;
+
+pub fn online_mask() -> u64 {
+    crate::arch::x86_64::smp::online_mask()
+}
+
+pub fn set_kernel_stack(top: u64) {
+    crate::arch::x86_64::tss::set_rsp0(top);
+}
+
+pub fn bring_up_secondaries(entry: SecondaryEntry) {
+    crate::arch::x86_64::smp::set_ap_main(entry);
+    let ids = crate::arch::x86_64::madt::parse_apic_ids(crate::boot::rsdp_paddr());
+    if !ids.is_empty() {
+        crate::println!("smp: bringing up {} secondary CPUs", ids.len());
+    }
+    crate::arch::x86_64::smp::bring_up(&ids);
 }
 
 pub use clock::busy_wait_nanos;

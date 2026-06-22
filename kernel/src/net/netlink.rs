@@ -8,7 +8,9 @@ use frame::sync::SpinIrq;
 
 use smoltcp::wire::IpCidr;
 
-use crate::vfs::{FsError, Inode, InodeKind, PollMask, Stat};
+use cyphera_kapi::{Errno, KResult};
+
+use crate::vfs::{Inode, InodeKind, PollMask, Stat};
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
@@ -47,7 +49,7 @@ impl Inode for NetlinkSocket {
         Stat::fresh(InodeKind::Pipe, 0, 0o600)
     }
 
-    fn write_at(&self, _off: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, _off: u64, buf: &[u8]) -> KResult<usize> {
         if buf.len() < 16 {
             return Ok(buf.len());
         }
@@ -63,7 +65,7 @@ impl Inode for NetlinkSocket {
                 65536,
                 ARPHRD_LOOPBACK,
             ));
-            if crate::sched::current_net_ns().has_iface() {
+            if crate::core::current_net_ns().has_iface() {
                 let mac = virtio::net_mac().unwrap_or([0; 6]);
                 q.push_back(build_link_msg(seq, 2, "eth0", &mac, 1500, ARPHRD_ETHER));
             }
@@ -78,11 +80,11 @@ impl Inode for NetlinkSocket {
         Ok(buf.len())
     }
 
-    fn read_at(&self, _off: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, _off: u64, buf: &mut [u8]) -> KResult<usize> {
         let mut q = self.queue.lock();
         let msg = match q.pop_front() {
             Some(m) => m,
-            None => return Err(FsError::WouldBlock),
+            None => return Err(Errno::AGAIN),
         };
         let n = msg.len().min(buf.len());
         buf[..n].copy_from_slice(&msg[..n]);
@@ -159,7 +161,7 @@ fn build_done(seq: u32) -> Vec<u8> {
 }
 
 fn interface_addrs() -> Vec<(i32, IpCidr)> {
-    crate::sched::current_net_ns().with_stack(|s| {
+    crate::core::current_net_ns().with_stack(|s| {
         let mut v: Vec<(i32, IpCidr)> = Vec::new();
         for c in s.loop_iface.ip_addrs() {
             v.push((1, *c));
@@ -175,8 +177,8 @@ fn interface_addrs() -> Vec<(i32, IpCidr)> {
 
 fn build_addr_msg(seq: u32, ifindex: i32, cidr: &IpCidr) -> Vec<u8> {
     let (family, prefix, addr): (u8, u8, Vec<u8>) = match cidr {
-        IpCidr::Ipv4(c) => (2, c.prefix_len(), c.address().as_bytes().to_vec()),
-        IpCidr::Ipv6(c) => (10, c.prefix_len(), c.address().as_bytes().to_vec()),
+        IpCidr::Ipv4(c) => (2, c.prefix_len(), c.address().octets().to_vec()),
+        IpCidr::Ipv6(c) => (10, c.prefix_len(), c.address().octets().to_vec()),
     };
     let mut buf = Vec::new();
     buf.extend_from_slice(&[0u8; 4]);

@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 
 use frame::sync::SpinIrq;
 
-use crate::process::Pid;
-use crate::wait::WaitQueue;
+use crate::core::wait::WaitQueue;
+use crate::process_model::Pid;
 
 pub const F_RDLCK: u16 = 0;
 pub const F_WRLCK: u16 = 1;

@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 
 use frame::user::TrapFrame;
 
-use crate::errno::{EBADF, EFAULT, EINTR, EINVAL, EPERM, ESRCH};
-use crate::sched;
+use crate::core as sched;
+use crate::errno::{EAGAIN, EBADF, EFAULT, EINTR, EINVAL, EPERM, ESRCH};
 use crate::vfs::{self, Inode, OpenFile, OpenFlags};
 
 pub(super) fn sys_sigaltstack(new_ptr: u64, old_ptr: u64, current_rsp: u64) -> i64 {
@@ -31,10 +31,10 @@ pub(super) fn sys_sigaltstack(new_ptr: u64, old_ptr: u64, current_rsp: u64) -> i
         let flags = i32::from_le_bytes(buf[8..12].try_into().unwrap());
         let size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
 
-        let mut new = crate::signal::AltStack { sp, flags, size };
-        if flags & crate::signal::AltStack::SS_DISABLE != 0 {
-            new = crate::signal::AltStack::disabled();
-        } else if size < crate::signal::AltStack::MIN_SIZE {
+        let mut new = crate::core::signal::AltStack { sp, flags, size };
+        if flags & crate::core::signal::AltStack::SS_DISABLE != 0 {
+            new = crate::core::signal::AltStack::disabled();
+        } else if size < crate::core::signal::AltStack::MIN_SIZE {
             return EINVAL;
         }
 
@@ -76,8 +76,7 @@ pub(super) fn sys_kill(pid: u64, signal: u64) -> i64 {
     }
     match sched::send_signal(target, signal as u32) {
         Ok(()) => 0,
-        Err(crate::sched::SignalError::Invalid) => EINVAL,
-        Err(crate::sched::SignalError::NoSuchProcess) => ESRCH,
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -96,11 +95,10 @@ pub(super) fn sys_tkill(tid: u64, sig: u64) -> i64 {
     let sender_local = sched::process_pid_ns(target_host)
         .map(|ns| ns.host_to_local_in(sender_host))
         .unwrap_or(0);
-    let info = crate::signal::SigInfo::for_tkill(sig as u32, sender_local);
+    let info = crate::core::signal::SigInfo::for_tkill(sig as u32, sender_local);
     match sched::send_signal_with_info(target_host, sig as u32, info) {
         Ok(()) => 0,
-        Err(crate::sched::SignalError::Invalid) => EINVAL,
-        Err(crate::sched::SignalError::NoSuchProcess) => ESRCH,
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -120,24 +118,23 @@ pub(super) fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
     }
     let sender_host = sched::current_pid();
     let sender_local = target_host_pid_in_ns_of(sender_host, target_host).unwrap_or(0);
-    let info = crate::signal::SigInfo::for_tkill(sig as u32, sender_local);
+    let info = crate::core::signal::SigInfo::for_tkill(sig as u32, sender_local);
     match sched::send_signal_with_info(target_host, sig as u32, info) {
         Ok(()) => 0,
-        Err(crate::sched::SignalError::Invalid) => EINVAL,
-        Err(crate::sched::SignalError::NoSuchProcess) => ESRCH,
+        Err(e) => e.as_neg_i64(),
     }
 }
 
 fn target_host_pid_in_ns_of(
-    host_pid: crate::process::Pid,
-    target_pid: crate::process::Pid,
+    host_pid: crate::process_model::Pid,
+    target_pid: crate::process_model::Pid,
 ) -> Option<u32> {
     let ns = sched::process_pid_ns(target_pid)?;
     Some(ns.host_to_local_in(host_pid))
 }
 
 pub(super) fn sys_rt_sigaction(signum: u64, new_act: u64, old_act: u64, sigsetsize: u64) -> i64 {
-    use crate::process::SigAction;
+    use crate::process_model::SigAction;
     if signum == 0 || signum >= 64 {
         return EINVAL;
     }
@@ -208,13 +205,13 @@ pub(super) fn sys_rt_sigreturn(tf: &mut TrapFrame) {
     sched::rt_sigreturn(tf);
 }
 
-static PIDFD_INDEX: frame::sync::SpinIrq<BTreeMap<usize, crate::process::Pid>> =
+static PIDFD_INDEX: frame::sync::SpinIrq<BTreeMap<usize, crate::process_model::Pid>> =
     frame::sync::SpinIrq::new(BTreeMap::new());
 
 const PIDFD_NONBLOCK: u64 = 0o4000;
 
-pub(crate) fn install_pidfd(target: crate::process::Pid, nonblock: bool) -> Result<i32, i64> {
-    let typed = crate::fdtypes::PidFdInode::new(target);
+pub(crate) fn install_pidfd(target: crate::process_model::Pid, nonblock: bool) -> Result<i32, i64> {
+    let typed = crate::ipc::fdtypes::PidFdInode::new(target);
     let inode_dyn: Arc<dyn Inode> = typed;
     let mut open_flags = OpenFlags::RDONLY;
     if nonblock {
@@ -270,8 +267,7 @@ pub(super) fn sys_pidfd_send_signal(pidfd: u64, sig: u64, _info: u64, flags: u64
     }
     match sched::send_signal(target, sig as u32) {
         Ok(()) => 0,
-        Err(crate::sched::SignalError::Invalid) => EINVAL,
-        Err(crate::sched::SignalError::NoSuchProcess) => ESRCH,
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -342,11 +338,11 @@ pub(super) fn sys_rt_sigtimedwait(
             }
         }
         if let Some(d) = deadline_ns {
-            crate::timeout::register(d, sched::current_pid());
+            crate::core::timeout::register(d, sched::current_pid());
         }
         sched::park_on_signalfd_wait();
         if deadline_ns.is_some() {
-            let _ = crate::timeout::unregister(sched::current_pid());
+            let _ = crate::core::timeout::unregister(sched::current_pid());
         }
     }
 }
@@ -364,7 +360,9 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     let old_mask = sched::with_signal(cur, |s| s.blocked()).unwrap_or(0);
     sched::with_signal_mut(cur, |s| {
         s.set_blocked(
-            new_mask & !((1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP)),
+            new_mask
+                & !((1u64 << crate::process_model::SIGKILL)
+                    | (1u64 << crate::process_model::SIGSTOP)),
         );
     });
     sched::sleep_until_signal();
@@ -389,7 +387,7 @@ pub(super) fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
 }
 
 pub(super) fn sys_rt_sigqueueinfo(local_pid: u64, sig: u64, info_ptr: u64) -> i64 {
-    if sig >= crate::process::NSIG as u64 {
+    if sig >= crate::process_model::NSIG as u64 {
         return EINVAL;
     }
     let target_host = match sched::caller_local_to_host(local_pid as u32) {
@@ -411,9 +409,10 @@ pub(super) fn sys_rt_sigqueueinfo(local_pid: u64, sig: u64, info_ptr: u64) -> i6
     }
     let sival = u64::from_ne_bytes(buf[24..32].try_into().unwrap());
     let sender_local = target_host_pid_in_ns_of(sched::current_pid(), target_host).unwrap_or(0);
-    let info = crate::signal::SigInfo::for_queue(sig as u32, si_code, sender_local, sival);
+    let info = crate::core::signal::SigInfo::for_queue(sig as u32, si_code, sender_local, sival);
     match sched::send_signal_with_info(target_host, sig as u32, info) {
         Ok(()) => 0,
+        Err(cyphera_kapi::Errno::AGAIN) => EAGAIN,
         Err(_) => ESRCH,
     }
 }
@@ -424,7 +423,7 @@ pub(super) fn sys_rt_tgsigqueueinfo(
     sig: u64,
     info_ptr: u64,
 ) -> i64 {
-    if sig >= crate::process::NSIG as u64 {
+    if sig >= crate::process_model::NSIG as u64 {
         return EINVAL;
     }
     let target_tid = match sched::caller_local_to_host(local_tid as u32) {
@@ -454,9 +453,10 @@ pub(super) fn sys_rt_tgsigqueueinfo(
     }
     let sival = u64::from_ne_bytes(buf[24..32].try_into().unwrap());
     let sender_local = target_host_pid_in_ns_of(sched::current_pid(), target_tid).unwrap_or(0);
-    let info = crate::signal::SigInfo::for_queue(sig as u32, si_code, sender_local, sival);
+    let info = crate::core::signal::SigInfo::for_queue(sig as u32, si_code, sender_local, sival);
     match sched::send_signal_with_info(target_tid, sig as u32, info) {
         Ok(()) => 0,
+        Err(cyphera_kapi::Errno::AGAIN) => EAGAIN,
         Err(_) => ESRCH,
     }
 }

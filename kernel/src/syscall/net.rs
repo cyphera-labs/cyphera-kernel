@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
-use crate::errno::{EAFNOSUPPORT, EBADF, EFAULT, EINVAL};
-use crate::sched;
+use crate::core as sched;
+use crate::errno::{EAFNOSUPPORT, EBADF, EFAULT, EINVAL, ESOCKTNOSUPPORT};
 use crate::vfs::{self, Inode, OpenFile, OpenFlags};
 
 use super::fs::{READ_BUF_MAX, WRITE_BUF_MAX};
@@ -21,6 +21,7 @@ fn inet_family(domain: u32) -> crate::net::inet::Family {
 }
 
 const SOCK_RAW: u32 = 3;
+const SOCK_SEQPACKET: u32 = 5;
 const IPPROTO_ICMP: u32 = 1;
 const IPPROTO_ICMPV6: u32 = 58;
 
@@ -40,7 +41,7 @@ pub(super) fn sys_socket(domain: u64, kind: u64, protocol: u64) -> i64 {
         {
             let s = match crate::net::icmp::IcmpSocket::new() {
                 Ok(s) => s,
-                Err(e) => return e.errno(),
+                Err(e) => return e.as_neg_i64(),
             };
             crate::net::icmp::register(&s);
             s
@@ -48,7 +49,7 @@ pub(super) fn sys_socket(domain: u64, kind: u64, protocol: u64) -> i64 {
         (AF_INET | AF_INET6, crate::net::inet::SOCK_DGRAM) => {
             let s = match crate::net::inet::InetSocket::new_udp(inet_family(domain)) {
                 Ok(s) => s,
-                Err(e) => return e.errno(),
+                Err(e) => return e.as_neg_i64(),
             };
             crate::net::inet::register(&s);
             s
@@ -56,7 +57,7 @@ pub(super) fn sys_socket(domain: u64, kind: u64, protocol: u64) -> i64 {
         (AF_INET | AF_INET6, crate::net::inet::SOCK_STREAM) => {
             let s = match crate::net::inet::InetSocket::new_tcp(inet_family(domain)) {
                 Ok(s) => s,
-                Err(e) => return e.errno(),
+                Err(e) => return e.as_neg_i64(),
             };
             crate::net::inet::register(&s);
             s
@@ -81,6 +82,11 @@ pub(super) fn sys_socketpair(domain: u64, kind: u64, _protocol: u64, sv: u64) ->
     if domain as u32 != AF_UNIX {
         return EAFNOSUPPORT;
     }
+    let framed = match (kind & 0xf) as u32 {
+        crate::net::inet::SOCK_STREAM => false,
+        crate::net::inet::SOCK_DGRAM | SOCK_SEQPACKET => true,
+        _ => return ESOCKTNOSUPPORT,
+    };
     let mut flags = OpenFlags::RDWR;
     if kind & 0o4000 != 0 {
         flags |= OpenFlags::NONBLOCK;
@@ -90,7 +96,7 @@ pub(super) fn sys_socketpair(domain: u64, kind: u64, _protocol: u64, sv: u64) ->
     } else {
         0
     };
-    let (a, b) = crate::net::unix::UnixEnd::pair();
+    let (a, b) = crate::net::unix::UnixEnd::pair(framed);
     let a_dyn: Arc<dyn Inode> = a;
     let b_dyn: Arc<dyn Inode> = b;
     let fa = Arc::new(OpenFile::new(a_dyn, flags));
@@ -212,7 +218,7 @@ pub(super) fn sys_sendto(
     fd: u64,
     buf: u64,
     count: u64,
-    _flags: u64,
+    flags: u64,
     addr: u64,
     addrlen: u64,
 ) -> i64 {
@@ -233,7 +239,7 @@ pub(super) fn sys_sendto(
     if frame::user::copy_from_user(buf, &mut payload).is_err() {
         return EFAULT;
     }
-    let nonblock = fd_is_nonblock(fd as i32);
+    let nonblock = fd_is_nonblock(fd as i32) || flags & MSG_DONTWAIT != 0;
     if addr != 0 && addrlen != 0 {
         let ab = match read_sockaddr(addr, addrlen) {
             Ok(b) => b,
@@ -249,7 +255,7 @@ pub(super) fn sys_recvfrom(
     fd: u64,
     buf: u64,
     count: u64,
-    _flags: u64,
+    flags: u64,
     addr: u64,
     addrlen_ptr: u64,
 ) -> i64 {
@@ -269,7 +275,7 @@ pub(super) fn sys_recvfrom(
         None => return crate::errno::ENOTSOCK,
     };
     let mut tmp = alloc::vec![0u8; n];
-    let nonblock = fd_is_nonblock(fd as i32);
+    let nonblock = fd_is_nonblock(fd as i32) || flags & MSG_DONTWAIT != 0;
     let peer_out = if addr != 0 && addrlen_ptr != 0 {
         Some((addr, addrlen_ptr))
     } else {
@@ -298,6 +304,7 @@ const CMSG_HDR_LEN: usize = 16;
 const SCM_SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: u32 = 8;
+const MSG_DONTWAIT: u64 = 0x40;
 
 fn parse_scm_rights(control: u64, controllen: u64) -> Result<alloc::vec::Vec<Arc<OpenFile>>, i64> {
     let mut out = alloc::vec::Vec::new();
@@ -367,7 +374,7 @@ fn deliver_scm_rights(
     (cmsg_len as u64, false)
 }
 
-pub(super) fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
+pub(super) fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let mut hdr = [0u8; MSGHDR_SIZE];
     if frame::user::copy_from_user(msg, &mut hdr).is_err() {
         return EFAULT;
@@ -390,9 +397,10 @@ pub(super) fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
     };
     let cap = total.min(READ_BUF_MAX);
     let mut tmp = alloc::vec![0u8; cap];
-    let (read, fds) = match file.inode.read_with_fds(&mut tmp) {
+    let nonblock = fd_is_nonblock(fd as i32) || flags & MSG_DONTWAIT != 0;
+    let (read, fds) = match file.inode.read_with_fds(&mut tmp, nonblock) {
         Ok(r) => r,
-        Err(e) => return e.errno(),
+        Err(e) => return e.as_neg_i64(),
     };
     let mut off = 0usize;
     for (base, len) in &vecs {
@@ -415,7 +423,7 @@ pub(super) fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
     read as i64
 }
 
-pub(super) fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
+pub(super) fn sys_sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     let mut hdr = [0u8; MSGHDR_SIZE];
     if frame::user::copy_from_user(msg, &mut hdr).is_err() {
         return EFAULT;
@@ -455,19 +463,20 @@ pub(super) fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> i64 {
         }
         off += take;
     }
+    let nonblock = fd_is_nonblock(fd as i32) || flags & MSG_DONTWAIT != 0;
     let r = if fds.is_empty() {
-        let wf = if fd_is_nonblock(fd as i32) {
+        let wf = if nonblock {
             OpenFlags::NONBLOCK
         } else {
             OpenFlags::empty()
         };
         file.inode.write_at_with_flags(0, &tmp[..off], wf)
     } else {
-        file.inode.write_with_fds(&tmp[..off], fds)
+        file.inode.write_with_fds(&tmp[..off], fds, nonblock)
     };
     match r {
         Ok(w) => w as i64,
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 

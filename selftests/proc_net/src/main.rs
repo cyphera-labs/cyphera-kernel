@@ -18,6 +18,7 @@ const AF_NETLINK: u64 = 16;
 const RTM_GETADDR: u16 = 22;
 const EINPROGRESS: i64 = -115;
 const EAGAIN: i64 = -11;
+const ESOCKTNOSUPPORT: i64 = -94;
 
 const EPOLL_CTL_ADD: u64 = 1;
 const EPOLLIN: u32 = 0x001;
@@ -53,6 +54,44 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1);
     }
     log("AF_UNIX socketpair OK\n");
+
+    let mut dg = [0i32; 2];
+    if sys_socketpair(AF_UNIX, SOCK_DGRAM, 0, dg.as_mut_ptr() as *mut u8) != 0 {
+        log("dgram socketpair failed\n");
+        sys_exit(1);
+    }
+    sys_write(dg[0] as u64, b"AAA".as_ptr(), 3);
+    sys_write(dg[0] as u64, b"BB".as_ptr(), 2);
+    let mut m = [0u8; 16];
+    if sys_read(dg[1] as u64, m.as_mut_ptr(), m.len()) != 3 || &m[..3] != b"AAA" {
+        log("dgram boundary: first message not 3 bytes AAA\n");
+        sys_exit(1);
+    }
+    if sys_read(dg[1] as u64, m.as_mut_ptr(), m.len()) != 2 || &m[..2] != b"BB" {
+        log("dgram boundary: second message not 2 bytes BB\n");
+        sys_exit(1);
+    }
+    sys_write(dg[0] as u64, b"HELLO".as_ptr(), 5);
+    sys_write(dg[0] as u64, b"XY".as_ptr(), 2);
+    let mut small = [0u8; 3];
+    if sys_read(dg[1] as u64, small.as_mut_ptr(), small.len()) != 3 || &small != b"HEL" {
+        log("dgram truncate: short read not 3 bytes HEL\n");
+        sys_exit(1);
+    }
+    if sys_read(dg[1] as u64, m.as_mut_ptr(), m.len()) != 2 || &m[..2] != b"XY" {
+        log("dgram truncate: leftover leaked instead of next message XY\n");
+        sys_exit(1);
+    }
+    sys_close(dg[0] as u64);
+    sys_close(dg[1] as u64);
+    log("AF_UNIX dgram socketpair boundaries + truncation OK\n");
+
+    let mut bad = [0i32; 2];
+    if sys_socketpair(AF_UNIX, 999, 0, bad.as_mut_ptr() as *mut u8) != ESOCKTNOSUPPORT {
+        log("socketpair unknown type should ESOCKTNOSUPPORT\n");
+        sys_exit(1);
+    }
+    log("AF_UNIX socketpair unknown-type reject OK\n");
 
     let mut nb = [0i32; 2];
     if sys_socketpair(

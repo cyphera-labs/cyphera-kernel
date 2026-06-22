@@ -4,6 +4,12 @@ syscall_entry:
     mov %rsp, %gs:0x8
     mov %gs:0x0, %rsp
 
+    # TrapFrame trailing rcx/r11 slots: SYSCALL overwrites the user rcx/r11
+    # (return rip/rflags), so there are no user values to record here; push
+    # zeroes to size the stack frame to the full TrapFrame. Discarded by the
+    # %gs:0x8 rsp reload on the return path.
+    pushq $0
+    pushq $0
     push %rax
     push %r15
     push %r14

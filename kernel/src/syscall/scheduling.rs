@@ -1,5 +1,5 @@
+use crate::core as sched;
 use crate::errno::{EFAULT, EINVAL, EPERM, ESRCH};
-use crate::sched;
 use frame::user::TrapFrame;
 
 pub(super) fn sys_rseq(rseq_ptr: u64, rseq_len: u64, flags: u64, sig: u64) -> i64 {
@@ -105,10 +105,10 @@ pub(super) fn sys_setpriority(which: u64, who: u64, niceval: u64) -> i64 {
         }
     };
     let cur_nice = sched::scheduling::nice(target_host).unwrap_or(0);
-    if clamped < cur_nice && !crate::security::capable(crate::process::CAP_SYS_NICE) {
+    if clamped < cur_nice && !crate::security::capable(crate::process_model::CAP_SYS_NICE) {
         return EPERM;
     }
-    sched::scheduling::set_nice(target_host, clamped);
+    sched::params::set_nice(target_host, clamped);
     0
 }
 
@@ -142,7 +142,7 @@ pub(super) fn sys_sched_setscheduler(pid: u64, policy: u64, param: u64) -> i64 {
             if !(1..=99).contains(&priority) {
                 return EINVAL;
             }
-            crate::process::SchedClass::Rt {
+            crate::process_model::SchedClass::Rt {
                 priority: priority as u8,
                 round_robin: false,
             }
@@ -151,7 +151,7 @@ pub(super) fn sys_sched_setscheduler(pid: u64, policy: u64, param: u64) -> i64 {
             if !(1..=99).contains(&priority) {
                 return EINVAL;
             }
-            crate::process::SchedClass::Rt {
+            crate::process_model::SchedClass::Rt {
                 priority: priority as u8,
                 round_robin: true,
             }
@@ -160,20 +160,22 @@ pub(super) fn sys_sched_setscheduler(pid: u64, policy: u64, param: u64) -> i64 {
             if priority != 0 {
                 return EINVAL;
             }
-            crate::process::SchedClass::Cfs
+            crate::process_model::SchedClass::Cfs
         }
         _ => return EINVAL,
     };
 
-    if matches!(new_class, crate::process::SchedClass::Rt { .. }) {
-        let allowed =
-            crate::security::target_capable(sched::current_pid(), crate::process::CAP_SYS_NICE);
+    if matches!(new_class, crate::process_model::SchedClass::Rt { .. }) {
+        let allowed = crate::security::target_capable(
+            sched::current_pid(),
+            crate::process_model::CAP_SYS_NICE,
+        );
         if !allowed {
             return EPERM;
         }
     }
 
-    match sched::set_sched_class(target, new_class) {
+    match sched::params::set_class(target, new_class) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -190,15 +192,15 @@ pub(super) fn sys_sched_getscheduler(pid: u64) -> i64 {
     };
     sched::scheduling::sched_class(target)
         .map(|c| match c {
-            crate::process::SchedClass::Cfs => SCHED_OTHER as i64,
-            crate::process::SchedClass::Rt { round_robin, .. } => {
+            crate::process_model::SchedClass::Cfs => SCHED_OTHER as i64,
+            crate::process_model::SchedClass::Rt { round_robin, .. } => {
                 if round_robin {
                     SCHED_RR as i64
                 } else {
                     SCHED_FIFO as i64
                 }
             }
-            crate::process::SchedClass::Deadline { .. } => SCHED_DEADLINE as i64,
+            crate::process_model::SchedClass::Deadline { .. } => SCHED_DEADLINE as i64,
         })
         .unwrap_or(ESRCH)
 }
@@ -225,29 +227,29 @@ pub(super) fn sys_sched_setparam(pid: u64, param: u64) -> i64 {
         None => return ESRCH,
     };
     let new_class = match cur_class {
-        crate::process::SchedClass::Rt { round_robin, .. } => {
+        crate::process_model::SchedClass::Rt { round_robin, .. } => {
             if !(1..=99).contains(&priority) {
                 return EINVAL;
             }
-            crate::process::SchedClass::Rt {
+            crate::process_model::SchedClass::Rt {
                 priority: priority as u8,
                 round_robin,
             }
         }
-        crate::process::SchedClass::Cfs => {
+        crate::process_model::SchedClass::Cfs => {
             if priority != 0 {
                 return EINVAL;
             }
             return 0;
         }
-        crate::process::SchedClass::Deadline { .. } => return EINVAL,
+        crate::process_model::SchedClass::Deadline { .. } => return EINVAL,
     };
     let allowed =
-        crate::security::target_capable(sched::current_pid(), crate::process::CAP_SYS_NICE);
+        crate::security::target_capable(sched::current_pid(), crate::process_model::CAP_SYS_NICE);
     if !allowed {
         return EPERM;
     }
-    match sched::set_sched_class(target, new_class) {
+    match sched::params::set_class(target, new_class) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -266,7 +268,7 @@ pub(super) fn sys_sched_getparam(pid: u64, param: u64) -> i64 {
         }
     };
     let priority = match sched::scheduling::sched_class(target) {
-        Some(crate::process::SchedClass::Rt { priority, .. }) => priority as i32,
+        Some(crate::process_model::SchedClass::Rt { priority, .. }) => priority as i32,
         Some(_) => 0,
         None => return ESRCH,
     };
@@ -337,12 +339,14 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
         if runtime > deadline || deadline > period {
             return EINVAL;
         }
-        let allowed =
-            crate::security::target_capable(sched::current_pid(), crate::process::CAP_SYS_NICE);
+        let allowed = crate::security::target_capable(
+            sched::current_pid(),
+            crate::process_model::CAP_SYS_NICE,
+        );
         if !allowed {
             return EPERM;
         }
-        return sched::set_deadline_class(target, runtime, deadline, period)
+        return sched::params::set_deadline(target, runtime, deadline, period)
             .map(|_| 0)
             .unwrap_or_else(|e| e);
     }
@@ -355,18 +359,20 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
             if policy == 0 {
                 let clamped = (nice as i8).clamp(-20, 19);
                 let cur_nice = sched::scheduling::nice(target).unwrap_or(0);
-                if clamped < cur_nice && !crate::security::capable(crate::process::CAP_SYS_NICE) {
+                if clamped < cur_nice
+                    && !crate::security::capable(crate::process_model::CAP_SYS_NICE)
+                {
                     return EPERM;
                 }
-                sched::scheduling::set_nice(target, clamped);
+                sched::params::set_nice(target, clamped);
             }
-            crate::process::SchedClass::Cfs
+            crate::process_model::SchedClass::Cfs
         }
         1 => {
             if !(1..=99).contains(&priority) {
                 return EINVAL;
             }
-            crate::process::SchedClass::Rt {
+            crate::process_model::SchedClass::Rt {
                 priority: priority as u8,
                 round_robin: false,
             }
@@ -375,7 +381,7 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
             if !(1..=99).contains(&priority) {
                 return EINVAL;
             }
-            crate::process::SchedClass::Rt {
+            crate::process_model::SchedClass::Rt {
                 priority: priority as u8,
                 round_robin: true,
             }
@@ -383,15 +389,17 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
         _ => return EINVAL,
     };
 
-    if matches!(new_class, crate::process::SchedClass::Rt { .. }) {
-        let allowed =
-            crate::security::target_capable(sched::current_pid(), crate::process::CAP_SYS_NICE);
+    if matches!(new_class, crate::process_model::SchedClass::Rt { .. }) {
+        let allowed = crate::security::target_capable(
+            sched::current_pid(),
+            crate::process_model::CAP_SYS_NICE,
+        );
         if !allowed {
             return EPERM;
         }
     }
 
-    match sched::set_sched_class(target, new_class) {
+    match sched::params::set_class(target, new_class) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -420,15 +428,15 @@ pub(super) fn sys_sched_getattr(pid: u64, attr_ptr: u64, size: u64, _flags: u64)
     let mut buf = [0u8; 48];
     buf[0..4].copy_from_slice(&48u32.to_ne_bytes());
     let (policy, prio, runtime, deadline, period): (u32, u32, u64, u64, u64) = match class {
-        crate::process::SchedClass::Cfs => (0, 0, 0, 0, 0),
-        crate::process::SchedClass::Rt {
+        crate::process_model::SchedClass::Cfs => (0, 0, 0, 0, 0),
+        crate::process_model::SchedClass::Rt {
             priority,
             round_robin,
         } => {
             let pol = if round_robin { 2 } else { 1 };
             (pol, priority as u32, 0, 0, 0)
         }
-        crate::process::SchedClass::Deadline {
+        crate::process_model::SchedClass::Deadline {
             runtime_ns,
             deadline_ns,
             period_ns,
@@ -460,7 +468,7 @@ pub(super) fn sys_sched_rr_get_interval(pid: u64, ts_ptr: u64) -> i64 {
     };
     let is_rr = matches!(
         sched::scheduling::sched_class(target),
-        Some(crate::process::SchedClass::Rt {
+        Some(crate::process_model::SchedClass::Rt {
             round_robin: true,
             ..
         })
@@ -479,7 +487,7 @@ pub(super) fn sys_sched_rr_get_interval(pid: u64, ts_ptr: u64) -> i64 {
     0
 }
 
-fn resolve_affinity_pid(pid: u64) -> Option<crate::process::Pid> {
+fn resolve_affinity_pid(pid: u64) -> Option<crate::process_model::Pid> {
     if pid == 0 {
         Some(sched::current_pid())
     } else {
@@ -505,7 +513,7 @@ pub(super) fn sys_sched_setaffinity(
         return EFAULT;
     }
     let want = u64::from_le_bytes(buf);
-    let online = frame::arch::x86_64::smp::online_mask();
+    let online = frame::cpu::online_mask();
     if want & online == 0 {
         return EINVAL;
     }
@@ -520,11 +528,13 @@ pub(super) fn sys_sched_setaffinity(
             Some(u) => u,
             None => return ESRCH,
         };
-        if !crate::security::has_cap(crate::process::CAP_SYS_NICE) && caller_euid != target_euid {
+        if !crate::security::has_cap(crate::process_model::CAP_SYS_NICE)
+            && caller_euid != target_euid
+        {
             return EPERM;
         }
     }
-    if !sched::set_cpu_affinity(target, want) {
+    if !sched::params::set_affinity(target, want) {
         return ESRCH;
     }
     if target == me {
@@ -552,7 +562,7 @@ pub(super) fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> i64
         Some(p) => p,
         None => return ESRCH,
     };
-    let online = frame::arch::x86_64::smp::online_mask();
+    let online = frame::cpu::online_mask();
     let eff = match sched::cpu_affinity(target) {
         Some(m) => m & online,
         None => return ESRCH,

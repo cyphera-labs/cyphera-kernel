@@ -12,55 +12,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(host_test))]
 use frame::sync::SpinIrq;
 
-#[cfg(not(host_test))]
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, OpenFlags, Stat, TimeSpec};
-
-#[derive(Debug, Clone, Copy)]
-pub enum Ext4Error {
-    BadMagic,
-    BadSuperblock,
-    UnsupportedFeature,
-    NeedsRecovery,
-    BadInode,
-    Io,
-    NoSpace,
-    Hole,
-    NotDir,
-    NotFile,
-    NotEmpty,
-    NotFound,
-    Exists,
-    InvalidName,
-    InvalidLink,
-}
+use cyphera_kapi::{Errno, KResult};
 
 #[cfg(not(host_test))]
-impl From<Ext4Error> for FsError {
-    fn from(e: Ext4Error) -> Self {
-        match e {
-            Ext4Error::BadMagic
-            | Ext4Error::BadSuperblock
-            | Ext4Error::UnsupportedFeature
-            | Ext4Error::NeedsRecovery
-            | Ext4Error::BadInode
-            | Ext4Error::InvalidLink
-            | Ext4Error::Hole
-            | Ext4Error::Io => FsError::Io,
-            Ext4Error::NoSpace => FsError::NoSpace,
-            Ext4Error::NotDir => FsError::NotDir,
-            Ext4Error::NotFile => FsError::NotFile,
-            Ext4Error::NotEmpty => FsError::NotEmpty,
-            Ext4Error::NotFound => FsError::NotFound,
-            Ext4Error::Exists => FsError::Exists,
-            Ext4Error::InvalidName => FsError::InvalidArgument,
-        }
-    }
-}
+use crate::vfs::{DirEntry, Inode, InodeKind, OpenFlags, Stat, TimeSpec};
 
 #[cfg(not(host_test))]
 pub trait BlockDevice: Send + Sync {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Ext4Error>;
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), Ext4Error>;
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<()>;
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<()>;
     fn capacity_bytes(&self) -> u64;
 }
 
@@ -83,22 +43,22 @@ impl InMemoryDevice {
 
 #[cfg(not(host_test))]
 impl BlockDevice for InMemoryDevice {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Ext4Error> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<()> {
         let g = self.bytes.lock();
         let start = offset as usize;
-        let end = start.checked_add(buf.len()).ok_or(Ext4Error::Io)?;
+        let end = start.checked_add(buf.len()).ok_or(Errno::IO)?;
         if end > g.len() {
-            return Err(Ext4Error::Io);
+            return Err(Errno::IO);
         }
         buf.copy_from_slice(&g[start..end]);
         Ok(())
     }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), Ext4Error> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<()> {
         let mut g = self.bytes.lock();
         let start = offset as usize;
-        let end = start.checked_add(buf.len()).ok_or(Ext4Error::Io)?;
+        let end = start.checked_add(buf.len()).ok_or(Errno::IO)?;
         if end > g.len() {
-            return Err(Ext4Error::Io);
+            return Err(Errno::IO);
         }
         g[start..end].copy_from_slice(buf);
         Ok(())
@@ -125,39 +85,39 @@ impl VirtioBlockDevice {
 
 #[cfg(not(host_test))]
 impl BlockDevice for VirtioBlockDevice {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Ext4Error> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
         offset
             .checked_add(buf.len() as u64)
             .filter(|&end| end <= self.cap)
-            .ok_or(Ext4Error::Io)?;
+            .ok_or(Errno::IO)?;
         let first = offset / 512;
         let last = (offset + buf.len() as u64 - 1) / 512;
         let nsec = (last - first + 1) as usize;
         let mut tmp = alloc::vec![0u8; nsec * 512];
-        crate::io::block_read(first, &mut tmp).map_err(|_| Ext4Error::Io)?;
+        crate::io::block_read(first, &mut tmp).map_err(|_| Errno::IO)?;
         let start = (offset - first * 512) as usize;
         buf.copy_from_slice(&tmp[start..start + buf.len()]);
         Ok(())
     }
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), Ext4Error> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
         offset
             .checked_add(buf.len() as u64)
             .filter(|&end| end <= self.cap)
-            .ok_or(Ext4Error::Io)?;
+            .ok_or(Errno::IO)?;
         let first = offset / 512;
         let last = (offset + buf.len() as u64 - 1) / 512;
         let nsec = (last - first + 1) as usize;
         let mut tmp = alloc::vec![0u8; nsec * 512];
-        crate::io::block_read(first, &mut tmp).map_err(|_| Ext4Error::Io)?;
+        crate::io::block_read(first, &mut tmp).map_err(|_| Errno::IO)?;
         let start = (offset - first * 512) as usize;
         tmp[start..start + buf.len()].copy_from_slice(buf);
-        crate::io::block_write(first, &tmp).map_err(|_| Ext4Error::Io)
+        crate::io::block_write(first, &tmp).map_err(|_| Errno::IO)
     }
     fn capacity_bytes(&self) -> u64 {
         self.cap
@@ -166,8 +126,6 @@ impl BlockDevice for VirtioBlockDevice {
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_ROOT_INO: u32 = 2;
-
-const EXT4_VALID_FS: u16 = 0x0001;
 
 const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
@@ -241,13 +199,13 @@ struct Superblock {
 }
 
 impl Superblock {
-    fn parse(buf: &[u8]) -> Result<Self, Ext4Error> {
+    fn parse(buf: &[u8]) -> KResult<Self> {
         if buf.len() < 1024 {
-            return Err(Ext4Error::BadMagic);
+            return Err(Errno::INVAL);
         }
         let magic = u16::from_le_bytes([buf[56], buf[57]]);
         if magic != EXT4_MAGIC {
-            return Err(Ext4Error::BadMagic);
+            return Err(Errno::INVAL);
         }
         let inodes_count = read_u32(buf, 0);
         let blocks_count_lo = read_u32(buf, 4);
@@ -275,10 +233,10 @@ impl Superblock {
         };
         let blocks_count = ((blocks_count_hi as u64) << 32) | blocks_count_lo as u64;
         if log_block_size > 6 {
-            return Err(Ext4Error::BadSuperblock);
+            return Err(Errno::INVAL);
         }
         if blocks_per_group == 0 || inodes_per_group == 0 {
-            return Err(Ext4Error::BadSuperblock);
+            return Err(Errno::INVAL);
         }
         let block_size: u32 = 1024u32 << log_block_size;
 
@@ -533,13 +491,13 @@ struct ExtentHeader {
 }
 
 impl ExtentHeader {
-    fn parse(buf: &[u8]) -> Result<Self, Ext4Error> {
+    fn parse(buf: &[u8]) -> KResult<Self> {
         if buf.len() < 12 {
-            return Err(Ext4Error::BadInode);
+            return Err(Errno::INVAL);
         }
         let magic = u16::from_le_bytes([buf[0], buf[1]]);
         if magic != EXT4_EXT_MAGIC {
-            return Err(Ext4Error::BadInode);
+            return Err(Errno::INVAL);
         }
         Ok(ExtentHeader {
             magic,
@@ -704,14 +662,14 @@ pub struct Ext4Fs {
 
 #[cfg(not(host_test))]
 impl Ext4Fs {
-    pub fn mount(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>, Ext4Error> {
+    pub fn mount(device: Arc<dyn BlockDevice>) -> KResult<Arc<Self>> {
         let mut sb_buf = [0u8; 1024];
         device.read_at(1024, &mut sb_buf)?;
         let sb = Superblock::parse(&sb_buf)?;
 
         let unsupported = sb.feature_incompat & !FEATURE_INCOMPAT_SUPPORTED;
         if unsupported & FEATURE_INCOMPAT_RECOVER != 0 {
-            return Err(Ext4Error::NeedsRecovery);
+            return Err(Errno::INVAL);
         }
         if unsupported
             & (FEATURE_INCOMPAT_ENCRYPT
@@ -721,14 +679,11 @@ impl Ext4Fs {
                 | FEATURE_INCOMPAT_JOURNAL_DEV)
             != 0
         {
-            return Err(Ext4Error::UnsupportedFeature);
+            return Err(Errno::INVAL);
         }
 
         if sb.feature_ro_compat & !FEATURE_RO_COMPAT_SUPPORTED != 0 {
-            return Err(Ext4Error::UnsupportedFeature);
-        }
-
-        if sb.state & EXT4_VALID_FS == 0 {
+            return Err(Errno::INVAL);
         }
 
         let block_size = sb.block_size;
@@ -777,31 +732,28 @@ impl Ext4Fs {
         Arc::new(Ext4Inode::new(self.clone(), EXT4_ROOT_INO))
     }
 
-    fn read_block(&self, phys: u64) -> Result<Vec<u8>, Ext4Error> {
+    fn read_block(&self, phys: u64) -> KResult<Vec<u8>> {
         let mut buf = alloc::vec![0u8; self.block_size as usize];
         self.device
             .read_at(phys * self.block_size as u64, &mut buf)?;
         Ok(buf)
     }
 
-    fn write_block(&self, phys: u64, data: &[u8]) -> Result<(), Ext4Error> {
+    fn write_block(&self, phys: u64, data: &[u8]) -> KResult<()> {
         if data.len() != self.block_size as usize {
-            return Err(Ext4Error::Io);
+            return Err(Errno::IO);
         }
         self.device.write_at(phys * self.block_size as u64, data)
     }
 
-    fn read_inode(&self, ino: u32) -> Result<RawInode, Ext4Error> {
+    fn read_inode(&self, ino: u32) -> KResult<RawInode> {
         if ino == 0 {
-            return Err(Ext4Error::BadInode);
+            return Err(Errno::INVAL);
         }
         let group = (ino - 1) / self.inodes_per_group;
         let index_in_group = (ino - 1) % self.inodes_per_group;
         let bgds = self.bgds.lock();
-        let bgd = bgds
-            .get(group as usize)
-            .copied()
-            .ok_or(Ext4Error::BadInode)?;
+        let bgd = bgds.get(group as usize).copied().ok_or(Errno::INVAL)?;
         drop(bgds);
         let table_start_byte = bgd.inode_table * self.block_size as u64;
         let inode_byte = table_start_byte + (index_in_group as u64) * (self.inode_size as u64);
@@ -810,17 +762,14 @@ impl Ext4Fs {
         Ok(RawInode::parse(&buf))
     }
 
-    fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Ext4Error> {
+    fn write_inode(&self, ino: u32, raw: &RawInode) -> KResult<()> {
         if ino == 0 {
-            return Err(Ext4Error::BadInode);
+            return Err(Errno::INVAL);
         }
         let group = (ino - 1) / self.inodes_per_group;
         let index_in_group = (ino - 1) % self.inodes_per_group;
         let bgds = self.bgds.lock();
-        let bgd = bgds
-            .get(group as usize)
-            .copied()
-            .ok_or(Ext4Error::BadInode)?;
+        let bgd = bgds.get(group as usize).copied().ok_or(Errno::INVAL)?;
         drop(bgds);
         let table_start_byte = bgd.inode_table * self.block_size as u64;
         let inode_byte = table_start_byte + (index_in_group as u64) * (self.inode_size as u64);
@@ -830,9 +779,9 @@ impl Ext4Fs {
         self.device.write_at(inode_byte, &buf)
     }
 
-    fn resolve_block(&self, raw: &RawInode, logical: u64) -> Result<Option<u64>, Ext4Error> {
+    fn resolve_block(&self, raw: &RawInode, logical: u64) -> KResult<Option<u64>> {
         if !raw.has_extents() {
-            return Err(Ext4Error::UnsupportedFeature);
+            return Err(Errno::INVAL);
         }
         let header = ExtentHeader::parse(&raw.i_block[..])?;
         self.walk_extents(&raw.i_block[..], header, logical)
@@ -843,7 +792,7 @@ impl Ext4Fs {
         node_buf: &[u8],
         header: ExtentHeader,
         logical: u64,
-    ) -> Result<Option<u64>, Ext4Error> {
+    ) -> KResult<Option<u64>> {
         let entries = header.entries as usize;
         if header.depth == 0 {
             for i in 0..entries {
@@ -865,14 +814,14 @@ impl Ext4Fs {
                     chosen = Some(idx);
                 }
             }
-            let idx = chosen.ok_or(Ext4Error::Hole)?;
+            let idx = chosen.ok_or(Errno::IO)?;
             let leaf = self.read_block(idx.leaf_phys())?;
             let leaf_header = ExtentHeader::parse(&leaf)?;
             self.walk_extents(&leaf, leaf_header, logical)
         }
     }
 
-    fn alloc_block(&self) -> Result<u64, Ext4Error> {
+    fn alloc_block(&self) -> KResult<u64> {
         let mut bgds = self.bgds.lock();
         for (group_idx, bgd) in bgds.iter_mut().enumerate() {
             if bgd.free_blocks_count == 0 {
@@ -903,10 +852,10 @@ impl Ext4Fs {
                 return Ok(block_no);
             }
         }
-        Err(Ext4Error::NoSpace)
+        Err(Errno::NOSPC)
     }
 
-    fn persist_bgd(&self, group_idx: usize, bgd: &Bgd) -> Result<(), Ext4Error> {
+    fn persist_bgd(&self, group_idx: usize, bgd: &Bgd) -> KResult<()> {
         let sb = self.sb.lock();
         let block_size = sb.block_size;
         let desc_size = sb.desc_size;
@@ -920,12 +869,12 @@ impl Ext4Fs {
         self.device.write_at(off, &buf)
     }
 
-    fn free_block(&self, phys: u64) -> Result<(), Ext4Error> {
+    fn free_block(&self, phys: u64) -> KResult<()> {
         let rel = phys.saturating_sub(self.first_data_block);
         let group_idx = (rel / self.blocks_per_group as u64) as usize;
         let bit_in_group = (rel % self.blocks_per_group as u64) as usize;
         let mut bgds = self.bgds.lock();
-        let bgd = bgds.get_mut(group_idx).ok_or(Ext4Error::Io)?;
+        let bgd = bgds.get_mut(group_idx).ok_or(Errno::IO)?;
         let mut bitmap = alloc::vec![0u8; self.block_size as usize];
         self.device
             .read_at(bgd.block_bitmap * self.block_size as u64, &mut bitmap)?;
@@ -938,7 +887,7 @@ impl Ext4Fs {
         self.persist_bgd(group_idx, &bgd_copy)
     }
 
-    fn alloc_inode(&self, kind: InodeKind) -> Result<u32, Ext4Error> {
+    fn alloc_inode(&self, kind: InodeKind) -> KResult<u32> {
         let mut bgds = self.bgds.lock();
         for (group_idx, bgd) in bgds.iter_mut().enumerate() {
             if bgd.free_inodes_count == 0 {
@@ -969,7 +918,7 @@ impl Ext4Fs {
                 return Ok(ino);
             }
         }
-        Err(Ext4Error::NoSpace)
+        Err(Errno::NOSPC)
     }
 }
 
@@ -985,15 +934,15 @@ impl Ext4Inode {
         Self { fs, ino }
     }
 
-    fn raw(&self) -> Result<RawInode, Ext4Error> {
+    fn raw(&self) -> KResult<RawInode> {
         self.fs.read_inode(self.ino)
     }
 
-    fn write_raw(&self, raw: &RawInode) -> Result<(), Ext4Error> {
+    fn write_raw(&self, raw: &RawInode) -> KResult<()> {
         self.fs.write_inode(self.ino, raw)
     }
 
-    fn read_data(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Ext4Error> {
+    fn read_data(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let raw = self.raw()?;
         let size = raw.size();
         if offset >= size {
@@ -1027,13 +976,7 @@ impl Ext4Inode {
         Ok(written)
     }
 
-    fn append_extent(
-        &self,
-        raw: &mut RawInode,
-        logical: u32,
-        phys: u64,
-        len: u16,
-    ) -> Result<(), Ext4Error> {
+    fn append_extent(&self, raw: &mut RawInode, logical: u32, phys: u64, len: u16) -> KResult<()> {
         let header = ExtentHeader::parse(&raw.i_block[..])?;
         let new_ext = Extent {
             block: logical,
@@ -1093,7 +1036,7 @@ impl Ext4Inode {
         let last = leaf_exts.last().unwrap();
         let leaf_end = last.block as u64 + last.real_len() as u64;
         if idxs.len() >= 4 {
-            return Err(Ext4Error::NoSpace);
+            return Err(Errno::NOSPC);
         }
         if (logical as u64) >= leaf_end {
             let new_leaf_phys = self.fs.alloc_block()?;
@@ -1132,7 +1075,7 @@ impl Ext4Inode {
         Ok(())
     }
 
-    fn write_data(&self, offset: u64, buf: &[u8]) -> Result<usize, Ext4Error> {
+    fn write_data(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
         let mut raw = self.raw()?;
         let bs = self.fs.block_size as u64;
         let mut written = 0usize;
@@ -1192,7 +1135,7 @@ impl Ext4Inode {
         kept
     }
 
-    fn truncate_to(&self, len: u64) -> Result<(), Ext4Error> {
+    fn truncate_to(&self, len: u64) -> KResult<()> {
         let mut raw = self.raw()?;
         let bs = self.fs.block_size as u64;
         let max_leaf = ((self.fs.block_size as usize - 12) / 12) as u16;
@@ -1236,10 +1179,10 @@ impl Ext4Inode {
         self.write_raw(&raw)
     }
 
-    fn read_dir_entries(&self) -> Result<Vec<RawDirent>, Ext4Error> {
+    fn read_dir_entries(&self) -> KResult<Vec<RawDirent>> {
         let raw = self.raw()?;
         if raw.kind() != InodeKind::Directory {
-            return Err(Ext4Error::NotDir);
+            return Err(Errno::NOTDIR);
         }
         let size = raw.size();
         let mut data = alloc::vec![0u8; size as usize];
@@ -1372,16 +1315,16 @@ impl Inode for Ext4Inode {
         }
     }
 
-    fn set_mode(&self, mode: u16) -> Result<(), FsError> {
-        let mut raw = self.raw().map_err(FsError::from)?;
+    fn set_mode(&self, mode: u16) -> KResult<()> {
+        let mut raw = self.raw()?;
         raw.i_mode = (raw.i_mode & 0xF000) | (mode & 0o7777);
         let now = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         raw.i_ctime = now;
-        self.write_raw(&raw).map_err(FsError::from)
+        self.write_raw(&raw)
     }
 
-    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
-        let mut raw = self.raw().map_err(FsError::from)?;
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> KResult<()> {
+        let mut raw = self.raw()?;
         if let Some(u) = uid {
             raw.i_uid_lo = u as u16;
             raw.i_uid_hi = (u >> 16) as u16;
@@ -1392,11 +1335,11 @@ impl Inode for Ext4Inode {
         }
         let now = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         raw.i_ctime = now;
-        self.write_raw(&raw).map_err(FsError::from)
+        self.write_raw(&raw)
     }
 
-    fn set_times(&self, atime: Option<TimeSpec>, mtime: Option<TimeSpec>) -> Result<(), FsError> {
-        let mut raw = self.raw().map_err(FsError::from)?;
+    fn set_times(&self, atime: Option<TimeSpec>, mtime: Option<TimeSpec>) -> KResult<()> {
+        let mut raw = self.raw()?;
         if let Some(a) = atime {
             raw.i_atime = a.sec as u32;
         }
@@ -1405,13 +1348,13 @@ impl Inode for Ext4Inode {
         }
         let now = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         raw.i_ctime = now;
-        self.write_raw(&raw).map_err(FsError::from)
+        self.write_raw(&raw)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let raw = self.raw().map_err(FsError::from)?;
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let raw = self.raw()?;
         if raw.kind() != InodeKind::Regular {
-            return Err(FsError::NotFile);
+            return Err(Errno::ISDIR);
         }
         let id = self.inode_id();
         let mut total = 0usize;
@@ -1434,7 +1377,7 @@ impl Inode for Ext4Inode {
                 continue;
             }
             let mut page = alloc::vec![0u8; 4096];
-            let got = self.read_data(page_off, &mut page).map_err(FsError::from)?;
+            let got = self.read_data(page_off, &mut page)?;
             if got == 0 {
                 break;
             }
@@ -1453,37 +1396,37 @@ impl Inode for Ext4Inode {
         Ok(total)
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let raw = self.raw().map_err(FsError::from)?;
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
+        let raw = self.raw()?;
         if raw.kind() != InodeKind::Regular {
-            return Err(FsError::NotFile);
+            return Err(Errno::ISDIR);
         }
-        let n = self.write_data(offset, buf).map_err(FsError::from)?;
+        let n = self.write_data(offset, buf)?;
         crate::fs::pagecache::write_through(self.inode_id(), offset, &buf[..n]);
         Ok(n)
     }
 
-    fn truncate(&self, len: u64) -> Result<(), FsError> {
-        let raw = self.raw().map_err(FsError::from)?;
+    fn truncate(&self, len: u64) -> KResult<()> {
+        let raw = self.raw()?;
         if raw.kind() != InodeKind::Regular {
-            return Err(FsError::NotFile);
+            return Err(Errno::ISDIR);
         }
         crate::fs::pagecache::invalidate_range(self.inode_id(), len, u64::MAX);
-        self.truncate_to(len).map_err(FsError::from)
+        self.truncate_to(len)
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let entries = self.read_dir_entries().map_err(FsError::from)?;
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
+        let entries = self.read_dir_entries()?;
         for e in &entries {
             if e.name == name.as_bytes() {
                 return Ok(Arc::new(Ext4Inode::new(self.fs.clone(), e.inode)));
             }
         }
-        Err(FsError::NotFound)
+        Err(Errno::NOENT)
     }
 
-    fn create(&self, name: &str, kind: InodeKind) -> Result<Arc<dyn Inode>, FsError> {
-        let new_ino = self.fs.alloc_inode(kind).map_err(FsError::from)?;
+    fn create(&self, name: &str, kind: InodeKind) -> KResult<Arc<dyn Inode>> {
+        let new_ino = self.fs.alloc_inode(kind)?;
         let mode_bits = match kind {
             InodeKind::Regular => I_MODE_FILE | 0o644,
             InodeKind::Directory => I_MODE_DIR | 0o755,
@@ -1523,7 +1466,7 @@ impl Inode for Ext4Inode {
         header.write(&mut new_raw.i_block[..12]);
 
         if kind == InodeKind::Directory {
-            let block = self.fs.alloc_block().map_err(FsError::from)?;
+            let block = self.fs.alloc_block()?;
             let mut blk = alloc::vec![0u8; self.fs.block_size as usize];
             write_u32(&mut blk, 0, new_ino);
             blk[4..6].copy_from_slice(&12u16.to_le_bytes());
@@ -1537,30 +1480,26 @@ impl Inode for Ext4Inode {
             blk[19] = FT_DIR;
             blk[20] = b'.';
             blk[21] = b'.';
-            self.fs.write_block(block, &blk).map_err(FsError::from)?;
+            self.fs.write_block(block, &blk)?;
 
-            self.append_extent(&mut new_raw, 0, block, 1)
-                .map_err(FsError::from)?;
+            self.append_extent(&mut new_raw, 0, block, 1)?;
             new_raw.set_size(self.fs.block_size as u64);
         }
-        self.fs
-            .write_inode(new_ino, &new_raw)
-            .map_err(FsError::from)?;
+        self.fs.write_inode(new_ino, &new_raw)?;
 
-        self.dir_add_entry(name, new_ino, ft_for_kind(kind))
-            .map_err(FsError::from)?;
+        self.dir_add_entry(name, new_ino, ft_for_kind(kind))?;
 
         if kind == InodeKind::Directory {
-            let mut self_raw = self.raw().map_err(FsError::from)?;
+            let mut self_raw = self.raw()?;
             self_raw.i_links_count += 1;
-            self.write_raw(&self_raw).map_err(FsError::from)?;
+            self.write_raw(&self_raw)?;
         }
 
         Ok(Arc::new(Ext4Inode::new(self.fs.clone(), new_ino)))
     }
 
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
-        let entries = self.read_dir_entries().map_err(FsError::from)?;
+    fn list(&self) -> KResult<Vec<DirEntry>> {
+        let entries = self.read_dir_entries()?;
         let mut out = Vec::new();
         for e in &entries {
             if e.name == b"." || e.name == b".." {
@@ -1584,8 +1523,8 @@ impl Inode for Ext4Inode {
         Ok(out)
     }
 
-    fn unlink(&self, name: &str) -> Result<(), FsError> {
-        let entries = self.read_dir_entries().map_err(FsError::from)?;
+    fn unlink(&self, name: &str) -> KResult<()> {
+        let entries = self.read_dir_entries()?;
         let mut found_ino: Option<u32> = None;
         for e in &entries {
             if e.name == name.as_bytes() {
@@ -1593,38 +1532,34 @@ impl Inode for Ext4Inode {
                 break;
             }
         }
-        let ino = found_ino.ok_or(FsError::NotFound)?;
-        self.dir_remove_entry(name).map_err(FsError::from)?;
+        let ino = found_ino.ok_or(Errno::NOENT)?;
+        self.dir_remove_entry(name)?;
         let target = Ext4Inode::new(self.fs.clone(), ino);
-        let mut traw = target.raw().map_err(FsError::from)?;
+        let mut traw = target.raw()?;
         traw.i_links_count = traw.i_links_count.saturating_sub(1);
         if traw.i_links_count == 0 {
             let _ = target.truncate_to(0);
             traw.i_dtime = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         }
-        target.write_raw(&traw).map_err(FsError::from)?;
+        target.write_raw(&traw)?;
         Ok(())
     }
 
-    fn link(&self, name: &str, target: Arc<dyn Inode>) -> Result<(), FsError> {
+    fn link(&self, name: &str, target: Arc<dyn Inode>) -> KResult<()> {
         if target.kind() == InodeKind::Directory {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
         let target_id = target.inode_id();
         let target_ino = (target_id ^ self.fs.dev_id) as u32;
-        let _ = self.fs.read_inode(target_ino).map_err(FsError::from)?;
+        let _ = self.fs.read_inode(target_ino)?;
         let kind = target.kind();
-        self.dir_add_entry(name, target_ino, ft_for_kind(kind))
-            .map_err(FsError::from)?;
+        self.dir_add_entry(name, target_ino, ft_for_kind(kind))?;
         target.bump_nlink();
         Ok(())
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let new_ino = self
-            .fs
-            .alloc_inode(InodeKind::Symlink)
-            .map_err(FsError::from)?;
+    fn symlink(&self, name: &str, target: &str) -> KResult<Arc<dyn Inode>> {
+        let new_ino = self.fs.alloc_inode(InodeKind::Symlink)?;
         let now = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         let mut raw = RawInode {
             i_mode: I_MODE_LNK | 0o777,
@@ -1658,78 +1593,67 @@ impl Inode for Ext4Inode {
                 generation: 0,
             };
             header.write(&mut raw.i_block[..12]);
-            let block = self.fs.alloc_block().map_err(FsError::from)?;
+            let block = self.fs.alloc_block()?;
             let mut data = alloc::vec![0u8; self.fs.block_size as usize];
             data[..target.len()].copy_from_slice(target.as_bytes());
-            self.fs.write_block(block, &data).map_err(FsError::from)?;
+            self.fs.write_block(block, &data)?;
             let new_inode = Ext4Inode::new(self.fs.clone(), new_ino);
-            new_inode
-                .append_extent(&mut raw, 0, block, 1)
-                .map_err(FsError::from)?;
+            new_inode.append_extent(&mut raw, 0, block, 1)?;
         }
-        self.fs.write_inode(new_ino, &raw).map_err(FsError::from)?;
-        self.dir_add_entry(name, new_ino, FT_LNK)
-            .map_err(FsError::from)?;
+        self.fs.write_inode(new_ino, &raw)?;
+        self.dir_add_entry(name, new_ino, FT_LNK)?;
         Ok(Arc::new(Ext4Inode::new(self.fs.clone(), new_ino)))
     }
 
-    fn read_link(&self) -> Result<String, FsError> {
-        let raw = self.raw().map_err(FsError::from)?;
+    fn read_link(&self) -> KResult<String> {
+        let raw = self.raw()?;
         if raw.kind() != InodeKind::Symlink {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
         let size = raw.size() as usize;
         if size <= 60 && !raw.has_extents() {
-            let s =
-                core::str::from_utf8(&raw.i_block[..size]).map_err(|_| FsError::InvalidArgument)?;
+            let s = core::str::from_utf8(&raw.i_block[..size]).map_err(|_| Errno::INVAL)?;
             return Ok(s.to_string());
         }
         let mut buf = alloc::vec![0u8; size];
-        self.read_data(0, &mut buf).map_err(FsError::from)?;
+        self.read_data(0, &mut buf)?;
         core::str::from_utf8(&buf)
             .map(|s| s.to_string())
-            .map_err(|_| FsError::InvalidArgument)
+            .map_err(|_| Errno::INVAL)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), FsError> {
+    fn rmdir(&self, name: &str) -> KResult<()> {
         let target = self.lookup(name)?;
         if target.kind() != InodeKind::Directory {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         }
         let entries = target.list()?;
         if !entries.is_empty() {
-            return Err(FsError::NotEmpty);
+            return Err(Errno::NOTEMPTY);
         }
-        self.dir_remove_entry(name).map_err(FsError::from)?;
+        self.dir_remove_entry(name)?;
         let target_id = target.inode_id();
         let target_ino = (target_id ^ self.fs.dev_id) as u32;
-        let mut traw = self.fs.read_inode(target_ino).map_err(FsError::from)?;
+        let mut traw = self.fs.read_inode(target_ino)?;
         traw.i_links_count = 0;
         traw.i_dtime = (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as u32;
         let _ = Ext4Inode::new(self.fs.clone(), target_ino).truncate_to(0);
-        self.fs
-            .write_inode(target_ino, &traw)
-            .map_err(FsError::from)?;
-        let mut self_raw = self.raw().map_err(FsError::from)?;
+        self.fs.write_inode(target_ino, &traw)?;
+        let mut self_raw = self.raw()?;
         self_raw.i_links_count = self_raw.i_links_count.saturating_sub(1);
-        self.write_raw(&self_raw).map_err(FsError::from)?;
+        self.write_raw(&self_raw)?;
         Ok(())
     }
 
-    fn mknod(&self, name: &str, kind: InodeKind, _dev: u64) -> Result<Arc<dyn Inode>, FsError> {
+    fn mknod(&self, name: &str, kind: InodeKind, _dev: u64) -> KResult<Arc<dyn Inode>> {
         match kind {
             InodeKind::Regular | InodeKind::CharDevice | InodeKind::Pipe => self.create(name, kind),
-            _ => Err(FsError::InvalidArgument),
+            _ => Err(Errno::INVAL),
         }
     }
 
-    fn rename(
-        &self,
-        old_name: &str,
-        new_parent: &Arc<dyn Inode>,
-        new_name: &str,
-    ) -> Result<(), FsError> {
-        let entries = self.read_dir_entries().map_err(FsError::from)?;
+    fn rename(&self, old_name: &str, new_parent: &Arc<dyn Inode>, new_name: &str) -> KResult<()> {
+        let entries = self.read_dir_entries()?;
         let mut found: Option<(u32, u8)> = None;
         for e in &entries {
             if e.name == old_name.as_bytes() {
@@ -1737,16 +1661,16 @@ impl Inode for Ext4Inode {
                 break;
             }
         }
-        let (ino, ft) = found.ok_or(FsError::NotFound)?;
+        let (ino, ft) = found.ok_or(Errno::NOENT)?;
         let new_target = Ext4Inode::new(self.fs.clone(), ino);
         let new_target_arc: Arc<dyn Inode> = Arc::new(new_target);
         new_parent
             .link(new_name, new_target_arc.clone())
             .or_else(|_| {
                 if Arc::as_ptr(new_parent) as *const () == self as *const _ as *const () {
-                    self.dir_add_entry(new_name, ino, ft).map_err(FsError::from)
+                    self.dir_add_entry(new_name, ino, ft)
                 } else {
-                    Err(FsError::PermissionDenied)
+                    Err(Errno::ACCES)
                 }
             })?;
         if let Ok(mut tr) = self.fs.read_inode(ino) {
@@ -1755,7 +1679,7 @@ impl Inode for Ext4Inode {
                 let _ = self.fs.write_inode(ino, &tr);
             }
         }
-        self.dir_remove_entry(old_name).map_err(FsError::from)?;
+        self.dir_remove_entry(old_name)?;
         Ok(())
     }
 
@@ -1779,7 +1703,7 @@ impl Inode for Ext4Inode {
 
 #[cfg(not(host_test))]
 impl Ext4Inode {
-    fn dir_add_entry(&self, name: &str, ino: u32, ft: u8) -> Result<(), Ext4Error> {
+    fn dir_add_entry(&self, name: &str, ino: u32, ft: u8) -> KResult<()> {
         let raw = self.raw()?;
         let bs = self.fs.block_size as u64;
         let dir_blocks = raw.size() / bs;
@@ -1846,7 +1770,7 @@ impl Ext4Inode {
         self.write_raw(&raw_mut)
     }
 
-    fn dir_remove_entry(&self, name: &str) -> Result<(), Ext4Error> {
+    fn dir_remove_entry(&self, name: &str) -> KResult<()> {
         let raw = self.raw()?;
         let bs = self.fs.block_size as u64;
         let dir_blocks = raw.size() / bs;
@@ -1886,7 +1810,7 @@ impl Ext4Inode {
                 p += rec_len;
             }
         }
-        Err(Ext4Error::NotFound)
+        Err(Errno::NOENT)
     }
 }
 
@@ -1920,10 +1844,7 @@ mod host_tests {
     #[test]
     fn superblock_rejects_short_buffer() {
         let short = alloc::vec![0u8; 100];
-        assert!(matches!(
-            Superblock::parse(&short),
-            Err(Ext4Error::BadMagic)
-        ));
+        assert!(matches!(Superblock::parse(&short), Err(Errno::INVAL)));
     }
 
     #[test]
@@ -1931,7 +1852,7 @@ mod host_tests {
         let mut buf = make_sb(2);
         buf[56] = 0;
         buf[57] = 0;
-        assert!(matches!(Superblock::parse(&buf), Err(Ext4Error::BadMagic)));
+        assert!(matches!(Superblock::parse(&buf), Err(Errno::INVAL)));
     }
 
     #[test]
@@ -1959,20 +1880,14 @@ mod host_tests {
     #[test]
     fn superblock_rejects_oversized_block_size() {
         let buf = make_sb(7);
-        assert!(matches!(
-            Superblock::parse(&buf),
-            Err(Ext4Error::BadSuperblock)
-        ));
+        assert!(matches!(Superblock::parse(&buf), Err(Errno::INVAL)));
     }
 
     #[test]
     fn superblock_rejects_shift_overflow_log_block_size() {
         for lbs in [7u32, 16, 31, 32, 33, 64, 100, u32::MAX] {
             let buf = make_sb(lbs);
-            assert!(matches!(
-                Superblock::parse(&buf),
-                Err(Ext4Error::BadSuperblock)
-            ));
+            assert!(matches!(Superblock::parse(&buf), Err(Errno::INVAL)));
         }
     }
 
@@ -2087,10 +2002,7 @@ mod host_tests {
     #[test]
     fn extent_header_rejects_short_buffer() {
         let short = [0u8; 11];
-        assert!(matches!(
-            ExtentHeader::parse(&short),
-            Err(Ext4Error::BadInode)
-        ));
+        assert!(matches!(ExtentHeader::parse(&short), Err(Errno::INVAL)));
     }
 
     #[test]
@@ -2098,10 +2010,7 @@ mod host_tests {
         let mut buf = [0u8; 12];
         buf[0] = 0xFF;
         buf[1] = 0xFF;
-        assert!(matches!(
-            ExtentHeader::parse(&buf),
-            Err(Ext4Error::BadInode)
-        ));
+        assert!(matches!(ExtentHeader::parse(&buf), Err(Errno::INVAL)));
     }
 
     #[test]

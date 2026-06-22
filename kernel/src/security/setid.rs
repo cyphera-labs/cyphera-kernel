@@ -1,6 +1,6 @@
+use crate::core as sched;
 use crate::errno::{EINVAL, EPERM};
-use crate::process::SETID_KEEP;
-use crate::sched;
+use crate::process_model::SETID_KEEP;
 
 fn check_setid_transition(
     current: u32,
@@ -19,7 +19,7 @@ fn check_setid_transition(
     new == ruid || new == euid || new == suid || new == current
 }
 
-fn map_setuid_in(c: &crate::process::Credentials, id: u32) -> Option<u32> {
+fn map_setuid_in(c: &crate::process_model::Credentials, id: u32) -> Option<u32> {
     if id == SETID_KEEP {
         Some(SETID_KEEP)
     } else {
@@ -27,7 +27,7 @@ fn map_setuid_in(c: &crate::process::Credentials, id: u32) -> Option<u32> {
     }
 }
 
-fn map_setgid_in(c: &crate::process::Credentials, id: u32) -> Option<u32> {
+fn map_setgid_in(c: &crate::process_model::Credentials, id: u32) -> Option<u32> {
     if id == SETID_KEEP {
         Some(SETID_KEEP)
     } else {
@@ -45,7 +45,7 @@ pub(crate) fn sys_setresuid(new_ruid: u32, new_euid: u32, new_suid: u32) -> i64 
             (Some(r), Some(e), Some(s)) => (r, e, s),
             _ => return EINVAL,
         };
-        let priv_ = c.has_cap(crate::process::CAP_SETUID);
+        let priv_ = c.has_cap(crate::process_model::CAP_SETUID);
         if !check_setid_transition(c.ruid, k_ruid, c.ruid, c.euid, c.suid, priv_)
             || !check_setid_transition(c.euid, k_euid, c.ruid, c.euid, c.suid, priv_)
             || !check_setid_transition(c.suid, k_suid, c.ruid, c.euid, c.suid, priv_)
@@ -78,7 +78,7 @@ pub(crate) fn sys_setresgid(new_rgid: u32, new_egid: u32, new_sgid: u32) -> i64 
             (Some(r), Some(e), Some(s)) => (r, e, s),
             _ => return EINVAL,
         };
-        let priv_ = c.has_cap(crate::process::CAP_SETGID);
+        let priv_ = c.has_cap(crate::process_model::CAP_SETGID);
         if !check_setid_transition(c.rgid, k_rgid, c.rgid, c.egid, c.sgid, priv_)
             || !check_setid_transition(c.egid, k_egid, c.rgid, c.egid, c.sgid, priv_)
             || !check_setid_transition(c.sgid, k_sgid, c.rgid, c.egid, c.sgid, priv_)
@@ -106,7 +106,7 @@ pub(crate) fn sys_setuid(uid: u32) -> i64 {
             None => return EINVAL,
         };
         let (or, oe, os, of) = (c.ruid, c.euid, c.suid, c.fsuid);
-        if c.has_cap(crate::process::CAP_SETUID) {
+        if c.has_cap(crate::process_model::CAP_SETUID) {
             c.ruid = ku;
             c.euid = ku;
             c.suid = ku;
@@ -130,7 +130,7 @@ pub(crate) fn sys_setgid(gid: u32) -> i64 {
             Some(k) => k,
             None => return EINVAL,
         };
-        if c.has_cap(crate::process::CAP_SETGID) {
+        if c.has_cap(crate::process_model::CAP_SETGID) {
             c.rgid = kg;
             c.egid = kg;
             c.sgid = kg;
@@ -152,7 +152,7 @@ pub(crate) fn sys_setreuid(new_ruid: u32, new_euid: u32) -> i64 {
             (Some(r), Some(e)) => (r, e),
             _ => return EINVAL,
         };
-        let priv_ = c.has_cap(crate::process::CAP_SETUID);
+        let priv_ = c.has_cap(crate::process_model::CAP_SETUID);
         if !check_setid_transition(c.ruid, k_ruid, c.ruid, c.euid, c.suid, priv_)
             || !check_setid_transition(c.euid, k_euid, c.ruid, c.euid, c.suid, priv_)
         {
@@ -182,7 +182,7 @@ pub(crate) fn sys_setregid(new_rgid: u32, new_egid: u32) -> i64 {
             (Some(r), Some(e)) => (r, e),
             _ => return EINVAL,
         };
-        let priv_ = c.has_cap(crate::process::CAP_SETGID);
+        let priv_ = c.has_cap(crate::process_model::CAP_SETGID);
         if !check_setid_transition(c.rgid, k_rgid, c.rgid, c.egid, c.sgid, priv_)
             || !check_setid_transition(c.egid, k_egid, c.rgid, c.egid, c.sgid, priv_)
         {
@@ -211,7 +211,7 @@ pub(crate) fn sys_setfsuid(new_fsuid: u32) -> i64 {
             Some(k) => k,
             None => return old as i64,
         };
-        let allowed = c.has_cap(crate::process::CAP_SETUID)
+        let allowed = c.has_cap(crate::process_model::CAP_SETUID)
             || k_new == c.ruid
             || k_new == c.euid
             || k_new == c.suid
@@ -230,7 +230,7 @@ pub(crate) fn sys_setfsgid(new_fsgid: u32) -> i64 {
             Some(k) => k,
             None => return old as i64,
         };
-        let allowed = c.has_cap(crate::process::CAP_SETGID)
+        let allowed = c.has_cap(crate::process_model::CAP_SETGID)
             || k_new == c.rgid
             || k_new == c.egid
             || k_new == c.sgid
@@ -286,7 +286,7 @@ pub fn exec_transition(
     }
 }
 
-pub fn apply_exec_transition(c: &mut crate::process::Credentials, t: &ExecCredTransition) {
+pub fn apply_exec_transition(c: &mut crate::process_model::Credentials, t: &ExecCredTransition) {
     if let Some(uid) = t.suid_owner {
         c.euid = uid;
         c.suid = uid;

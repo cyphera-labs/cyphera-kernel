@@ -1,18 +1,20 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
+use crate::core as sched;
 use crate::errno::{EBADF, EFAULT, EINTR, EINVAL};
-use crate::sched;
 use crate::vfs::{self, Inode, OpenFile, OpenFlags};
 
 static EPOLL_INDEX: frame::sync::SpinIrq<BTreeMap<usize, Arc<crate::net::epoll::EpollInstance>>> =
     frame::sync::SpinIrq::new(BTreeMap::new());
 
-static SIGNALFD_INDEX: frame::sync::SpinIrq<BTreeMap<usize, Arc<crate::fdtypes::SignalFdInode>>> =
-    frame::sync::SpinIrq::new(BTreeMap::new());
+static SIGNALFD_INDEX: frame::sync::SpinIrq<
+    BTreeMap<usize, Arc<crate::ipc::fdtypes::SignalFdInode>>,
+> = frame::sync::SpinIrq::new(BTreeMap::new());
 
-static TIMERFD_FD_INDEX: frame::sync::SpinIrq<BTreeMap<usize, Arc<crate::fdtypes::TimerFdInode>>> =
-    frame::sync::SpinIrq::new(BTreeMap::new());
+static TIMERFD_FD_INDEX: frame::sync::SpinIrq<
+    BTreeMap<usize, Arc<crate::ipc::fdtypes::TimerFdInode>>,
+> = frame::sync::SpinIrq::new(BTreeMap::new());
 
 fn lookup_epoll(fd: i32) -> Option<Arc<crate::net::epoll::EpollInstance>> {
     let file = sched::with_current_fds(|t| t.get(fd))?;
@@ -20,7 +22,7 @@ fn lookup_epoll(fd: i32) -> Option<Arc<crate::net::epoll::EpollInstance>> {
     EPOLL_INDEX.lock().get(&key).cloned()
 }
 
-fn lookup_timerfd(fd: i32) -> Option<Arc<crate::fdtypes::TimerFdInode>> {
+fn lookup_timerfd(fd: i32) -> Option<Arc<crate::ipc::fdtypes::TimerFdInode>> {
     let file = sched::with_current_fds(|t| t.get(fd))?;
     let key = Arc::as_ptr(&file.inode) as *const () as usize;
     TIMERFD_FD_INDEX.lock().get(&key).cloned()
@@ -58,7 +60,7 @@ pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
 fn poll_wait(buf: &mut [u8], nfds: usize, deadline: Option<u64>, immediate: bool) -> i64 {
     let pid = sched::current_pid();
     if let Some(d) = deadline {
-        crate::timeout::register(d, pid);
+        crate::core::timeout::register(d, pid);
     }
 
     let mut files: alloc::vec::Vec<Option<alloc::sync::Arc<crate::vfs::OpenFile>>> =
@@ -101,7 +103,7 @@ fn poll_wait(buf: &mut [u8], nfds: usize, deadline: Option<u64>, immediate: bool
                     .for_each_wait_queue(&mut |wq| wq.dequeue(pid));
             }
             if deadline.is_some() {
-                let _ = crate::timeout::unregister(pid);
+                let _ = crate::core::timeout::unregister(pid);
             }
             return ready;
         }
@@ -125,7 +127,7 @@ fn poll_wait(buf: &mut [u8], nfds: usize, deadline: Option<u64>, immediate: bool
             }
             true
         };
-        let outcome = crate::wait::wait_guarded("poll/select", deadline, &still_queued);
+        let outcome = crate::core::wait::wait_guarded("poll/select", deadline, &still_queued);
 
         for file in files.iter().flatten() {
             file.inode
@@ -134,19 +136,19 @@ fn poll_wait(buf: &mut [u8], nfds: usize, deadline: Option<u64>, immediate: bool
         }
 
         match outcome {
-            crate::wait::WaitOutcome::Interrupted => {
+            crate::core::wait::WaitOutcome::Interrupted => {
                 if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+                    let _ = crate::core::timeout::unregister(pid);
                 }
                 return EINTR;
             }
-            crate::wait::WaitOutcome::TimedOut => {
+            crate::core::wait::WaitOutcome::TimedOut => {
                 if deadline.is_some() {
-                    let _ = crate::timeout::unregister(pid);
+                    let _ = crate::core::timeout::unregister(pid);
                 }
                 return 0;
             }
-            crate::wait::WaitOutcome::Woken => {}
+            crate::core::wait::WaitOutcome::Woken => {}
         }
     }
 }
@@ -432,7 +434,7 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> i64 
     if op == EPOLL_CTL_DEL {
         return match inst.ctl_del(fd as i32) {
             Ok(()) => 0,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         };
     }
     let mut ev = [0u8; 12];
@@ -448,7 +450,7 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> i64 
     };
     match res {
         Ok(()) => 0,
-        Err(e) => e.errno(),
+        Err(e) => e.as_neg_i64(),
     }
 }
 
@@ -599,7 +601,7 @@ pub(super) fn sys_signalfd4(fd: u64, mask_ptr: u64, sigsetsize: u64, flags: u64)
         return fd_signed as i64;
     }
 
-    let typed = crate::fdtypes::SignalFdInode::new(mask);
+    let typed = crate::ipc::fdtypes::SignalFdInode::new(mask);
     let inode_dyn: Arc<dyn Inode> = typed.clone();
     let mut open_flags = OpenFlags::RDONLY;
     if (flags & SFD_NONBLOCK) != 0 {
@@ -628,7 +630,7 @@ pub(super) fn sys_eventfd2(initval: u64, flags: u64) -> i64 {
         return EINVAL;
     }
     let semaphore = (flags & EFD_SEMAPHORE) != 0;
-    let typed = crate::fdtypes::EventFdInode::new(initval, semaphore);
+    let typed = crate::ipc::fdtypes::EventFdInode::new(initval, semaphore);
     let inode_dyn: Arc<dyn Inode> = typed;
     let mut open_flags = OpenFlags::RDWR;
     if (flags & EFD_NONBLOCK) != 0 {
@@ -657,7 +659,7 @@ pub(super) fn sys_timerfd_create(clockid: u64, flags: u64) -> i64 {
     if clockid > 7 {
         return EINVAL;
     }
-    let typed = crate::fdtypes::TimerFdInode::new(clockid as u32);
+    let typed = crate::ipc::fdtypes::TimerFdInode::new(clockid as u32);
     let inode_dyn: Arc<dyn Inode> = typed.clone();
     let mut open_flags = OpenFlags::RDONLY;
     if (flags & TFD_NONBLOCK) != 0 {

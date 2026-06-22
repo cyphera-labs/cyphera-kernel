@@ -7,7 +7,9 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 
 #[cfg(not(host_test))]
-use crate::vfs::{FsError, Inode, InodeKind, path::normalize};
+use crate::vfs::{Inode, InodeKind, path::normalize};
+#[cfg(not(host_test))]
+use cyphera_kapi::Errno;
 
 #[derive(Debug)]
 pub enum TarError {
@@ -15,13 +17,13 @@ pub enum TarError {
     BadField(&'static str),
     Truncated,
     #[cfg(not(host_test))]
-    Vfs(FsError),
+    Vfs(Errno),
     BadPath,
 }
 
 #[cfg(not(host_test))]
-impl From<FsError> for TarError {
-    fn from(e: FsError) -> Self {
+impl From<Errno> for TarError {
+    fn from(e: Errno) -> Self {
         TarError::Vfs(e)
     }
 }

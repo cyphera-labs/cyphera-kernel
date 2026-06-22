@@ -3,21 +3,31 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 use super::tss::DOUBLE_FAULT_IST_INDEX;
 
+core::arch::global_asm!(include_str!("fault.s"), options(att_syntax));
+
+extern "C" {
+    fn de_trampoline();
+    fn of_trampoline();
+    fn br_trampoline();
+    fn ud_trampoline();
+    fn gp_trampoline();
+    fn pf_trampoline();
+    fn mf_trampoline();
+    fn ac_trampoline();
+    fn xm_trampoline();
+}
+
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
 pub fn init() {
     let idt = IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
 
-        idt.divide_error.set_handler_fn(handle_divide_error);
         idt.debug.set_handler_fn(handle_debug);
         idt.non_maskable_interrupt.set_handler_fn(handle_nmi);
         idt.breakpoint
             .set_handler_fn(handle_breakpoint)
             .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
-        idt.overflow.set_handler_fn(handle_overflow);
-        idt.bound_range_exceeded.set_handler_fn(handle_bound);
-        idt.invalid_opcode.set_handler_fn(handle_invalid_opcode);
         idt.device_not_available.set_handler_fn(handle_device_na);
 
         // SAFETY: set_stack_index requires the IST index to name a
@@ -36,13 +46,35 @@ pub fn init() {
         idt.invalid_tss.set_handler_fn(handle_invalid_tss);
         idt.segment_not_present.set_handler_fn(handle_segment_np);
         idt.stack_segment_fault.set_handler_fn(handle_stack_seg);
-        idt.general_protection_fault.set_handler_fn(handle_gpf);
-        idt.page_fault.set_handler_fn(handle_page_fault);
-        idt.x87_floating_point.set_handler_fn(handle_x87);
-        idt.alignment_check.set_handler_fn(handle_alignment);
         idt.machine_check.set_handler_fn(handle_machine_check);
-        idt.simd_floating_point.set_handler_fn(handle_simd);
         idt.virtualization.set_handler_fn(handle_virt);
+
+        // SAFETY: each synchronous user-fault vector is installed by address to
+        // a register-snapshot trampoline (gs-relative stores + jmp to the typed
+        // handler, leaving the CPU exception frame intact, so the handler runs
+        // as a direct gate would). The symbols are crate-local `.text`, valid
+        // for the program's lifetime; set_handler_addr only stores the gate's
+        // target.
+        unsafe {
+            idt.divide_error
+                .set_handler_addr(x86_64::VirtAddr::new(de_trampoline as *const () as u64));
+            idt.overflow
+                .set_handler_addr(x86_64::VirtAddr::new(of_trampoline as *const () as u64));
+            idt.bound_range_exceeded
+                .set_handler_addr(x86_64::VirtAddr::new(br_trampoline as *const () as u64));
+            idt.invalid_opcode
+                .set_handler_addr(x86_64::VirtAddr::new(ud_trampoline as *const () as u64));
+            idt.general_protection_fault
+                .set_handler_addr(x86_64::VirtAddr::new(gp_trampoline as *const () as u64));
+            idt.page_fault
+                .set_handler_addr(x86_64::VirtAddr::new(pf_trampoline as *const () as u64));
+            idt.x87_floating_point
+                .set_handler_addr(x86_64::VirtAddr::new(mf_trampoline as *const () as u64));
+            idt.alignment_check
+                .set_handler_addr(x86_64::VirtAddr::new(ac_trampoline as *const () as u64));
+            idt.simd_floating_point
+                .set_handler_addr(x86_64::VirtAddr::new(xm_trampoline as *const () as u64));
+        }
 
         idt[crate::intr::lapic::TIMER_VECTOR].set_handler_fn(handle_timer);
         idt[crate::intr::lapic::RESCHED_IPI_VECTOR].set_handler_fn(handle_resched_ipi);
@@ -54,7 +86,11 @@ pub fn init() {
     idt.load();
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_divide_error(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 0, 0, 0);
+    }
     panic_with_frame("#DE divide-by-zero", &frame, None);
 }
 
@@ -112,23 +148,26 @@ extern "x86-interrupt" fn handle_breakpoint(mut frame: InterruptStackFrame) {
     crate::println!("#BP breakpoint @ {:#x}", frame.instruction_pointer.as_u64());
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_overflow(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 4, 0, 0);
+    }
     panic_with_frame("#OF overflow", &frame, None);
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_bound(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 5, 0, 0);
+    }
     panic_with_frame("#BR bound range exceeded", &frame, None);
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_invalid_opcode(frame: InterruptStackFrame) {
     if from_user(&frame) {
-        if let Some(h) = crate::user::user_fault_handler() {
-            crate::println!(
-                "#UD from user @ rip={:#x}; killing process",
-                frame.instruction_pointer.as_u64()
-            );
-            h(0, 6, 0);
-        }
+        try_deliver_user_fault(&frame, 6, 0, 0);
     }
     panic_with_frame("#UD invalid opcode", &frame, None);
 }
@@ -153,19 +192,15 @@ extern "x86-interrupt" fn handle_stack_seg(frame: InterruptStackFrame, err: u64)
     panic_with_frame("#SS stack-segment fault", &frame, Some(err));
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_gpf(frame: InterruptStackFrame, err: u64) {
     if from_user(&frame) {
-        if let Some(h) = crate::user::user_fault_handler() {
-            crate::println!(
-                "#GP from user @ rip={:#x} err={err:#x}; killing process",
-                frame.instruction_pointer.as_u64()
-            );
-            h(0, 13, err);
-        }
+        try_deliver_user_fault(&frame, 13, err, 0);
     }
     panic_with_frame("#GP general protection fault", &frame, Some(err));
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_page_fault(
     mut frame: InterruptStackFrame,
     err: PageFaultErrorCode,
@@ -193,15 +228,7 @@ extern "x86-interrupt" fn handle_page_fault(
                 return;
             }
         }
-        if let Some(h) = crate::user::user_fault_handler() {
-            crate::println!(
-                "#PF from user @ rip={:#x} cr2={:#x} err={:?}; killing process",
-                frame.instruction_pointer.as_u64(),
-                cr2,
-                err
-            );
-            h(cr2, 14, err.bits());
-        }
+        try_deliver_user_fault(&frame, 14, err.bits(), cr2);
     }
     crate::println!(
         "#PF page fault @ rip={:#x} cr2={:#x} err={:?}",
@@ -216,11 +243,30 @@ fn from_user(frame: &InterruptStackFrame) -> bool {
     (frame.code_segment.0 & 3) == 3
 }
 
+fn try_deliver_user_fault(frame: &InterruptStackFrame, vector: u8, error: u64, addr: u64) {
+    if let Some(h) = crate::user::user_fault_signal() {
+        let mut tf = crate::user::fault_trapframe(
+            frame.instruction_pointer.as_u64(),
+            frame.cpu_flags.bits(),
+            frame.stack_pointer.as_u64(),
+        );
+        h(&mut tf, vector, error, addr);
+    }
+}
+
+#[no_mangle]
 extern "x86-interrupt" fn handle_x87(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 16, 0, 0);
+    }
     panic_with_frame("#MF x87 FPU error", &frame, None);
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_alignment(frame: InterruptStackFrame, err: u64) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 17, err, 0);
+    }
     panic_with_frame("#AC alignment check", &frame, Some(err));
 }
 
@@ -228,7 +274,11 @@ extern "x86-interrupt" fn handle_machine_check(frame: InterruptStackFrame) -> ! 
     panic_with_frame("#MC machine check", &frame, None);
 }
 
+#[no_mangle]
 extern "x86-interrupt" fn handle_simd(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        try_deliver_user_fault(&frame, 19, 0, 0);
+    }
     panic_with_frame("#XM SIMD floating-point", &frame, None);
 }
 

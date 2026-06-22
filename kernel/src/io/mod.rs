@@ -132,25 +132,18 @@ impl IoQueue {
 }
 
 pub trait BlockDevice {
-    fn dispatch(&mut self, req: IoRequest, buf: &mut [u8]) -> Result<(), IoError>;
+    fn dispatch(&mut self, req: IoRequest, buf: &mut [u8]) -> KResult<()>;
     fn capacity_sectors(&self) -> u64;
 }
 
-#[derive(Debug)]
-pub enum IoError {
-    Transport,
-    OutOfRange,
-    BadBuffer,
-    NoDevice,
-}
-
+use cyphera_kapi::{Errno, KResult};
 use frame::sync::SpinIrq;
 
 static IO_ENGINE: SpinIrq<IoQueue> = SpinIrq::new(IoQueue::new());
 
-pub fn block_read(lba: u64, buf: &mut [u8]) -> Result<(), IoError> {
+pub fn block_read(lba: u64, buf: &mut [u8]) -> KResult<()> {
     if buf.is_empty() || !buf.len().is_multiple_of(512) {
-        return Err(IoError::BadBuffer);
+        return Err(Errno::INVAL);
     }
     let n_sectors = (buf.len() / 512) as u32;
     apply_io_quota(IoOp::Read, buf.len() as u64);
@@ -164,12 +157,12 @@ pub fn block_read(lba: u64, buf: &mut [u8]) -> Result<(), IoError> {
         q.submit(req);
         let _ = q.dispatch_next(now);
     }
-    ::virtio::read_block_sector(lba, buf).map_err(|_| IoError::Transport)
+    ::virtio::read_block_sector(lba, buf).map_err(|_| Errno::IO)
 }
 
-pub fn block_write(lba: u64, buf: &[u8]) -> Result<(), IoError> {
+pub fn block_write(lba: u64, buf: &[u8]) -> KResult<()> {
     if buf.is_empty() || !buf.len().is_multiple_of(512) {
-        return Err(IoError::BadBuffer);
+        return Err(Errno::INVAL);
     }
     let n_sectors = (buf.len() / 512) as u32;
     apply_io_quota(IoOp::Write, buf.len() as u64);
@@ -183,11 +176,11 @@ pub fn block_write(lba: u64, buf: &[u8]) -> Result<(), IoError> {
         q.submit(req);
         let _ = q.dispatch_next(now);
     }
-    ::virtio::write_block_sector(lba, buf).map_err(|_| IoError::Transport)
+    ::virtio::write_block_sector(lba, buf).map_err(|_| Errno::IO)
 }
 
 fn apply_io_quota(op: IoOp, bytes: u64) {
-    let cg = match crate::sched::current_cgroup() {
+    let cg = match crate::core::current_cgroup() {
         Some(c) => c,
         None => return,
     };
@@ -204,7 +197,7 @@ fn apply_io_quota(op: IoOp, bytes: u64) {
             Ok(()) => return,
             Err(retry_after_ns) => {
                 let deadline = now.saturating_add(retry_after_ns.max(1_000_000));
-                crate::sched::sleep_until(deadline);
+                crate::core::sleep_until(deadline);
             }
         }
     }

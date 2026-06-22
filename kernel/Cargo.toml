@@ -50,7 +50,7 @@ bitflags = { version = "2.12", default-features = false }
 # smoltcp — TCP/IP stack. Wraps our virtio-net driver via a Device
 # adapter. MIT/Apache, used under MIT. The heapless "medium-ip"
 # deps are pruned; we carry ethernet + dual-stack v4/v6.
-smoltcp = { version = "0.11", default-features = false, optional = true, features = [
+smoltcp = { version = "0.13", default-features = false, optional = true, features = [
     "alloc",
     "medium-ethernet",
     "medium-ip",
@@ -59,6 +59,7 @@ smoltcp = { version = "0.11", default-features = false, optional = true, feature
     "socket-udp",
     "socket-tcp",
     "socket-icmp",
+    "auto-icmp-echo-reply",
 ] }
 
 # chacha20 (RustCrypto, RFC 8439) — HOST-ONLY test oracle, never shipped. The

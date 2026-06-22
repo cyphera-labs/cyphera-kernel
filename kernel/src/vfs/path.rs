@@ -5,10 +5,13 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 
 #[cfg(not(host_test))]
-use super::{FsError, Inode, InodeKind, MountEntry, MountInUseTag, MountPropagation, MountTable};
+use super::{Inode, InodeKind, MountEntry, MountInUseTag, MountPropagation, MountTable};
 
 #[cfg(not(host_test))]
-type ResolveWithMount = Result<(Arc<dyn Inode>, Option<Arc<MountInUseTag>>), FsError>;
+use cyphera_kapi::{Errno, KResult};
+
+#[cfg(not(host_test))]
+type ResolveWithMount = KResult<(Arc<dyn Inode>, Option<Arc<MountInUseTag>>)>;
 
 #[cfg(not(host_test))]
 pub struct Context {
@@ -20,8 +23,8 @@ pub struct Context {
 impl Context {
     pub fn current() -> Self {
         let root =
-            crate::sched::with_current_fs_root(|r| r.clone()).unwrap_or_else(super::root_inode);
-        let mounts = crate::sched::with_current_mount_table(|m| m.clone())
+            crate::core::with_current_fs_root(|r| r.clone()).unwrap_or_else(super::root_inode);
+        let mounts = crate::core::with_current_mount_table(|m| m.clone())
             .flatten()
             .unwrap_or_else(super::global_mount_table);
         Self { root, mounts }
@@ -210,11 +213,7 @@ impl Context {
 }
 
 #[cfg(not(host_test))]
-pub fn resolve(
-    ctx: &Context,
-    start: &Arc<dyn Inode>,
-    path: &str,
-) -> Result<Arc<dyn Inode>, FsError> {
+pub fn resolve(ctx: &Context, start: &Arc<dyn Inode>, path: &str) -> KResult<Arc<dyn Inode>> {
     resolve_with_depth(ctx, start, "/", path, 0, true).map(|r| r.inode)
 }
 
@@ -223,7 +222,7 @@ pub fn resolve_no_follow(
     ctx: &Context,
     start: &Arc<dyn Inode>,
     path: &str,
-) -> Result<Arc<dyn Inode>, FsError> {
+) -> KResult<Arc<dyn Inode>> {
     resolve_with_depth(ctx, start, "/", path, 0, false).map(|r| r.inode)
 }
 
@@ -289,11 +288,11 @@ fn resolve_with_depth(
     path: &str,
     depth: u32,
     follow_last: bool,
-) -> Result<ResolveResult, FsError> {
+) -> KResult<ResolveResult> {
     use alloc::string::String;
 
     if depth > MAX_SYMLINK_DEPTH {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     let mut deepest_mount_tag: Option<Arc<MountInUseTag>> = None;
     let (mut current, mut canonical) = if path.starts_with('/') {
@@ -309,7 +308,7 @@ fn resolve_with_depth(
     let last_idx = components.len();
     for (i, component) in components.iter().enumerate() {
         if *component == ".." {
-            return Err(FsError::NotSupported);
+            return Err(Errno::NOSYS);
         }
         let is_last = i + 1 == last_idx;
         let child = current.lookup(component)?;
@@ -357,7 +356,7 @@ pub fn resolve_parent<'a>(
     ctx: &Context,
     start: &Arc<dyn Inode>,
     path: &'a str,
-) -> Result<(Arc<dyn Inode>, &'a str), FsError> {
+) -> KResult<(Arc<dyn Inode>, &'a str)> {
     let trimmed = path.trim_end_matches('/');
     let split = trimmed.rfind('/');
     let (parent_path, leaf) = match split {
@@ -365,7 +364,7 @@ pub fn resolve_parent<'a>(
         None => ("", trimmed),
     };
     if leaf.is_empty() {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
 
     let parent = if parent_path.is_empty() && trimmed.starts_with('/') {
@@ -377,7 +376,7 @@ pub fn resolve_parent<'a>(
     };
 
     if parent.kind() != InodeKind::Directory {
-        return Err(FsError::NotDir);
+        return Err(Errno::NOTDIR);
     }
 
     Ok((parent, leaf))

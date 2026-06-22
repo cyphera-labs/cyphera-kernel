@@ -23,7 +23,7 @@
 #   (gdb) bt                         # backtrace whatever is running
 #   (gdb) info functions dump_all    # locate the dump helper
 #   (gdb) call <mangled_name>()      # invoke dump_all_processes
-#   (gdb) print kernel::sched::GLOBAL._0.lock
+#   (gdb) print kernel::core::GLOBAL._0.lock
 #   (gdb) continue                   # resume the kernel
 #   (gdb) detach + quit              # let it keep running
 

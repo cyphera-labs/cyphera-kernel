@@ -5,9 +5,10 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use cyphera_kapi::{Errno, KResult};
 use frame::sync::SpinIrq;
 
-use crate::process::Pid;
+use crate::process_model::Pid;
 
 #[derive(Debug, Default)]
 pub struct MemoryController {
@@ -228,38 +229,38 @@ impl Cgroup {
         })
     }
 
-    pub fn create_child(parent: &Arc<Self>, name: &str) -> Result<Arc<Self>, CgroupError> {
+    pub fn create_child(parent: &Arc<Self>, name: &str) -> KResult<Arc<Self>> {
         if name.is_empty() || name.contains('/') {
-            return Err(CgroupError::InvalidName);
+            return Err(Errno::INVAL);
         }
         let mut children = parent.children.lock();
         if children.contains_key(name) {
-            return Err(CgroupError::Exists);
+            return Err(Errno::EXIST);
         }
         let child = Cgroup::new_child(parent, name.to_string());
         children.insert(name.to_string(), child.clone());
         Ok(child)
     }
 
-    pub fn remove_child(parent: &Arc<Self>, name: &str) -> Result<(), CgroupError> {
+    pub fn remove_child(parent: &Arc<Self>, name: &str) -> KResult<()> {
         let mut children = parent.children.lock();
-        let child = children.get(name).ok_or(CgroupError::NotFound)?;
+        let child = children.get(name).ok_or(Errno::NOENT)?;
         if !child.pids.lock().is_empty() {
-            return Err(CgroupError::Busy);
+            return Err(Errno::BUSY);
         }
         if !child.children.lock().is_empty() {
-            return Err(CgroupError::Busy);
+            return Err(Errno::BUSY);
         }
         children.remove(name);
         Ok(())
     }
 
-    pub fn attach_pid(self: &Arc<Self>, pid: Pid) -> Result<(), CgroupError> {
+    pub fn attach_pid(self: &Arc<Self>, pid: Pid) -> KResult<()> {
         {
             let mut pc = self.pids_ctl.lock();
             if let Some(max) = pc.max {
                 if pc.current + 1 > max {
-                    return Err(CgroupError::PidsLimit);
+                    return Err(Errno::AGAIN);
                 }
             }
             pc.current += 1;
@@ -276,7 +277,7 @@ impl Cgroup {
         }
     }
 
-    pub fn try_charge_memory(self: &Arc<Self>, bytes: u64) -> Result<(), CgroupError> {
+    pub fn try_charge_memory(self: &Arc<Self>, bytes: u64) -> KResult<()> {
         let chain = self.ancestor_chain();
         let mut charged: Vec<Arc<Cgroup>> = Vec::new();
         for cg in &chain {
@@ -290,7 +291,7 @@ impl Cgroup {
                         dm.current = dm.current.saturating_sub(bytes);
                     }
                     cg.memory.lock().events_oom += 1;
-                    return Err(CgroupError::MemoryLimit);
+                    return Err(Errno::NOMEM);
                 }
             }
             m.current = new;
@@ -329,10 +330,10 @@ impl Cgroup {
         let victim = candidates
             .iter()
             .copied()
-            .max_by_key(|&p| crate::sched::process_charged_bytes(p))
+            .max_by_key(|&p| crate::core::process_charged_bytes(p))
             .unwrap_or(candidates[0]);
         self.memory.lock().events_oom_kill += 1;
-        let _ = crate::sched::send_signal(victim, 9);
+        let _ = crate::core::send_signal(victim, 9);
     }
 
     fn ancestor_chain(self: &Arc<Self>) -> Vec<Arc<Cgroup>> {
@@ -364,29 +365,6 @@ impl Cgroup {
             s.push_str(&p);
         }
         s
-    }
-}
-
-#[derive(Debug)]
-pub enum CgroupError {
-    InvalidName,
-    Exists,
-    NotFound,
-    Busy,
-    PidsLimit,
-    MemoryLimit,
-}
-
-impl CgroupError {
-    pub fn errno(&self) -> i64 {
-        match self {
-            CgroupError::InvalidName => -22,
-            CgroupError::Exists => -17,
-            CgroupError::NotFound => -2,
-            CgroupError::Busy => -16,
-            CgroupError::PidsLimit => -11,
-            CgroupError::MemoryLimit => -12,
-        }
     }
 }
 

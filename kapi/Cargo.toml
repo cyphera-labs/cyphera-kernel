@@ -15,3 +15,6 @@ publish.workspace = true
 [lib]
 name = "cyphera_kapi"
 path = "src/lib.rs"
+
+[dependencies]
+bitflags = { version = "2.12", default-features = false }

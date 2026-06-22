@@ -9,7 +9,9 @@ use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use frame::mm::{PhysFrame, Size4KiB, frame_alloc, read_from_frame, write_to_frame, zero_frame};
 use frame::sync::SpinIrq;
 
-use crate::vfs::{DirEntry, FsError, Inode, InodeKind, OpenFlags, PollMask, Stat, TimeSpec};
+use cyphera_kapi::{Errno, KResult};
+
+use crate::vfs::{DirEntry, Inode, InodeKind, OpenFlags, PollMask, Stat, TimeSpec};
 
 static NEXT_TMPFS_INODE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,10 +44,10 @@ pub struct TmpfsInode {
     nlink: AtomicU32,
     fifo_readers: AtomicU32,
     fifo_writers: AtomicU32,
-    fifo_read_waiters: crate::wait::WaitQueue,
-    fifo_write_waiters: crate::wait::WaitQueue,
-    fifo_open_read_waiters: crate::wait::WaitQueue,
-    fifo_open_write_waiters: crate::wait::WaitQueue,
+    fifo_read_waiters: crate::core::wait::WaitQueue,
+    fifo_write_waiters: crate::core::wait::WaitQueue,
+    fifo_open_read_waiters: crate::core::wait::WaitQueue,
+    fifo_open_write_waiters: crate::core::wait::WaitQueue,
     rdev: AtomicU64,
     atime: SpinIrq<TimeSpec>,
     mtime: SpinIrq<TimeSpec>,
@@ -165,12 +167,12 @@ fn default_mode_for(kind: InodeKind) -> u16 {
     }
 }
 
-fn validate_and_seal_overwrite(src: &Arc<dyn Inode>, dst: &Arc<dyn Inode>) -> Result<(), FsError> {
+fn validate_and_seal_overwrite(src: &Arc<dyn Inode>, dst: &Arc<dyn Inode>) -> KResult<()> {
     let src_dir = src.kind() == InodeKind::Directory;
     let dst_dir = dst.kind() == InodeKind::Directory;
     match (src_dir, dst_dir) {
-        (false, true) => Err(FsError::NotFile),
-        (true, false) => Err(FsError::NotDir),
+        (false, true) => Err(Errno::ISDIR),
+        (true, false) => Err(Errno::NOTDIR),
         (true, true) => dst.seal_if_empty_dir(),
         (false, false) => Ok(()),
     }
@@ -225,10 +227,10 @@ impl TmpfsInode {
             nlink: AtomicU32::new(default_nlink_for(kind)),
             fifo_readers: AtomicU32::new(0),
             fifo_writers: AtomicU32::new(0),
-            fifo_read_waiters: crate::wait::WaitQueue::new(),
-            fifo_write_waiters: crate::wait::WaitQueue::new(),
-            fifo_open_read_waiters: crate::wait::WaitQueue::new(),
-            fifo_open_write_waiters: crate::wait::WaitQueue::new(),
+            fifo_read_waiters: crate::core::wait::WaitQueue::new(),
+            fifo_write_waiters: crate::core::wait::WaitQueue::new(),
+            fifo_open_read_waiters: crate::core::wait::WaitQueue::new(),
+            fifo_open_write_waiters: crate::core::wait::WaitQueue::new(),
             rdev: AtomicU64::new(0),
             atime: SpinIrq::new(t),
             mtime: SpinIrq::new(t),
@@ -250,16 +252,16 @@ impl TmpfsInode {
         once_root
     }
 
-    pub fn attach_inherent(&self, name: &str, child: Arc<dyn Inode>) -> Result<(), FsError> {
+    pub fn attach_inherent(&self, name: &str, child: Arc<dyn Inode>) -> KResult<()> {
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if self.dir_removed.load(Ordering::Relaxed) {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         if map.contains_key(name) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         map.insert(name.to_string(), child);
         self.touch_ctime();
@@ -317,13 +319,13 @@ impl Inode for TmpfsInode {
         }
     }
 
-    fn set_mode(&self, mode: u16) -> Result<(), FsError> {
+    fn set_mode(&self, mode: u16) -> KResult<()> {
         self.mode.store(mode & 0o7777, Ordering::Release);
         self.touch_ctime();
         Ok(())
     }
 
-    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> KResult<()> {
         if let Some(u) = uid {
             self.uid.store(u, Ordering::Release);
         }
@@ -334,7 +336,7 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn set_times(&self, atime: Option<TimeSpec>, mtime: Option<TimeSpec>) -> Result<(), FsError> {
+    fn set_times(&self, atime: Option<TimeSpec>, mtime: Option<TimeSpec>) -> KResult<()> {
         if let Some(a) = atime {
             *self.atime.lock() = a;
         }
@@ -366,14 +368,14 @@ impl Inode for TmpfsInode {
         mask
     }
 
-    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::wait::WaitQueue)) {
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
         if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
             f(&self.fifo_read_waiters);
             f(&self.fifo_write_waiters);
         }
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         let g = self.state.lock();
         match &*g {
             TmpfsData::Regular(data) => {
@@ -382,9 +384,9 @@ impl Inode for TmpfsInode {
                 self.touch_atime();
                 Ok(n)
             }
-            TmpfsData::Symlink(_) => Err(FsError::InvalidArgument),
-            TmpfsData::Directory(_) => Err(FsError::NotFile),
-            TmpfsData::CharDevice => Err(FsError::NotSupported),
+            TmpfsData::Symlink(_) => Err(Errno::INVAL),
+            TmpfsData::Directory(_) => Err(Errno::ISDIR),
+            TmpfsData::CharDevice => Err(Errno::NOSYS),
             TmpfsData::Fifo(_) => {
                 drop(g);
                 self.fifo_read(buf, false)
@@ -392,26 +394,21 @@ impl Inode for TmpfsInode {
         }
     }
 
-    fn read_at_with_flags(
-        &self,
-        offset: u64,
-        buf: &mut [u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, offset: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
         if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
             return self.fifo_read(buf, flags.contains(OpenFlags::NONBLOCK));
         }
         self.read_at(offset, buf)
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
         let mut g = self.state.lock();
         match &mut *g {
             TmpfsData::Regular(data) => {
                 let written = data.write_from(offset, buf);
                 drop(g);
                 if written == 0 && !buf.is_empty() {
-                    return Err(FsError::NoSpace);
+                    return Err(Errno::NOSPC);
                 }
                 self.touch_mtime();
                 crate::fs::pagecache::write_through(self.id, offset, &buf[..written]);
@@ -422,27 +419,22 @@ impl Inode for TmpfsInode {
                 self.fifo_write(buf, false)
             }
             TmpfsData::Symlink(_) | TmpfsData::Directory(_) | TmpfsData::CharDevice => {
-                Err(FsError::NotFile)
+                Err(Errno::ISDIR)
             }
         }
     }
 
-    fn write_at_with_flags(
-        &self,
-        offset: u64,
-        buf: &[u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, offset: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
         if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
             return self.fifo_write(buf, flags.contains(OpenFlags::NONBLOCK));
         }
         self.write_at(offset, buf)
     }
 
-    fn truncate(&self, len: u64) -> Result<(), FsError> {
+    fn truncate(&self, len: u64) -> KResult<()> {
         let mut g = self.state.lock();
         let TmpfsData::Regular(data) = &mut *g else {
-            return Err(FsError::NotFile);
+            return Err(Errno::ISDIR);
         };
         let old_len = data.len;
         data.resize(len);
@@ -454,20 +446,20 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
         let g = self.state.lock();
         let TmpfsData::Directory(map) = &*g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
-        map.get(name).cloned().ok_or(FsError::NotFound)
+        map.get(name).cloned().ok_or(Errno::NOENT)
     }
 
-    fn create(&self, name: &str, kind: InodeKind) -> Result<Arc<dyn Inode>, FsError> {
+    fn create(&self, name: &str, kind: InodeKind) -> KResult<Arc<dyn Inode>> {
         let new: Arc<dyn Inode> = match kind {
             InodeKind::Regular => Self::new_file(),
             InodeKind::Directory => Self::new_dir(),
             InodeKind::Symlink => {
-                return Err(FsError::InvalidArgument);
+                return Err(Errno::INVAL);
             }
             InodeKind::CharDevice => Self::new_char_device(0),
             InodeKind::Pipe => Self::new_fifo(),
@@ -475,13 +467,13 @@ impl Inode for TmpfsInode {
         };
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if self.dir_removed.load(Ordering::Relaxed) {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         if map.contains_key(name) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         map.insert(name.to_string(), new.clone());
         if kind == InodeKind::Directory {
@@ -492,22 +484,27 @@ impl Inode for TmpfsInode {
         Ok(new)
     }
 
-    fn mknod(&self, name: &str, kind: InodeKind, dev: u64) -> Result<Arc<dyn Inode>, FsError> {
+    fn mknod(&self, name: &str, kind: InodeKind, dev: u64) -> KResult<Arc<dyn Inode>> {
         let new: Arc<dyn Inode> = match kind {
-            InodeKind::CharDevice => Self::new_char_device(dev),
+            InodeKind::CharDevice => {
+                let major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32;
+                let minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
+                let fallback: Arc<dyn Inode> = Self::new_char_device(dev);
+                crate::fs::devfs::node_for_dev(major, minor).unwrap_or(fallback)
+            }
             InodeKind::Pipe => Self::new_fifo(),
             InodeKind::Regular => Self::new_file(),
-            _ => return Err(FsError::InvalidArgument),
+            _ => return Err(Errno::INVAL),
         };
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if self.dir_removed.load(Ordering::Relaxed) {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         if map.contains_key(name) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         map.insert(name.to_string(), new.clone());
         drop(g);
@@ -515,17 +512,17 @@ impl Inode for TmpfsInode {
         Ok(new)
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, FsError> {
+    fn symlink(&self, name: &str, target: &str) -> KResult<Arc<dyn Inode>> {
         let new = Self::new_symlink(target.to_string());
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if self.dir_removed.load(Ordering::Relaxed) {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         if map.contains_key(name) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         let new_dyn: Arc<dyn Inode> = new.clone();
         map.insert(name.to_string(), new_dyn);
@@ -534,18 +531,18 @@ impl Inode for TmpfsInode {
         Ok(new)
     }
 
-    fn read_link(&self) -> Result<String, FsError> {
+    fn read_link(&self) -> KResult<String> {
         let g = self.state.lock();
         match &*g {
             TmpfsData::Symlink(t) => Ok(t.clone()),
-            _ => Err(FsError::InvalidArgument),
+            _ => Err(Errno::INVAL),
         }
     }
 
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
+    fn list(&self) -> KResult<Vec<DirEntry>> {
         let g = self.state.lock();
         let TmpfsData::Directory(map) = &*g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         Ok(map
             .iter()
@@ -557,12 +554,12 @@ impl Inode for TmpfsInode {
             .collect())
     }
 
-    fn unlink(&self, name: &str) -> Result<(), FsError> {
+    fn unlink(&self, name: &str) -> KResult<()> {
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
-        let removed = map.remove(name).ok_or(FsError::NotFound)?;
+        let removed = map.remove(name).ok_or(Errno::NOENT)?;
         if removed.kind() == InodeKind::Directory {
             self.nlink.fetch_sub(1, Ordering::AcqRel);
         }
@@ -572,13 +569,13 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn seal_if_empty_dir(&self) -> Result<(), FsError> {
+    fn seal_if_empty_dir(&self) -> KResult<()> {
         let g = self.state.lock();
         let TmpfsData::Directory(map) = &*g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if !map.is_empty() {
-            return Err(FsError::NotEmpty);
+            return Err(Errno::NOTEMPTY);
         }
         self.dir_removed.store(true, Ordering::Relaxed);
         Ok(())
@@ -589,10 +586,10 @@ impl Inode for TmpfsInode {
         self.dir_removed.store(false, Ordering::Relaxed);
     }
 
-    fn unlink_if_matches(&self, name: &str, expect: &Arc<dyn Inode>) -> Result<bool, FsError> {
+    fn unlink_if_matches(&self, name: &str, expect: &Arc<dyn Inode>) -> KResult<bool> {
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if !map.get(name).is_some_and(|cur| Arc::ptr_eq(cur, expect)) {
             return Ok(false);
@@ -607,17 +604,17 @@ impl Inode for TmpfsInode {
         Ok(true)
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), FsError> {
+    fn rmdir(&self, name: &str) -> KResult<()> {
         let target = self.lookup(name)?;
         if target.kind() != InodeKind::Directory {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         }
         target.seal_if_empty_dir()?;
         match self.unlink_if_matches(name, &target) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 target.unseal_dir();
-                Err(FsError::NotFound)
+                Err(Errno::NOENT)
             }
             Err(e) => {
                 target.unseal_dir();
@@ -626,19 +623,19 @@ impl Inode for TmpfsInode {
         }
     }
 
-    fn link(&self, name: &str, target: Arc<dyn Inode>) -> Result<(), FsError> {
+    fn link(&self, name: &str, target: Arc<dyn Inode>) -> KResult<()> {
         if target.kind() == InodeKind::Directory {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
         let mut g = self.state.lock();
         let TmpfsData::Directory(map) = &mut *g else {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         };
         if self.dir_removed.load(Ordering::Relaxed) {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         if map.contains_key(name) {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         map.insert(name.to_string(), target.clone());
         drop(g);
@@ -647,35 +644,30 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn attach(&self, name: &str, child: Arc<dyn Inode>) -> Result<(), FsError> {
+    fn attach(&self, name: &str, child: Arc<dyn Inode>) -> KResult<()> {
         TmpfsInode::attach_inherent(self, name, child)
     }
 
-    fn rename(
-        &self,
-        old_name: &str,
-        new_parent: &Arc<dyn Inode>,
-        new_name: &str,
-    ) -> Result<(), FsError> {
+    fn rename(&self, old_name: &str, new_parent: &Arc<dyn Inode>, new_name: &str) -> KResult<()> {
         if Arc::as_ptr(new_parent) as *const () == self as *const _ as *const () {
             if old_name == new_name {
                 let g = self.state.lock();
                 let TmpfsData::Directory(map) = &*g else {
-                    return Err(FsError::NotDir);
+                    return Err(Errno::NOTDIR);
                 };
                 return if map.contains_key(old_name) {
                     Ok(())
                 } else {
-                    Err(FsError::NotFound)
+                    Err(Errno::NOENT)
                 };
             }
             for _attempt in 0..64 {
                 let (src, dst) = {
                     let g = self.state.lock();
                     let TmpfsData::Directory(map) = &*g else {
-                        return Err(FsError::NotDir);
+                        return Err(Errno::NOTDIR);
                     };
-                    let src = map.get(old_name).cloned().ok_or(FsError::NotFound)?;
+                    let src = map.get(old_name).cloned().ok_or(Errno::NOENT)?;
                     let dst = map.get(new_name).cloned();
                     (src, dst)
                 };
@@ -687,7 +679,7 @@ impl Inode for TmpfsInode {
                 }
                 let mut g = self.state.lock();
                 let TmpfsData::Directory(map) = &mut *g else {
-                    return Err(FsError::NotDir);
+                    return Err(Errno::NOTDIR);
                 };
                 let src_ok = map.get(old_name).is_some_and(|cur| Arc::ptr_eq(cur, &src));
                 let cur_dst = map.get(new_name).cloned();
@@ -701,7 +693,7 @@ impl Inode for TmpfsInode {
                     if let Some(d) = &dst {
                         d.unseal_dir();
                     }
-                    return Err(FsError::NotFound);
+                    return Err(Errno::NOENT);
                 }
                 if !dst_ok {
                     drop(g);
@@ -723,7 +715,7 @@ impl Inode for TmpfsInode {
                 }
                 return Ok(());
             }
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
 
         if let Ok(dst) = new_parent.lookup(new_name) {
@@ -745,9 +737,9 @@ impl Inode for TmpfsInode {
         let entry = {
             let mut g = self.state.lock();
             let TmpfsData::Directory(map) = &mut *g else {
-                return Err(FsError::NotDir);
+                return Err(Errno::NOTDIR);
             };
-            map.remove(old_name).ok_or(FsError::NotFound)?
+            map.remove(old_name).ok_or(Errno::NOENT)?
         };
         let moved_is_dir = entry.kind() == InodeKind::Directory;
         match new_parent.attach(new_name, entry.clone()) {
@@ -790,7 +782,7 @@ impl Inode for TmpfsInode {
         if flags.contains(OpenFlags::NONBLOCK) || (readable && writable) {
             return;
         }
-        let cur = crate::sched::current_pid();
+        let cur = crate::core::current_pid();
         if readable {
             loop {
                 self.fifo_open_read_waiters.enqueue(cur);
@@ -798,11 +790,11 @@ impl Inode for TmpfsInode {
                     self.fifo_open_read_waiters.dequeue(cur);
                     return;
                 }
-                let outcome = crate::wait::wait_guarded("fifo_open_read", None, &|| {
+                let outcome = crate::core::wait::wait_guarded("fifo_open_read", None, &|| {
                     self.fifo_open_read_waiters.contains(cur)
                 });
                 self.fifo_open_read_waiters.dequeue(cur);
-                if outcome == crate::wait::WaitOutcome::Interrupted {
+                if outcome == crate::core::wait::WaitOutcome::Interrupted {
                     return;
                 }
             }
@@ -813,11 +805,11 @@ impl Inode for TmpfsInode {
                     self.fifo_open_write_waiters.dequeue(cur);
                     return;
                 }
-                let outcome = crate::wait::wait_guarded("fifo_open_write", None, &|| {
+                let outcome = crate::core::wait::wait_guarded("fifo_open_write", None, &|| {
                     self.fifo_open_write_waiters.contains(cur)
                 });
                 self.fifo_open_write_waiters.dequeue(cur);
-                if outcome == crate::wait::WaitOutcome::Interrupted {
+                if outcome == crate::core::wait::WaitOutcome::Interrupted {
                     return;
                 }
             }
@@ -847,16 +839,16 @@ impl Inode for TmpfsInode {
         self.touch_ctime();
     }
 
-    fn set_xattr(&self, name: &str, value: &[u8], flags: u32) -> Result<(), FsError> {
+    fn set_xattr(&self, name: &str, value: &[u8], flags: u32) -> KResult<()> {
         const XATTR_CREATE: u32 = 1;
         const XATTR_REPLACE: u32 = 2;
         let mut t = self.xattrs.lock();
         let exists = t.contains_key(name);
         if flags & XATTR_CREATE != 0 && exists {
-            return Err(FsError::Exists);
+            return Err(Errno::EXIST);
         }
         if flags & XATTR_REPLACE != 0 && !exists {
-            return Err(FsError::NotFound);
+            return Err(Errno::NOENT);
         }
         t.insert(name.to_string(), value.to_vec());
         drop(t);
@@ -864,9 +856,9 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn get_xattr(&self, name: &str, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn get_xattr(&self, name: &str, buf: &mut [u8]) -> KResult<usize> {
         let t = self.xattrs.lock();
-        let v = t.get(name).ok_or(FsError::NotFound)?;
+        let v = t.get(name).ok_or(Errno::NOENT)?;
         if buf.is_empty() {
             return Ok(v.len());
         }
@@ -875,14 +867,14 @@ impl Inode for TmpfsInode {
         Ok(v.len())
     }
 
-    fn list_xattr(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn list_xattr(&self, buf: &mut [u8]) -> KResult<usize> {
         let t = self.xattrs.lock();
         let total: usize = t.keys().map(|n| n.len() + 1).sum();
         if buf.is_empty() {
             return Ok(total);
         }
         if buf.len() < total {
-            return Err(FsError::Range);
+            return Err(Errno::RANGE);
         }
         let mut off = 0;
         for k in t.keys() {
@@ -894,9 +886,9 @@ impl Inode for TmpfsInode {
         Ok(total)
     }
 
-    fn remove_xattr(&self, name: &str) -> Result<(), FsError> {
+    fn remove_xattr(&self, name: &str) -> KResult<()> {
         let mut t = self.xattrs.lock();
-        t.remove(name).ok_or(FsError::NotFound)?;
+        t.remove(name).ok_or(Errno::NOENT)?;
         drop(t);
         self.touch_ctime();
         Ok(())
@@ -904,12 +896,12 @@ impl Inode for TmpfsInode {
 }
 
 impl TmpfsInode {
-    fn fifo_read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, FsError> {
+    fn fifo_read(&self, buf: &mut [u8], nonblock: bool) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         crate::vfs::blocking::block_io("fifo_read", &self.fifo_read_waiters, nonblock, None, || {
             let mut g = self.state.lock();
             let TmpfsData::Fifo(ring) = &mut *g else {
-                return IoAttempt::Err(FsError::NotSupported);
+                return IoAttempt::Err(Errno::NOSYS);
             };
             if !ring.is_empty() {
                 let n = buf.len().min(ring.len());
@@ -928,7 +920,7 @@ impl TmpfsInode {
         })
     }
 
-    fn fifo_write(&self, buf: &[u8], nonblock: bool) -> Result<usize, FsError> {
+    fn fifo_write(&self, buf: &[u8], nonblock: bool) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         crate::vfs::blocking::block_io(
             "fifo_write",
@@ -938,10 +930,10 @@ impl TmpfsInode {
             || {
                 let mut g = self.state.lock();
                 let TmpfsData::Fifo(ring) = &mut *g else {
-                    return IoAttempt::Err(FsError::NotSupported);
+                    return IoAttempt::Err(Errno::NOSYS);
                 };
                 if self.fifo_readers.load(Ordering::Acquire) == 0 {
-                    return IoAttempt::Err(FsError::BrokenPipe);
+                    return IoAttempt::Err(Errno::PIPE);
                 }
                 let room = DEFAULT_FIFO_CAPACITY.saturating_sub(ring.len());
                 if room > 0 {

@@ -21,7 +21,10 @@ const F_DUPFD: u64 = 0;
 const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
 const FD_CLOEXEC: u64 = 1;
+const O_NONBLOCK: u64 = 0o4000;
+const EAGAIN: i64 = -11;
 const TIOCGWINSZ: u64 = 0x5413;
 
 #[no_mangle]
@@ -190,6 +193,39 @@ pub extern "C" fn _start() -> ! {
     sys_close(fd as u64);
     sys_close(dup_fd as u64);
     log("fcntl OK\n");
+
+    let mut nbfds = [0i32; 2];
+    if sys_pipe2(nbfds.as_mut_ptr() as *mut u8, 0) != 0 {
+        log("pipe2 for nonblock test failed\n");
+        sys_exit(1);
+    }
+    let rfd = nbfds[0] as u64;
+    let fl0 = sys_fcntl(rfd, F_GETFL, 0);
+    if fl0 < 0 {
+        log("F_GETFL before set failed\n");
+        sys_exit(1);
+    }
+    if sys_fcntl(rfd, F_SETFL, fl0 as u64 | O_NONBLOCK) != 0 {
+        log("F_SETFL O_NONBLOCK failed\n");
+        sys_exit(1);
+    }
+    let fl1 = sys_fcntl(rfd, F_GETFL, 0);
+    if fl1 < 0 || (fl1 as u64) & O_NONBLOCK == 0 {
+        log("F_GETFL missing O_NONBLOCK after F_SETFL\n");
+        sys_exit(1);
+    }
+    if (fl1 as u64) & 3 != (fl0 as u64) & 3 {
+        log("F_SETFL changed the access mode\n");
+        sys_exit(1);
+    }
+    let mut one = [0u8; 1];
+    if sys_read(rfd, one.as_mut_ptr(), 1) != EAGAIN {
+        log("nonblocking empty-pipe read not EAGAIN\n");
+        sys_exit(1);
+    }
+    sys_close(nbfds[0] as u64);
+    sys_close(nbfds[1] as u64);
+    log("fcntl F_SETFL O_NONBLOCK + EAGAIN OK\n");
 
     let tty: &[u8; 9] = b"/dev/tty\0";
     let fd = sys_openat(AT_FDCWD, tty.as_ptr(), O_RDWR, 0);
@@ -443,6 +479,49 @@ pub extern "C" fn _start() -> ! {
         sys_exit(1);
     }
     log("/sys/kernel/ostype OK\n");
+
+    let mut sz = [0u8; 32];
+    let n = read_path(b"/sys/block/vda/size\0", &mut sz);
+    if n <= 0 {
+        log("/sys/block/vda/size missing\n");
+        sys_exit(1);
+    }
+    let mut sectors: u64 = 0;
+    let mut saw_digit = false;
+    for &b in &sz[..n as usize] {
+        if b == b'\n' {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            log("/sys/block/vda/size not a number\n");
+            sys_exit(1);
+        }
+        sectors = sectors * 10 + (b - b'0') as u64;
+        saw_digit = true;
+    }
+    if !saw_digit || sectors == 0 {
+        log("/sys/block/vda/size not positive\n");
+        sys_exit(1);
+    }
+    let mut ro = [0u8; 8];
+    let n = read_path(b"/sys/block/vda/ro\0", &mut ro);
+    if n <= 0 || &ro[..n as usize] != b"0\n" {
+        log("/sys/block/vda/ro mismatch\n");
+        sys_exit(1);
+    }
+    let mut rm = [0u8; 8];
+    let n = read_path(b"/sys/block/vda/removable\0", &mut rm);
+    if n <= 0 || &rm[..n as usize] != b"0\n" {
+        log("/sys/block/vda/removable mismatch\n");
+        sys_exit(1);
+    }
+    let mut lbs = [0u8; 8];
+    let n = read_path(b"/sys/block/vda/queue/logical_block_size\0", &mut lbs);
+    if n <= 0 || &lbs[..n as usize] != b"512\n" {
+        log("/sys/block/vda/queue/logical_block_size mismatch\n");
+        sys_exit(1);
+    }
+    log("/sys/block/vda topology OK\n");
 
     let mmpath: &[u8; 11] = b"/tmp/mmap\0\0";
     let fd = sys_openat(AT_FDCWD, mmpath.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);

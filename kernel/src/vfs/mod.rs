@@ -8,6 +8,7 @@ pub mod pipe;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use cyphera_kapi::{Errno, KResult};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InodeKind {
@@ -62,47 +63,6 @@ impl Stat {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum FsError {
-    NotFound,
-    NotDir,
-    NotFile,
-    Exists,
-    InvalidArgument,
-    PermissionDenied,
-    Io,
-    NotSupported,
-    NotEmpty,
-    WouldBlock,
-    BrokenPipe,
-    NameTooLong,
-    Interrupted,
-    NoSpace,
-    Range,
-}
-
-impl FsError {
-    pub fn errno(self) -> i64 {
-        match self {
-            FsError::NotFound => -2,
-            FsError::Io => -5,
-            FsError::PermissionDenied => -13,
-            FsError::Exists => -17,
-            FsError::NotDir => -20,
-            FsError::NotFile => -21,
-            FsError::InvalidArgument => -22,
-            FsError::WouldBlock => -11,
-            FsError::BrokenPipe => -32,
-            FsError::NameTooLong => -36,
-            FsError::NotEmpty => -39,
-            FsError::NotSupported => -38,
-            FsError::Interrupted => -4,
-            FsError::NoSpace => -28,
-            FsError::Range => -34,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
@@ -118,90 +78,84 @@ pub trait Inode: Send + Sync {
         self as *const Self as *const () as u64
     }
 
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotFile)
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> KResult<usize> {
+        Err(Errno::ISDIR)
     }
 
-    fn read_at_with_flags(
-        &self,
-        offset: u64,
-        buf: &mut [u8],
-        _flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, offset: u64, buf: &mut [u8], _flags: OpenFlags) -> KResult<usize> {
         self.read_at(offset, buf)
     }
 
-    fn peek_at(&self, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn peek_at(&self, _buf: &mut [u8]) -> KResult<usize> {
+        Err(Errno::NOSYS)
     }
 
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::NotFile)
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> KResult<usize> {
+        Err(Errno::ISDIR)
     }
 
-    fn write_at_with_flags(
-        &self,
-        offset: u64,
-        buf: &[u8],
-        _flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, offset: u64, buf: &[u8], _flags: OpenFlags) -> KResult<usize> {
         self.write_at(offset, buf)
     }
 
-    fn write_with_fds(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> Result<usize, FsError> {
+    fn write_with_fds(
+        &self,
+        buf: &[u8],
+        fds: Vec<Arc<OpenFile>>,
+        _nonblock: bool,
+    ) -> KResult<usize> {
         if !fds.is_empty() {
-            return Err(FsError::NotSupported);
+            return Err(Errno::NOSYS);
         }
         self.write_at(0, buf)
     }
 
-    fn read_with_fds(&self, buf: &mut [u8]) -> Result<(usize, Vec<Arc<OpenFile>>), FsError> {
+    fn read_with_fds(
+        &self,
+        buf: &mut [u8],
+        _nonblock: bool,
+    ) -> KResult<(usize, Vec<Arc<OpenFile>>)> {
         let n = self.read_at(0, buf)?;
         Ok((n, Vec::new()))
     }
 
-    fn truncate(&self, _len: u64) -> Result<(), FsError> {
-        Err(FsError::NotFile)
+    fn truncate(&self, _len: u64) -> KResult<()> {
+        Err(Errno::ISDIR)
     }
 
-    fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        Err(FsError::NotDir)
+    fn lookup(&self, _name: &str) -> KResult<Arc<dyn Inode>> {
+        Err(Errno::NOTDIR)
     }
 
-    fn create(&self, _name: &str, _kind: InodeKind) -> Result<Arc<dyn Inode>, FsError> {
-        Err(FsError::NotDir)
+    fn create(&self, _name: &str, _kind: InodeKind) -> KResult<Arc<dyn Inode>> {
+        Err(Errno::NOTDIR)
     }
 
-    fn list(&self) -> Result<Vec<DirEntry>, FsError> {
-        Err(FsError::NotDir)
+    fn list(&self) -> KResult<Vec<DirEntry>> {
+        Err(Errno::NOTDIR)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), FsError> {
-        Err(FsError::NotDir)
+    fn unlink(&self, _name: &str) -> KResult<()> {
+        Err(Errno::NOTDIR)
     }
 
-    fn attach(&self, _name: &str, _child: Arc<dyn Inode>) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn attach(&self, _name: &str, _child: Arc<dyn Inode>) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
-    fn read_link(&self) -> Result<String, FsError> {
-        Err(FsError::NotSupported)
+    fn read_link(&self) -> KResult<String> {
+        Err(Errno::NOSYS)
     }
 
     fn magic_resolve(&self) -> Option<Arc<dyn Inode>> {
         None
     }
 
-    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn Inode>, FsError> {
-        Err(FsError::NotDir)
+    fn symlink(&self, _name: &str, _target: &str) -> KResult<Arc<dyn Inode>> {
+        Err(Errno::NOTDIR)
     }
 
-    fn rename(
-        &self,
-        old_name: &str,
-        new_parent: &Arc<dyn Inode>,
-        new_name: &str,
-    ) -> Result<(), FsError> {
+    fn rename(&self, old_name: &str, new_parent: &Arc<dyn Inode>, new_name: &str) -> KResult<()> {
         let inode = self.lookup(old_name)?;
         new_parent.attach(new_name, inode)?;
         self.unlink(old_name)?;
@@ -215,117 +169,86 @@ pub trait Inode: Send + Sync {
         false
     }
 
-    fn set_mode(&self, _mode: u16) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn set_mode(&self, _mode: u16) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
-    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
-    fn set_times(&self, _atime: Option<TimeSpec>, _mtime: Option<TimeSpec>) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn set_times(&self, _atime: Option<TimeSpec>, _mtime: Option<TimeSpec>) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
-    fn link(&self, _name: &str, _target: Arc<dyn Inode>) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn link(&self, _name: &str, _target: Arc<dyn Inode>) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
     fn bump_nlink(&self) {}
 
     fn drop_nlink(&self) {}
 
-    fn rmdir(&self, name: &str) -> Result<(), FsError> {
+    fn rmdir(&self, name: &str) -> KResult<()> {
         self.unlink(name)
     }
 
-    fn seal_if_empty_dir(&self) -> Result<(), FsError> {
+    fn seal_if_empty_dir(&self) -> KResult<()> {
         if self.kind() != InodeKind::Directory {
-            return Err(FsError::NotDir);
+            return Err(Errno::NOTDIR);
         }
         if !self.list()?.is_empty() {
-            return Err(FsError::NotEmpty);
+            return Err(Errno::NOTEMPTY);
         }
         Ok(())
     }
 
     fn unseal_dir(&self) {}
 
-    fn unlink_if_matches(&self, name: &str, _expect: &Arc<dyn Inode>) -> Result<bool, FsError> {
+    fn unlink_if_matches(&self, name: &str, _expect: &Arc<dyn Inode>) -> KResult<bool> {
         self.unlink(name).map(|_| true)
     }
 
-    fn mknod(&self, _name: &str, _kind: InodeKind, _dev: u64) -> Result<Arc<dyn Inode>, FsError> {
-        Err(FsError::NotSupported)
+    fn mknod(&self, _name: &str, _kind: InodeKind, _dev: u64) -> KResult<Arc<dyn Inode>> {
+        Err(Errno::NOSYS)
     }
 
-    fn set_xattr(&self, _name: &str, _value: &[u8], _flags: u32) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn set_xattr(&self, _name: &str, _value: &[u8], _flags: u32) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
-    fn get_xattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn get_xattr(&self, _name: &str, _buf: &mut [u8]) -> KResult<usize> {
+        Err(Errno::NOSYS)
     }
 
-    fn list_xattr(&self, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn list_xattr(&self, _buf: &mut [u8]) -> KResult<usize> {
+        Err(Errno::NOSYS)
     }
 
-    fn remove_xattr(&self, _name: &str) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn remove_xattr(&self, _name: &str) -> KResult<()> {
+        Err(Errno::NOSYS)
     }
 
     fn poll(&self) -> PollMask {
         PollMask::IN | PollMask::OUT
     }
 
-    fn for_each_wait_queue(&self, _f: &mut dyn FnMut(&crate::wait::WaitQueue)) {}
+    fn for_each_wait_queue(&self, _f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {}
 
     fn as_socket(&self) -> Option<&dyn crate::net::Socket> {
         None
     }
 
-    fn as_namespace_handle(&self) -> Option<&crate::fdtypes::NamespaceHandle> {
+    fn as_pipe(&self) -> Option<&crate::vfs::pipe::Pipe> {
+        None
+    }
+
+    fn as_namespace_handle(&self) -> Option<&crate::ipc::fdtypes::NamespaceHandle> {
         None
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct PollMask: u32 {
-        const IN  = 0x001;
-        const OUT = 0x004;
-        const ERR = 0x008;
-        const HUP = 0x010;
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct OpenFlags: u32 {
-        const RDONLY    = 0o0;
-        const WRONLY    = 0o1;
-        const RDWR      = 0o2;
-        const CREAT     = 0o100;
-        const EXCL      = 0o200;
-        const TRUNC     = 0o1000;
-        const APPEND    = 0o2000;
-        const NONBLOCK  = 0o4000;
-        const DIRECTORY = 0o200000;
-        const NOFOLLOW  = 0o400000;
-        const CLOEXEC   = 0o2000000;
-        const PATH      = 0o10000000;
-    }
-}
-
-impl OpenFlags {
-    pub fn is_writable(self) -> bool {
-        self.contains(OpenFlags::WRONLY) || self.contains(OpenFlags::RDWR)
-    }
-    pub fn is_readable(self) -> bool {
-        !self.contains(OpenFlags::WRONLY)
-    }
-}
+pub use cyphera_kapi::{OpenFlags, PollMask};
 
 #[derive(Copy, Clone, Debug)]
 pub enum Whence {
@@ -390,10 +313,10 @@ impl OpenFile {
             .store(next, core::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+    pub fn read(&self, buf: &mut [u8]) -> KResult<usize> {
         let f = self.flags();
         if !f.is_readable() {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
         let off = *self.offset.lock();
         let n = self.inode.read_at_with_flags(off, buf, f)?;
@@ -401,10 +324,10 @@ impl OpenFile {
         Ok(n)
     }
 
-    pub fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
+    pub fn write(&self, buf: &[u8]) -> KResult<usize> {
         let f = self.flags();
         if !f.is_writable() {
-            return Err(FsError::PermissionDenied);
+            return Err(Errno::ACCES);
         }
         let off = if f.contains(OpenFlags::APPEND) {
             self.inode.stat().size
@@ -416,7 +339,7 @@ impl OpenFile {
         Ok(n)
     }
 
-    pub fn seek(&self, whence: Whence, pos: i64) -> Result<u64, FsError> {
+    pub fn seek(&self, whence: Whence, pos: i64) -> KResult<u64> {
         let mut cur = self.offset.lock();
         let new = match whence {
             Whence::Set => pos.max(0) as u64,

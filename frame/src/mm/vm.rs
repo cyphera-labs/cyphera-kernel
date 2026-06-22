@@ -12,6 +12,76 @@ use crate::mm::frame_alloc;
 
 static PT_MUTATION_LOCK: crate::sync::SpinIrq<()> = crate::sync::SpinIrq::new(());
 
+#[cfg(cow_fork_forced_window)]
+const COW_FORCED_WINDOW_LO: u64 = 0x4000_0000;
+#[cfg(cow_fork_forced_window)]
+const COW_FORCED_WINDOW_HI: u64 = COW_FORCED_WINDOW_LO + 64 * 4096;
+#[cfg(cow_fork_forced_window)]
+const COW_FORCED_WINDOW_BUDGET: u64 = 2_000_000;
+#[cfg(cow_fork_forced_window)]
+static COW_FORCED_WINDOW_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(cow_fork_forced_window)]
+#[inline(never)]
+fn cow_fork_forced_window_after_leaf_read(parent_pml4: *const u64, vaddr: u64, expected: [u64; 4]) {
+    if !(COW_FORCED_WINDOW_LO..COW_FORCED_WINDOW_HI).contains(&vaddr) {
+        return;
+    }
+    if COW_FORCED_WINDOW_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    const FW_PRESENT: u64 = 1 << 0;
+    const FW_HUGE: u64 = 1 << 7;
+    const FW_FRAME_MASK: u64 = 0x000f_ffff_ffff_f000;
+    let i4 = ((vaddr >> 39) & 0x1ff) as usize;
+    let i3 = ((vaddr >> 30) & 0x1ff) as usize;
+    let i2 = ((vaddr >> 21) & 0x1ff) as usize;
+    let i1 = ((vaddr >> 12) & 0x1ff) as usize;
+    let mut n = 0u64;
+    while n < COW_FORCED_WINDOW_BUDGET {
+        // SAFETY: re-walks the parent tree exactly as the fork walk above —
+        // `parent_pml4` is the parent PML4 direct-map alias, each index is masked
+        // to one 512-entry table, and a deeper level is dereferenced only after
+        // its parent entry is confirmed present AND unchanged. A freed table
+        // clears its parent entry, so a freed frame is caught at the parent level
+        // and never read through. Reads are volatile so the loop re-reads memory
+        // each pass and observes a peer-CPU mutation instead of caching the first.
+        unsafe {
+            let l4_e = core::ptr::read_volatile(parent_pml4.add(i4));
+            if l4_e & FW_PRESENT == 0 || l4_e != expected[0] {
+                panic!("cow_fork_forced_window: L4 entry changed/freed under the window");
+            }
+            let l3 = crate::mm::direct_map::phys_to_virt(l4_e & FW_FRAME_MASK) as *const u64;
+            let l3_e = core::ptr::read_volatile(l3.add(i3));
+            if l3_e & FW_PRESENT == 0 || l3_e & FW_HUGE != 0 || l3_e != expected[1] {
+                panic!("cow_fork_forced_window: L3 entry changed/freed under the window");
+            }
+            let l2 = crate::mm::direct_map::phys_to_virt(l3_e & FW_FRAME_MASK) as *const u64;
+            let l2_e = core::ptr::read_volatile(l2.add(i2));
+            if l2_e & FW_PRESENT == 0 || l2_e & FW_HUGE != 0 || l2_e != expected[2] {
+                panic!("cow_fork_forced_window: L2 entry changed/freed under the window");
+            }
+            let l1 = crate::mm::direct_map::phys_to_virt(l2_e & FW_FRAME_MASK) as *const u64;
+            let l1_e = core::ptr::read_volatile(l1.add(i1));
+            if l1_e & FW_PRESENT == 0 || l1_e != expected[3] {
+                panic!("cow_fork_forced_window: L1 leaf changed/freed under the window");
+            }
+        }
+        core::hint::spin_loop();
+        n += 1;
+    }
+}
+
+#[cfg(not(cow_fork_forced_window))]
+#[inline(always)]
+fn cow_fork_forced_window_after_leaf_read(
+    _parent_pml4: *const u64,
+    _vaddr: u64,
+    _expected: [u64; 4],
+) {
+}
+
 const COW_PTE: PageTableFlags = PageTableFlags::BIT_9;
 
 const PTE_PRESENT: u64 = 1 << 0;
@@ -79,6 +149,15 @@ impl FrameDeallocator<Size4KiB> for PhysFrameAdapter {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct AddrSpaceRoot(PhysFrame<Size4KiB>);
+
+impl AddrSpaceRoot {
+    pub fn as_phys(&self) -> u64 {
+        self.0.start_address().as_u64()
+    }
+}
+
 pub struct VmSpace {
     root: PhysFrame<Size4KiB>,
     owned: bool,
@@ -90,16 +169,16 @@ impl VmSpace {
         Self { root, owned: false }
     }
 
-    pub fn root_frame(&self) -> PhysFrame<Size4KiB> {
-        self.root
+    pub fn root(&self) -> AddrSpaceRoot {
+        AddrSpaceRoot(self.root)
     }
 
-    pub fn activate_root(root: PhysFrame<Size4KiB>) {
+    pub fn activate_root(root: AddrSpaceRoot) {
         let (_, flags) = Cr3::read();
         // SAFETY: caller asserts the frame is a valid PML4 with the
         // kernel high-half mirrored. Same rationale as
         // `activate_for_task`.
-        unsafe { Cr3::write(root, flags) };
+        unsafe { Cr3::write(root.0, flags) };
     }
 
     pub fn new() -> Result<Self, MapError> {
@@ -295,12 +374,11 @@ impl VmSpace {
         Ok(())
     }
 
-    fn downgrade_leaf_to_cow_and_inc(
+    fn downgrade_leaf_to_cow_and_inc_locked(
         &mut self,
         vaddr: u64,
         parent_frame: PhysFrame<Size4KiB>,
     ) -> bool {
-        let _g = PT_MUTATION_LOCK.lock();
         match self.leaf_pte_ptr(vaddr) {
             Some(p) => {
                 frame_alloc::frame_ref_inc(parent_frame);
@@ -316,9 +394,7 @@ impl VmSpace {
                 }
                 true
             }
-            None => {
-                false
-            }
+            None => false,
         }
     }
 
@@ -768,6 +844,15 @@ impl VmSpace {
         let mut child_installed: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, bool)> =
             alloc::vec::Vec::new();
 
+        #[derive(Clone, Copy)]
+        enum DeferredMap {
+            SharedFile,
+            ReadonlyShare,
+            EagerCopy,
+        }
+        let mut deferred: alloc::vec::Vec<(u64, PhysFrame<Size4KiB>, Perms, DeferredMap)> =
+            alloc::vec::Vec::new();
+
         let parent_pml4_pa = self.root.start_address().as_u64();
         // SAFETY: page-table frames live in RAM, which the direct map
         // aliases at phys_to_virt(pa); the kernel-half PML4 entry is
@@ -776,22 +861,13 @@ impl VmSpace {
         let parent_pml4 = (crate::mm::direct_map::phys_to_virt(parent_pml4_pa)) as *const u64;
 
         let mut walk_err: Option<MapError> = None;
+        let _pt = PT_MUTATION_LOCK.lock();
         'walk: for i4 in 0usize..256 {
             // SAFETY: `parent_pml4` is the parent PML4 frame's direct-map
             // alias; `i4 < 256` keeps the offset inside the 512-entry table,
-            // and each slot is an aligned `u64`, so this read is in-bounds
-            // and well-aligned.
-            //
-            // CONCURRENCY (NOT fully serialized — see flag): this raw
-            // walk does NOT hold `PT_MUTATION_LOCK`. The fork caller
-            // holds the per-AddressSpace vmspace lock, but the mm
-            // syscalls (mmap/munmap/mprotect on a CLONE_VM peer) take
-            // only `PT_MUTATION_LOCK`, a disjoint lock — so a peer CPU
-            // sharing this root can mutate these entries (and free the
-            // intermediate frames whose direct-map alias backs the
-            // l3/l2/l1 reads below) mid-walk. Soundness today rests
-            // on no CLONE_VM-peer mmap/munmap running concurrently with
-            // this fork; that is not enforced here.
+            // and each slot is an aligned `u64`, so this read is in-bounds and
+            // well-aligned. PT_MUTATION_LOCK (held) excludes the mutators that
+            // could free this frame, so it stays a live page table for the walk.
             let l4_e = unsafe { parent_pml4.add(i4).read() };
             if l4_e & PRESENT == 0 {
                 continue;
@@ -800,11 +876,10 @@ impl VmSpace {
             for i3 in 0usize..512 {
                 // SAFETY: `l3` is the direct-map VA of the PDPT frame
                 // named by the present (checked above) L4 entry; the
-                // frame lives in RAM aliased by the direct
-                // mapping. `i3 < 512` keeps the aligned `u64` read inside
-                // the table. (Same unserialized-peer-mutation caveat as
-                // the L4 read above: a concurrent peer munmap could free
-                // this PDPT frame mid-walk.)
+                // frame lives in RAM aliased by the direct mapping.
+                // `i3 < 512` keeps the aligned `u64` read inside the
+                // table. PT_MUTATION_LOCK (held across the walk) excludes
+                // the peer munmap that could free this PDPT frame.
                 let l3_e = unsafe { l3.add(i3).read() };
                 if l3_e & PRESENT == 0 || l3_e & HUGE != 0 {
                     continue;
@@ -837,6 +912,12 @@ impl VmSpace {
                             | ((i2 as u64) << 21)
                             | ((i1 as u64) << 12);
 
+                        cow_fork_forced_window_after_leaf_read(
+                            parent_pml4,
+                            vaddr,
+                            [l4_e, l3_e, l2_e, l1_e],
+                        );
+
                         let parent_is_cow = l1_e & cow_bit != 0;
                         let mut perms = Perms::READ;
                         if l1_e & WRITABLE != 0 || parent_is_cow {
@@ -853,9 +934,10 @@ impl VmSpace {
                             .iter()
                             .any(|&(lo, hi)| vaddr >= lo && vaddr < hi);
 
-                        let page = match Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr))
-                        {
-                            Ok(p) => p,
+                        let parent_frame = match PhysFrame::<Size4KiB>::from_start_address(
+                            PhysAddr::new(parent_frame_pa),
+                        ) {
+                            Ok(f) => f,
                             Err(_) => {
                                 walk_err = Some(MapError::Misaligned);
                                 break 'walk;
@@ -863,45 +945,22 @@ impl VmSpace {
                         };
 
                         if is_shared {
-                            let parent_frame = match PhysFrame::<Size4KiB>::from_start_address(
-                                PhysAddr::new(parent_frame_pa),
-                            ) {
-                                Ok(f) => f,
-                                Err(_) => {
-                                    walk_err = Some(MapError::Misaligned);
-                                    break 'walk;
-                                }
-                            };
-                            if let Err(e) = child.map_one_frame(page, parent_frame, perms) {
-                                walk_err = Some(e);
-                                break 'walk;
-                            }
-                            shared_vaddrs.push(vaddr);
+                            deferred.push((vaddr, parent_frame, perms, DeferredMap::SharedFile));
                         } else {
-                            let parent_frame = match PhysFrame::<Size4KiB>::from_start_address(
-                                PhysAddr::new(parent_frame_pa),
-                            ) {
-                                Ok(f) => f,
-                                Err(_) => {
-                                    walk_err = Some(MapError::Misaligned);
-                                    break 'walk;
-                                }
-                            };
                             let is_writable = perms.contains(Perms::WRITE);
                             let tracked = frame_alloc::frame_ref_count(parent_frame) != 0;
                             if is_writable && tracked {
-                                if self.downgrade_leaf_to_cow_and_inc(vaddr, parent_frame) {
+                                if self.downgrade_leaf_to_cow_and_inc_locked(vaddr, parent_frame) {
                                     cow_vaddrs.push((vaddr, parent_frame, perms));
                                 }
                             } else if !is_writable && tracked {
-                                if let Err(e) =
-                                    child.map_one_frame_fork_anon(page, parent_frame, perms, false)
-                                {
-                                    walk_err = Some(e);
-                                    break 'walk;
-                                }
                                 frame_alloc::frame_ref_inc(parent_frame);
-                                child_installed.push((vaddr, parent_frame, false));
+                                deferred.push((
+                                    vaddr,
+                                    parent_frame,
+                                    perms,
+                                    DeferredMap::ReadonlyShare,
+                                ));
                             } else {
                                 let new_frame = match frame_alloc::alloc_frame() {
                                     Some(f) => f,
@@ -916,7 +975,9 @@ impl VmSpace {
                                 // frames both aliased writable by the direct
                                 // map; `new_frame` was just freshly allocated so
                                 // it does not alias `parent_frame`, making the
-                                // 4096-byte copy non-overlapping.
+                                // 4096-byte copy non-overlapping. PT_MUTATION_LOCK
+                                // is held, so `parent_frame` cannot be freed under
+                                // the copy.
                                 unsafe {
                                     core::ptr::copy_nonoverlapping(
                                         crate::mm::direct_map::phys_to_virt(src) as *const u8,
@@ -924,12 +985,7 @@ impl VmSpace {
                                         4096,
                                     );
                                 }
-                                if let Err(e) = child.map_one_frame(page, new_frame, perms) {
-                                    frame_alloc::free_frame(new_frame);
-                                    walk_err = Some(e);
-                                    break 'walk;
-                                }
-                                child_installed.push((vaddr, new_frame, true));
+                                deferred.push((vaddr, new_frame, perms, DeferredMap::EagerCopy));
                             }
                         }
                     }
@@ -937,9 +993,44 @@ impl VmSpace {
             }
         }
 
+        drop(_pt);
+
         if let Some(e) = walk_err {
             self.unwind_cow_share(&mut child, &shared_vaddrs, &child_installed, &cow_vaddrs, 0);
+            for &(_, f, _, kind) in &deferred {
+                if matches!(kind, DeferredMap::ReadonlyShare | DeferredMap::EagerCopy) {
+                    frame_alloc::free_frame(f);
+                }
+            }
             return Err(e);
+        }
+
+        for i in 0..deferred.len() {
+            let (vaddr, frame, perms, kind) = deferred[i];
+            let install = match Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)) {
+                Ok(page) => match kind {
+                    DeferredMap::SharedFile => child.map_one_frame(page, frame, perms),
+                    DeferredMap::ReadonlyShare => {
+                        child.map_one_frame_fork_anon(page, frame, perms, false)
+                    }
+                    DeferredMap::EagerCopy => child.map_one_frame(page, frame, perms),
+                },
+                Err(_) => Err(MapError::Misaligned),
+            };
+            if let Err(e) = install {
+                self.unwind_cow_share(&mut child, &shared_vaddrs, &child_installed, &cow_vaddrs, 0);
+                for &(_, f, _, k) in &deferred[i..] {
+                    if matches!(k, DeferredMap::ReadonlyShare | DeferredMap::EagerCopy) {
+                        frame_alloc::free_frame(f);
+                    }
+                }
+                return Err(e);
+            }
+            match kind {
+                DeferredMap::SharedFile => shared_vaddrs.push(vaddr),
+                DeferredMap::ReadonlyShare => child_installed.push((vaddr, frame, false)),
+                DeferredMap::EagerCopy => child_installed.push((vaddr, frame, true)),
+            }
         }
 
         let needs_shootdown = !cow_vaddrs.is_empty();
@@ -1200,9 +1291,7 @@ pub enum MapError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CowBreak {
-    Broken {
-        old_frame: PhysFrame<Size4KiB>,
-    },
+    Broken { old_frame: PhysFrame<Size4KiB> },
     BrokenInPlace,
     AlreadyWritable,
     NotCow,

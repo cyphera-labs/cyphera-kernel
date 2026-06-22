@@ -15,6 +15,7 @@ pub struct CpuArea {
     pub _pad: u32,
     pub current_pid: u32,
     pub _pad2: u32,
+    pub fault_gpr: [u64; 15],
 }
 
 impl CpuArea {
@@ -26,8 +27,24 @@ impl CpuArea {
             _pad: 0,
             current_pid: 0,
             _pad2: 0,
+            fault_gpr: [0; 15],
         }
     }
+}
+
+pub const FAULT_GPR_OFFSET: usize = 0x20;
+
+const _: () = assert!(core::mem::offset_of!(CpuArea, fault_gpr) == FAULT_GPR_OFFSET);
+
+pub fn fault_gprs() -> [u64; 15] {
+    let id = current_cpu_id();
+    let ptr = area_ptr(id);
+    // SAFETY: `current_cpu_id` selects this CPU's own area (the one GS_BASE
+    // points at), so this reads only local storage with no cross-CPU
+    // aliasing. The exception trampoline wrote the snapshot into these slots
+    // immediately before the handler that calls this ran, with interrupts
+    // masked, so no peer write can be in flight.
+    unsafe { (*ptr).fault_gpr }
 }
 
 #[repr(C, align(64))]

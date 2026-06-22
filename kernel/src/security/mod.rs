@@ -1,6 +1,8 @@
+pub mod bpf;
+pub mod seccomp;
 pub mod setid;
 
-use crate::sched;
+use crate::core as sched;
 
 pub fn capable(cap: u32) -> bool {
     sched::with_current_creds(|c| c.capable_host(cap))
@@ -10,7 +12,7 @@ pub fn has_cap(cap: u32) -> bool {
     sched::with_current_creds(|c| c.has_cap(cap))
 }
 
-pub fn target_capable(pid: crate::process::Pid, cap: u32) -> bool {
+pub fn target_capable(pid: crate::process_model::Pid, cap: u32) -> bool {
     sched::with_target_creds(pid, |c| c.capable_host(cap)).unwrap_or(false)
 }
 
@@ -28,7 +30,7 @@ pub fn capset(new_eff: u64, new_perm: u64, new_inh: u64) -> Result<(), i64> {
         if (new_inh & !(c.caps_bnd | c.caps_inh)) != 0 {
             return Err(crate::errno::EPERM);
         }
-        let mask = crate::process::ALL_CAPS_MASK;
+        let mask = crate::process_model::ALL_CAPS_MASK;
         c.caps_eff = new_eff & mask;
         c.caps_perm = new_perm & mask;
         c.caps_inh = new_inh & mask;

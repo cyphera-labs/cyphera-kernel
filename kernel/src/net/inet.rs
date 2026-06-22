@@ -8,8 +8,10 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
-use crate::vfs::{FsError, Inode, InodeKind, OpenFlags, PollMask, Stat};
-use crate::wait::WaitQueue;
+use cyphera_kapi::{Errno, KResult};
+
+use crate::core::wait::WaitQueue;
+use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
 
 pub fn register(s: &Arc<InetSocket>) {
     s.ns.register_inet(s);
@@ -26,6 +28,20 @@ const TCP_BUFFER_BYTES: usize = 64 * 1024;
 enum SockKind {
     Udp,
     Tcp,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Realm {
+    Ext,
+    Loop,
+    Both,
+}
+
+pub(crate) fn addr_is_loop(addr: IpAddress) -> bool {
+    match addr {
+        IpAddress::Ipv4(a) => a.is_loopback(),
+        IpAddress::Ipv6(a) => a == Ipv6Address::LOCALHOST,
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -70,31 +86,42 @@ impl SockOpts {
 }
 
 pub struct InetSocket {
-    handle: SocketHandle,
+    handle: SpinIrq<SocketHandle>,
+    loop_handle: SpinIrq<Option<SocketHandle>>,
+    realm: SpinIrq<Realm>,
     kind: SockKind,
     family: Family,
     ns: Arc<crate::net::NetNamespace>,
     peer: SpinIrq<Option<IpEndpoint>>,
     bound_local: SpinIrq<Option<IpListenEndpoint>>,
     listening: SpinIrq<bool>,
-    listeners: SpinIrq<alloc::vec::Vec<SocketHandle>>,
+    listeners: SpinIrq<alloc::vec::Vec<(SocketHandle, bool)>>,
     wait: WaitQueue,
     pub opts: SpinIrq<SockOpts>,
 }
 
 impl InetSocket {
-    pub fn new_udp(family: Family) -> Result<Arc<Self>, FsError> {
+    fn new_udp_socket() -> udp::Socket<'static> {
         let metadata_storage = vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS];
         let payload_storage = vec![0u8; UDP_BUFFER_BYTES];
         let metadata_storage_2 = metadata_storage.clone();
         let payload_storage_2 = payload_storage.clone();
         let rx = udp::PacketBuffer::new(metadata_storage, payload_storage);
         let tx = udp::PacketBuffer::new(metadata_storage_2, payload_storage_2);
-        let socket = udp::Socket::new(rx, tx);
-        let ns = crate::sched::current_net_ns();
-        let handle = ns.with_stack(|s| s.sockets.add(socket));
+        udp::Socket::new(rx, tx)
+    }
+
+    pub fn new_udp(family: Family) -> KResult<Arc<Self>> {
+        let ns = crate::core::current_net_ns();
+        let (handle, loop_handle) = ns.with_stack(|s| {
+            let ext = s.sockets.add(Self::new_udp_socket());
+            let lp = s.loop_sockets.add(Self::new_udp_socket());
+            (ext, lp)
+        });
         Ok(Arc::new(Self {
-            handle,
+            handle: SpinIrq::new(handle),
+            loop_handle: SpinIrq::new(Some(loop_handle)),
+            realm: SpinIrq::new(Realm::Both),
             kind: SockKind::Udp,
             family,
             ns,
@@ -107,14 +134,16 @@ impl InetSocket {
         }))
     }
 
-    pub fn new_tcp(family: Family) -> Result<Arc<Self>, FsError> {
+    pub fn new_tcp(family: Family) -> KResult<Arc<Self>> {
         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let socket = tcp::Socket::new(rx, tx);
-        let ns = crate::sched::current_net_ns();
+        let ns = crate::core::current_net_ns();
         let handle = ns.with_stack(|s| s.sockets.add(socket));
         Ok(Arc::new(Self {
-            handle,
+            handle: SpinIrq::new(handle),
+            loop_handle: SpinIrq::new(None),
+            realm: SpinIrq::new(Realm::Ext),
             kind: SockKind::Tcp,
             family,
             ns,
@@ -130,24 +159,58 @@ impl InetSocket {
     fn new_tcp_listener(
         ns: &Arc<crate::net::NetNamespace>,
         local: IpListenEndpoint,
-    ) -> Result<SocketHandle, FsError> {
+        is_loop: bool,
+    ) -> KResult<SocketHandle> {
         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let socket = tcp::Socket::new(rx, tx);
         ns.with_stack(|s| {
-            let h = s.sockets.add(socket);
-            let sock = s.sockets.get_mut::<tcp::Socket>(h);
-            sock.listen(local)
-                .map(|_| h)
-                .map_err(|_| FsError::InvalidArgument)
+            let h = s.set(is_loop).add(socket);
+            let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
+            sock.listen(local).map(|_| h).map_err(|_| Errno::INVAL)
         })
     }
 
     pub fn handle(&self) -> SocketHandle {
-        self.handle
+        *self.handle.lock()
     }
 
-    pub fn bind_endpoint(&self, ep: IpListenEndpoint) -> Result<(), FsError> {
+    fn primary_loop(&self) -> bool {
+        *self.realm.lock() == Realm::Loop
+    }
+
+    fn udp_endpoints(&self) -> alloc::vec::Vec<(SocketHandle, bool)> {
+        let mut v = alloc::vec![(*self.handle.lock(), false)];
+        if let Some(h) = *self.loop_handle.lock() {
+            v.push((h, true));
+        }
+        v
+    }
+
+    fn udp_handle_for(&self, is_loop: bool) -> SocketHandle {
+        if is_loop {
+            self.loop_handle.lock().unwrap_or(*self.handle.lock())
+        } else {
+            *self.handle.lock()
+        }
+    }
+
+    fn place_tcp_handle(&self, is_loop: bool) {
+        let target = if is_loop { Realm::Loop } else { Realm::Ext };
+        if *self.realm.lock() == target {
+            return;
+        }
+        let old = *self.handle.lock();
+        let from_loop = self.primary_loop();
+        let moved = self.ns.with_stack(|s| {
+            let sock = s.set(from_loop).remove(old);
+            s.set(is_loop).add(sock)
+        });
+        *self.handle.lock() = moved;
+        *self.realm.lock() = target;
+    }
+
+    pub fn bind_endpoint(&self, ep: IpListenEndpoint) -> KResult<()> {
         let ep = match self.kind {
             SockKind::Udp => {
                 let ep = if ep.port == 0 {
@@ -158,10 +221,12 @@ impl InetSocket {
                 } else {
                     ep
                 };
-                self.ns.with_stack(|s| {
-                    let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
-                    sock.bind(ep).map_err(|_| FsError::InvalidArgument)
-                })?;
+                for (h, is_loop) in self.udp_endpoints() {
+                    self.ns.with_stack(|s| {
+                        let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
+                        sock.bind(ep).map_err(|_| Errno::INVAL)
+                    })?;
+                }
                 ep
             }
             SockKind::Tcp => ep,
@@ -170,7 +235,7 @@ impl InetSocket {
         Ok(())
     }
 
-    pub fn connect_endpoint(&self, ep: IpEndpoint) -> Result<(), FsError> {
+    pub fn connect_endpoint(&self, ep: IpEndpoint) -> KResult<()> {
         match self.kind {
             SockKind::Udp => {
                 *self.peer.lock() = Some(ep);
@@ -183,18 +248,23 @@ impl InetSocket {
                     .map(|le| le.port)
                     .filter(|p| *p != 0)
                     .unwrap_or_else(|| self.ns.next_ephemeral_port());
+                let is_loop = addr_is_loop(ep.addr);
+                self.place_tcp_handle(is_loop);
+                let handle = *self.handle.lock();
                 self.ns.with_stack(|s| {
-                    let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
-                    let is_loop = match ep.addr {
-                        IpAddress::Ipv4(a) => a.is_loopback(),
-                        IpAddress::Ipv6(a) => a == Ipv6Address::LOOPBACK,
-                    };
-                    let ctx = match (is_loop, s.iface.as_mut()) {
-                        (false, Some(iface)) => iface.context(),
-                        _ => s.loop_iface.context(),
-                    };
-                    sock.connect(ctx, ep, local)
-                        .map_err(|_| FsError::InvalidArgument)
+                    match (is_loop, s.iface.as_mut()) {
+                        (false, Some(iface)) => {
+                            let ctx = iface.context();
+                            let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+                            sock.connect(ctx, ep, local)
+                        }
+                        _ => {
+                            let ctx = s.loop_iface.context();
+                            let sock = s.loop_sockets.get_mut::<tcp::Socket>(handle);
+                            sock.connect(ctx, ep, local)
+                        }
+                    }
+                    .map_err(|_| Errno::INVAL)
                 })?;
                 {
                     let mut bl = self.bound_local.lock();
@@ -215,8 +285,9 @@ impl InetSocket {
     }
 
     fn tcp_state(&self) -> tcp::State {
+        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
         self.ns
-            .with_stack(|s| s.sockets.get::<tcp::Socket>(self.handle).state())
+            .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state())
     }
 
     pub fn tcp_connect(&self, ep: IpEndpoint, nonblock: bool) -> i64 {
@@ -243,7 +314,7 @@ impl InetSocket {
             }
         }
         if let Err(e) = self.connect_endpoint(ep) {
-            return e.errno();
+            return e.as_neg_i64();
         }
         if nonblock {
             EINPROGRESS
@@ -259,9 +330,10 @@ impl InetSocket {
         use crate::vfs::blocking::IoAttempt;
         let r =
             crate::vfs::blocking::block_io::<i64>("inet_connect", &self.wait, false, None, || {
+                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 let st = self
                     .ns
-                    .with_stack(|s| s.sockets.get::<tcp::Socket>(self.handle).state());
+                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state());
                 if tcp_established_or_past(st) {
                     self.opts.lock().ever_established = true;
                     IoAttempt::Ready(0)
@@ -273,21 +345,33 @@ impl InetSocket {
             });
         match r {
             Ok(status) => status,
-            Err(FsError::Interrupted) => crate::errno::EINTR,
-            Err(e) => e.errno(),
+            Err(Errno::INTR) => crate::errno::EINTR,
+            Err(e) => e.as_neg_i64(),
         }
     }
 
-    pub fn listen_stream(&self, backlog: i32) -> Result<(), FsError> {
+    pub fn listen_stream(&self, backlog: i32) -> KResult<()> {
         match self.kind {
-            SockKind::Udp => Err(FsError::InvalidArgument),
+            SockKind::Udp => Err(Errno::INVAL),
             SockKind::Tcp => {
-                let local = self.bound_local.lock().ok_or(FsError::InvalidArgument)?;
+                let local = self.bound_local.lock().ok_or(Errno::INVAL)?;
                 let n = (backlog.max(1) as usize).min(MAX_LISTEN_BACKLOG);
-                let mut pool = alloc::vec::Vec::with_capacity(n);
+                let realms: &[bool] = match local.addr {
+                    None => &[false, true],
+                    Some(addr) if addr_is_loop(addr) => &[true],
+                    Some(_) => &[false],
+                };
+                let mut pool = alloc::vec::Vec::with_capacity(n * realms.len());
                 for _ in 0..n {
-                    pool.push(Self::new_tcp_listener(&self.ns, local)?);
+                    for &is_loop in realms {
+                        pool.push((Self::new_tcp_listener(&self.ns, local, is_loop)?, is_loop));
+                    }
                 }
+                *self.realm.lock() = match local.addr {
+                    None => Realm::Both,
+                    Some(addr) if addr_is_loop(addr) => Realm::Loop,
+                    Some(_) => Realm::Ext,
+                };
                 *self.listeners.lock() = pool;
                 *self.listening.lock() = true;
                 Ok(())
@@ -295,21 +379,21 @@ impl InetSocket {
         }
     }
 
-    pub fn try_accept(&self) -> Result<Arc<Self>, FsError> {
+    pub fn try_accept(&self) -> KResult<Arc<Self>> {
         if self.kind != SockKind::Tcp || !*self.listening.lock() {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
-        let local = self.bound_local.lock().ok_or(FsError::InvalidArgument)?;
+        let local = self.bound_local.lock().ok_or(Errno::INVAL)?;
 
         let mut pool = self.listeners.lock();
         if pool.is_empty() {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
 
         let mut active_idx = None;
-        for (i, &h) in pool.iter().enumerate() {
+        for (i, &(h, is_loop)) in pool.iter().enumerate() {
             let active = self.ns.with_stack(|s| {
-                let sock = s.sockets.get::<tcp::Socket>(h);
+                let sock = s.set(is_loop).get::<tcp::Socket>(h);
                 sock.is_active()
             });
             if active {
@@ -319,21 +403,27 @@ impl InetSocket {
         }
         let idx = match active_idx {
             Some(i) => i,
-            None => return Err(FsError::WouldBlock),
+            None => return Err(Errno::AGAIN),
         };
-        let accepted_handle = pool[idx];
-        let replacement = Self::new_tcp_listener(&self.ns, local)?;
-        pool[idx] = replacement;
+        let (accepted_handle, accepted_loop) = pool[idx];
+        let replacement = Self::new_tcp_listener(&self.ns, local, accepted_loop)?;
+        pool[idx] = (replacement, accepted_loop);
         drop(pool);
 
         let remote = self.ns.with_stack(|s| {
-            s.sockets
+            s.set(accepted_loop)
                 .get::<tcp::Socket>(accepted_handle)
                 .remote_endpoint()
         });
 
         Ok(Arc::new(InetSocket {
-            handle: accepted_handle,
+            handle: SpinIrq::new(accepted_handle),
+            loop_handle: SpinIrq::new(None),
+            realm: SpinIrq::new(if accepted_loop {
+                Realm::Loop
+            } else {
+                Realm::Ext
+            }),
             kind: SockKind::Tcp,
             family: self.family,
             ns: self.ns.clone(),
@@ -354,14 +444,14 @@ impl InetSocket {
         buf: &[u8],
         peer: Option<IpEndpoint>,
         nonblock: bool,
-    ) -> Result<usize, FsError> {
+    ) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         if self.opts.lock().shut_wr {
-            return Err(FsError::BrokenPipe);
+            return Err(Errno::PIPE);
         }
         let target = match peer.or_else(|| *self.peer.lock()) {
             Some(p) => p,
-            None => return Err(FsError::InvalidArgument),
+            None => return Err(Errno::INVAL),
         };
         if self.kind == SockKind::Udp && self.bound_local.lock().is_none() {
             let ep = IpListenEndpoint {
@@ -374,68 +464,77 @@ impl InetSocket {
             SockKind::Udp => "inet_send_udp",
             SockKind::Tcp => "inet_send_tcp",
         };
+        let dst_loop = addr_is_loop(target.addr);
         crate::vfs::blocking::block_io(site, &self.wait, nonblock, None, || {
             self.ns.with_stack(|s| match self.kind {
                 SockKind::Udp => {
-                    let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
+                    let h = self.udp_handle_for(dst_loop);
+                    let sock = s.set(dst_loop).get_mut::<udp::Socket>(h);
                     match sock.send_slice(buf, target) {
                         Ok(()) => IoAttempt::Ready(buf.len()),
                         Err(udp::SendError::BufferFull) => IoAttempt::WouldBlock,
-                        Err(_) => IoAttempt::Err(FsError::Io),
+                        Err(_) => IoAttempt::Err(Errno::IO),
                     }
                 }
                 SockKind::Tcp => {
-                    let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                    let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
+                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
                     if !sock.may_send() {
-                        return IoAttempt::Err(FsError::BrokenPipe);
+                        return IoAttempt::Err(Errno::PIPE);
                     }
                     match sock.send_slice(buf) {
                         Ok(0) if !buf.is_empty() => IoAttempt::WouldBlock,
                         Ok(n) => IoAttempt::Ready(n),
-                        Err(_) => IoAttempt::Err(FsError::Io),
+                        Err(_) => IoAttempt::Err(Errno::IO),
                     }
                 }
             })
         })
     }
 
-    pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<(usize, Option<IpEndpoint>), FsError> {
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> KResult<(usize, Option<IpEndpoint>)> {
         if self.opts.lock().shut_rd {
             return Ok((0, None));
         }
         match self.kind {
-            SockKind::Udp => self.ns.with_stack(|s| {
-                let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
-                if !sock.can_recv() {
-                    return Err(FsError::WouldBlock);
+            SockKind::Udp => {
+                for (h, is_loop) in self.udp_endpoints() {
+                    let got: KResult<Option<(usize, Option<IpEndpoint>)>> =
+                        self.ns.with_stack(|s| {
+                            let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
+                            if !sock.can_recv() {
+                                return Ok(None);
+                            }
+                            let (n, meta) = sock.recv_slice(buf).map_err(|_| Errno::IO)?;
+                            Ok(Some((n, Some(meta.endpoint))))
+                        });
+                    if let Some(r) = got? {
+                        return Ok(r);
+                    }
                 }
-                let (n, meta) = sock.recv_slice(buf).map_err(|_| FsError::Io)?;
-                Ok((n, Some(meta.endpoint)))
-            }),
+                Err(Errno::AGAIN)
+            }
             SockKind::Tcp => {
                 let ever_established = self.opts.lock().ever_established;
+                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 self.ns.with_stack(|s| {
-                    let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
                     if !sock.can_recv() {
                         if !sock.may_recv()
                             && (ever_established || tcp_established_or_past(sock.state()))
                         {
                             return Ok((0, None));
                         }
-                        return Err(FsError::WouldBlock);
+                        return Err(Errno::AGAIN);
                     }
-                    let n = sock.recv_slice(buf).map_err(|_| FsError::Io)?;
+                    let n = sock.recv_slice(buf).map_err(|_| Errno::IO)?;
                     Ok((n, None))
                 })
             }
         }
     }
 
-    pub fn recv(
-        &self,
-        buf: &mut [u8],
-        nonblock: bool,
-    ) -> Result<(usize, Option<IpEndpoint>), FsError> {
+    pub fn recv(&self, buf: &mut [u8], nonblock: bool) -> KResult<(usize, Option<IpEndpoint>)> {
         let rcvtimeo_us = self.opts.lock().rcvtimeo_us;
         let deadline = if !nonblock && rcvtimeo_us != 0 {
             Some(
@@ -448,7 +547,7 @@ impl InetSocket {
         crate::vfs::blocking::block_io("inet_recv", &self.wait, nonblock, deadline, || {
             match self.try_recv_from(buf) {
                 Ok(x) => crate::vfs::blocking::IoAttempt::Ready(x),
-                Err(FsError::WouldBlock) => crate::vfs::blocking::IoAttempt::WouldBlock,
+                Err(Errno::AGAIN) => crate::vfs::blocking::IoAttempt::WouldBlock,
                 Err(e) => crate::vfs::blocking::IoAttempt::Err(e),
             }
         })
@@ -463,7 +562,7 @@ impl InetSocket {
             let pool = self.listeners.lock().clone();
             let any_active = self.ns.with_stack(|s| {
                 pool.iter()
-                    .any(|h| s.sockets.get::<tcp::Socket>(*h).is_active())
+                    .any(|(h, is_loop)| s.set(*is_loop).get::<tcp::Socket>(*h).is_active())
             });
             return if any_active {
                 PollMask::IN
@@ -471,21 +570,29 @@ impl InetSocket {
                 PollMask::empty()
             };
         }
-        let (mask, established) = self.ns.with_stack(|s| {
+        if self.kind == SockKind::Udp {
             let mut m = PollMask::empty();
-            let mut est = false;
-            match self.kind {
-                SockKind::Udp => {
-                    let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
+            for (h, is_loop) in self.udp_endpoints() {
+                self.ns.with_stack(|s| {
+                    let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
                     if sock.can_recv() {
                         m |= PollMask::IN;
                     }
                     if sock.can_send() {
                         m |= PollMask::OUT;
                     }
-                }
+                });
+            }
+            return m;
+        }
+        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
+        let (mask, established) = self.ns.with_stack(|s| {
+            let mut m = PollMask::empty();
+            let mut est = false;
+            match self.kind {
+                SockKind::Udp => {}
                 SockKind::Tcp => {
-                    let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
                     est = tcp_established_or_past(sock.state());
                     if sock.can_recv() || opts.shut_rd {
                         m |= PollMask::IN;
@@ -537,9 +644,10 @@ impl InetSocket {
             |le: IpListenEndpoint| IpEndpoint::new(le.addr.unwrap_or(unspec.addr), le.port);
         match self.kind {
             SockKind::Udp => {
+                let h = *self.handle.lock();
                 let le = self
                     .ns
-                    .with_stack(|s| s.sockets.get::<udp::Socket>(self.handle).endpoint());
+                    .with_stack(|s| s.sockets.get::<udp::Socket>(h).endpoint());
                 if le.port != 0 {
                     le_to_ep(le)
                 } else {
@@ -550,9 +658,10 @@ impl InetSocket {
                 }
             }
             SockKind::Tcp => {
+                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 let smol = self
                     .ns
-                    .with_stack(|s| s.sockets.get::<tcp::Socket>(self.handle).local_endpoint());
+                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).local_endpoint());
                 match smol {
                     Some(ep) => ep,
                     None => match *self.bound_local.lock() {
@@ -568,9 +677,10 @@ impl InetSocket {
         match self.kind {
             SockKind::Udp => *self.peer.lock(),
             SockKind::Tcp => {
+                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 let remote = self
                     .ns
-                    .with_stack(|s| s.sockets.get::<tcp::Socket>(self.handle).remote_endpoint());
+                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).remote_endpoint());
                 remote.or_else(|| *self.peer.lock())
             }
         }
@@ -603,9 +713,10 @@ impl InetSocket {
                 return;
             }
         }
+        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
         let st = self
             .ns
-            .with_stack(|s| s.sockets.get::<tcp::Socket>(self.handle).state());
+            .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state());
         if tcp_established_or_past(st) {
             self.opts.lock().ever_established = true;
         } else if st == tcp::State::Closed {
@@ -616,12 +727,12 @@ impl InetSocket {
         }
     }
 
-    pub fn do_shutdown(&self, how: i32) -> Result<(), FsError> {
+    pub fn do_shutdown(&self, how: i32) -> KResult<()> {
         const SHUT_RD: i32 = 0;
         const SHUT_WR: i32 = 1;
         const SHUT_RDWR: i32 = 2;
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
-            return Err(FsError::InvalidArgument);
+            return Err(Errno::INVAL);
         }
         let mut o = self.opts.lock();
         if how == SHUT_RD || how == SHUT_RDWR {
@@ -630,8 +741,9 @@ impl InetSocket {
         if how == SHUT_WR || how == SHUT_RDWR {
             o.shut_wr = true;
             if self.kind == SockKind::Tcp {
+                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 self.ns.with_stack(|s| {
-                    let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
                     sock.close();
                 });
             }
@@ -642,9 +754,10 @@ impl InetSocket {
     }
 
     pub fn apply_smoltcp_sockopt(&self, kind: SmoltcpOpt, val: u64) {
+        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
         self.ns.with_stack(|s| match self.kind {
             SockKind::Tcp => {
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
                 match kind {
                     SmoltcpOpt::TcpNoDelay => sock.set_nagle_enabled(val == 0),
                     SmoltcpOpt::Keepalive => {
@@ -679,30 +792,20 @@ impl Inode for InetSocket {
         Stat::fresh(InodeKind::Pipe, 0, 0o600)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         self.read_at_with_flags(offset, buf, OpenFlags::empty())
     }
 
-    fn read_at_with_flags(
-        &self,
-        _off: u64,
-        buf: &mut [u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, _off: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
         let (n, _peer) = self.recv(buf, flags.contains(OpenFlags::NONBLOCK))?;
         Ok(n)
     }
 
-    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, off: u64, buf: &[u8]) -> KResult<usize> {
         self.write_at_with_flags(off, buf, OpenFlags::empty())
     }
 
-    fn write_at_with_flags(
-        &self,
-        _off: u64,
-        buf: &[u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, _off: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
         self.send_payload(buf, None, flags.contains(OpenFlags::NONBLOCK))
     }
 
@@ -720,19 +823,24 @@ impl Inode for InetSocket {
 
     fn on_close(&self, _flags: OpenFlags) {
         self.ns.unregister_inet(self);
-        let pool: alloc::vec::Vec<SocketHandle> = self.listeners.lock().drain(..).collect();
+        let pool: alloc::vec::Vec<(SocketHandle, bool)> = self.listeners.lock().drain(..).collect();
+        let primary = (*self.handle.lock(), self.primary_loop());
+        let loop_udp = *self.loop_handle.lock();
         self.ns.with_stack(|s| {
             if self.kind == SockKind::Tcp {
-                s.sockets.get_mut::<tcp::Socket>(self.handle).abort();
-                for h in &pool {
-                    s.sockets.get_mut::<tcp::Socket>(*h).abort();
+                s.set(primary.1).get_mut::<tcp::Socket>(primary.0).abort();
+                for (h, is_loop) in &pool {
+                    s.set(*is_loop).get_mut::<tcp::Socket>(*h).abort();
                 }
             }
         });
         self.ns.with_stack(|s| {
-            s.sockets.remove(self.handle);
-            for h in pool {
-                s.sockets.remove(h);
+            s.set(primary.1).remove(primary.0);
+            if let Some(h) = loop_udp {
+                s.loop_sockets.remove(h);
+            }
+            for (h, is_loop) in pool {
+                s.set(is_loop).remove(h);
             }
         });
     }
@@ -742,11 +850,11 @@ impl super::Socket for InetSocket {
     fn bind(&self, addr: &[u8]) -> i64 {
         let ep = match parse_sockaddr(addr) {
             Ok(e) => e,
-            Err(e) => return e.errno(),
+            Err(e) => return e.as_neg_i64(),
         };
         if ep.port != 0
             && ep.port < 1024
-            && !crate::security::capable(crate::process::CAP_NET_BIND_SERVICE)
+            && !crate::security::capable(crate::process_model::CAP_NET_BIND_SERVICE)
         {
             return crate::errno::EACCES;
         }
@@ -760,14 +868,14 @@ impl super::Socket for InetSocket {
         };
         match self.bind_endpoint(listen) {
             Ok(()) => 0,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         }
     }
 
     fn listen(&self, backlog: i32) -> i64 {
         match self.listen_stream(backlog) {
             Ok(()) => 0,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         }
     }
 
@@ -779,11 +887,11 @@ impl super::Socket for InetSocket {
             None,
             || match self.try_accept() {
                 Ok(s) => crate::vfs::blocking::IoAttempt::Ready(s),
-                Err(FsError::WouldBlock) => crate::vfs::blocking::IoAttempt::WouldBlock,
+                Err(Errno::AGAIN) => crate::vfs::blocking::IoAttempt::WouldBlock,
                 Err(e) => crate::vfs::blocking::IoAttempt::Err(e),
             },
         )
-        .map_err(|e| e.errno())?;
+        .map_err(|e| e.as_neg_i64())?;
         register(&new_sock);
         if let Some((addr, addrlen)) = peer_out {
             if addr != 0 && addrlen != 0 {
@@ -806,14 +914,14 @@ impl super::Socket for InetSocket {
     fn connect(&self, addr: &[u8], nonblock: bool) -> i64 {
         let ep = match parse_sockaddr(addr) {
             Ok(e) => e,
-            Err(e) => return e.errno(),
+            Err(e) => return e.as_neg_i64(),
         };
         if self.is_tcp() {
             return self.tcp_connect(ep, nonblock);
         }
         match self.connect_endpoint(ep) {
             Ok(()) => 0,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         }
     }
 
@@ -821,20 +929,20 @@ impl super::Socket for InetSocket {
         let peer = match addr {
             Some(ab) => match parse_sockaddr(ab) {
                 Ok(e) => Some(e),
-                Err(e) => return e.errno(),
+                Err(e) => return e.as_neg_i64(),
             },
             None => None,
         };
         match self.send_payload(buf, peer, nonblock) {
             Ok(w) => w as i64,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         }
     }
 
     fn recv_from(&self, buf: &mut [u8], peer_out: Option<(u64, u64)>, nonblock: bool) -> i64 {
         let (read, peer) = match self.recv(buf, nonblock) {
             Ok(r) => r,
-            Err(e) => return e.errno(),
+            Err(e) => return e.as_neg_i64(),
         };
         if let Some((addr, addrlen_ptr)) = peer_out {
             if addr != 0 && addrlen_ptr != 0 {
@@ -852,7 +960,7 @@ impl super::Socket for InetSocket {
     fn shutdown(&self, how: i32) -> i64 {
         match self.do_shutdown(how) {
             Ok(()) => 0,
-            Err(e) => e.errno(),
+            Err(e) => e.as_neg_i64(),
         }
     }
 
@@ -1189,40 +1297,42 @@ pub const SOCKADDR_MAX: usize = 28;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-pub fn parse_sockaddr(buf: &[u8]) -> Result<IpEndpoint, FsError> {
+pub fn parse_sockaddr(buf: &[u8]) -> KResult<IpEndpoint> {
     if buf.len() < 2 {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     match u16::from_le_bytes([buf[0], buf[1]]) {
         AF_INET => parse_sockaddr_in(buf),
         AF_INET6 => parse_sockaddr_in6(buf),
-        _ => Err(FsError::InvalidArgument),
+        _ => Err(Errno::INVAL),
     }
 }
 
-pub fn parse_sockaddr_in(buf: &[u8]) -> Result<IpEndpoint, FsError> {
+pub fn parse_sockaddr_in(buf: &[u8]) -> KResult<IpEndpoint> {
     if buf.len() < 8 {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     let fam = u16::from_le_bytes([buf[0], buf[1]]);
     if fam != AF_INET {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     let port = u16::from_be_bytes([buf[2], buf[3]]);
     let addr = Ipv4Address::new(buf[4], buf[5], buf[6], buf[7]);
     Ok(IpEndpoint::new(IpAddress::Ipv4(addr), port))
 }
 
-pub fn parse_sockaddr_in6(buf: &[u8]) -> Result<IpEndpoint, FsError> {
+pub fn parse_sockaddr_in6(buf: &[u8]) -> KResult<IpEndpoint> {
     if buf.len() < 24 {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     let fam = u16::from_le_bytes([buf[0], buf[1]]);
     if fam != AF_INET6 {
-        return Err(FsError::InvalidArgument);
+        return Err(Errno::INVAL);
     }
     let port = u16::from_be_bytes([buf[2], buf[3]]);
-    let addr = Ipv6Address::from_bytes(&buf[8..24]);
+    let mut o6 = [0u8; 16];
+    o6.copy_from_slice(&buf[8..24]);
+    let addr = Ipv6Address::from(o6);
     Ok(IpEndpoint::new(IpAddress::Ipv6(addr), port))
 }
 
@@ -1231,13 +1341,13 @@ pub fn write_sockaddr_in(ep: &IpEndpoint, out: &mut [u8]) -> usize {
     match ep.addr {
         IpAddress::Ipv4(a) => {
             out[0..2].copy_from_slice(&AF_INET.to_le_bytes());
-            out[4..8].copy_from_slice(a.as_bytes());
+            out[4..8].copy_from_slice(&a.octets());
             16
         }
         IpAddress::Ipv6(a) => {
             out[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
             out[4..8].copy_from_slice(&0u32.to_le_bytes());
-            out[8..24].copy_from_slice(a.as_bytes());
+            out[8..24].copy_from_slice(&a.octets());
             out[24..28].copy_from_slice(&0u32.to_le_bytes());
             28
         }

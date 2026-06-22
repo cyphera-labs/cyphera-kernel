@@ -63,6 +63,10 @@ name = "proc_cow_fork"
 version = "0.0.1"
 
 [[package]]
+name = "proc_cow_fork_mmrace"
+version = "0.0.1"
+
+[[package]]
 name = "proc_cow_forkrace"
 version = "0.0.1"
 
@@ -135,11 +139,19 @@ name = "proc_fork"
 version = "0.0.1"
 
 [[package]]
+name = "proc_fork_rlimit"
+version = "0.0.1"
+
+[[package]]
 name = "proc_fork_shared"
 version = "0.0.1"
 
 [[package]]
 name = "proc_fs_extras"
+version = "0.0.1"
+
+[[package]]
+name = "proc_fsync"
 version = "0.0.1"
 
 [[package]]
@@ -156,6 +168,10 @@ version = "0.0.1"
 
 [[package]]
 name = "proc_ioctl_oss"
+version = "0.0.1"
+
+[[package]]
+name = "proc_itimer"
 version = "0.0.1"
 
 [[package]]
@@ -179,6 +195,14 @@ name = "proc_misc_quickwins"
 version = "0.0.1"
 
 [[package]]
+name = "proc_mknod"
+version = "0.0.1"
+
+[[package]]
+name = "proc_mlock"
+version = "0.0.1"
+
+[[package]]
 name = "proc_mmap_extras"
 version = "0.0.1"
 
@@ -195,11 +219,23 @@ name = "proc_mremap"
 version = "0.0.1"
 
 [[package]]
+name = "proc_msg_dontwait"
+version = "0.0.1"
+
+[[package]]
 name = "proc_namespaces"
 version = "0.0.1"
 
 [[package]]
 name = "proc_net"
+version = "0.0.1"
+
+[[package]]
+name = "proc_oom"
+version = "0.0.1"
+
+[[package]]
+name = "proc_oom_stack"
 version = "0.0.1"
 
 [[package]]
@@ -223,6 +259,10 @@ name = "proc_pidns"
 version = "0.0.1"
 
 [[package]]
+name = "proc_pipe_size"
+version = "0.0.1"
+
+[[package]]
 name = "proc_process_vm"
 version = "0.0.1"
 
@@ -243,7 +283,15 @@ name = "proc_ptrace_orphan"
 version = "0.0.1"
 
 [[package]]
+name = "proc_ptrace_segv"
+version = "0.0.1"
+
+[[package]]
 name = "proc_ptrace_signal"
+version = "0.0.1"
+
+[[package]]
+name = "proc_ptrace_singlestep"
 version = "0.0.1"
 
 [[package]]
@@ -271,6 +319,14 @@ name = "proc_rt"
 version = "0.0.1"
 
 [[package]]
+name = "proc_rt_signal"
+version = "0.0.1"
+
+[[package]]
+name = "proc_sa_restart"
+version = "0.0.1"
+
+[[package]]
 name = "proc_sched_churn"
 version = "0.0.1"
 
@@ -283,11 +339,23 @@ name = "proc_segv"
 version = "0.0.1"
 
 [[package]]
+name = "proc_segv_handler"
+version = "0.0.1"
+
+[[package]]
 name = "proc_select"
 version = "0.0.1"
 
 [[package]]
+name = "proc_sigfpe_handler"
+version = "0.0.1"
+
+[[package]]
 name = "proc_signal"
+version = "0.0.1"
+
+[[package]]
+name = "proc_signal_drain"
 version = "0.0.1"
 
 [[package]]
@@ -340,6 +408,10 @@ version = "0.0.1"
 
 [[package]]
 name = "proc_tmpfs_leak"
+version = "0.0.1"
+
+[[package]]
+name = "proc_uid_sigpending"
 version = "0.0.1"
 
 [[package]]

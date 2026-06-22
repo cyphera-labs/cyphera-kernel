@@ -34,7 +34,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
 
     let mut vmspace = VmSpace::new_user().expect("alloc proc_mmap_shared vmspace");
 
-    let loaded = kernel::elf::load_static(ELF, &mut vmspace).expect("load proc_mmap_shared");
+    let loaded =
+        kernel::loader::elf::load_static(ELF, &mut vmspace).expect("load proc_mmap_shared");
     let _ = vmspace
         .map_anon(
             VirtAddr::new(STACK_VADDR),
@@ -43,7 +44,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         )
         .expect("map stack");
 
-    let _pid = kernel::sched::register_with_vmspace(
+    let _pid = kernel::process_model::register_with_vmspace(
         Some(vmspace),
         loaded.entry,
         STACK_VADDR + (STACK_PAGES * 4096) as u64,
@@ -52,5 +53,5 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
 
     println!("[test] mmap_shared: dropping to ring 3");
     println!("------ user output ------");
-    kernel::sched::start_first()
+    kernel::core::start_first()
 }

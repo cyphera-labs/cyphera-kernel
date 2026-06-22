@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use frame::sync::SpinIrq;
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -23,7 +23,7 @@ use smoltcp::wire::{
 
 use device::VirtioNetDevice;
 
-use crate::wait::WaitQueue;
+use crate::core::wait::WaitQueue;
 
 pub trait Socket {
     fn bind(&self, addr: &[u8]) -> i64 {
@@ -82,6 +82,17 @@ pub struct NetStack {
     pub loop_device: Loopback,
     pub loop_iface: Interface,
     pub sockets: SocketSet<'static>,
+    pub loop_sockets: SocketSet<'static>,
+}
+
+impl NetStack {
+    pub fn set(&mut self, loopback: bool) -> &mut SocketSet<'static> {
+        if loopback {
+            &mut self.loop_sockets
+        } else {
+            &mut self.sockets
+        }
+    }
 }
 
 pub struct NetNamespace {
@@ -111,11 +122,13 @@ impl NetNamespace {
             let now = smoltcp_now();
             let mut changed = false;
             if let (Some(iface), Some(device)) = (stack.iface.as_mut(), stack.device.as_mut()) {
-                changed |= iface.poll(now, device, &mut stack.sockets);
+                changed |=
+                    iface.poll(now, device, &mut stack.sockets) == PollResult::SocketStateChanged;
             }
             changed |= stack
                 .loop_iface
-                .poll(now, &mut stack.loop_device, &mut stack.sockets);
+                .poll(now, &mut stack.loop_device, &mut stack.loop_sockets)
+                == PollResult::SocketStateChanged;
             (r, changed)
         };
         if changed {
@@ -216,7 +229,7 @@ fn build_loopback() -> (Loopback, Interface) {
             ))
             .ok();
         addrs
-            .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOOPBACK), 128))
+            .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128))
             .ok();
         addrs
             .push(IpCidr::new(
@@ -273,6 +286,7 @@ pub fn init() {
         loop_device,
         loop_iface,
         sockets: SocketSet::new(Vec::new()),
+        loop_sockets: SocketSet::new(Vec::new()),
     };
     let ns = NetNamespace::new(stack);
     register_ns(&ns);
@@ -296,6 +310,7 @@ pub fn new_namespace() -> Arc<NetNamespace> {
         loop_device,
         loop_iface,
         sockets: SocketSet::new(Vec::new()),
+        loop_sockets: SocketSet::new(Vec::new()),
     };
     let ns = NetNamespace::new(stack);
     register_ns(&ns);
@@ -327,7 +342,7 @@ extern "C" fn smoltcp_pump() -> ! {
 }
 
 pub fn start_pump_kthread() {
-    let _pid = crate::sched::spawn_kthread("smoltcp-pump", smoltcp_pump);
+    let _pid = crate::process_model::spawn_kthread("smoltcp-pump", smoltcp_pump);
 }
 
 fn smoltcp_now() -> Instant {

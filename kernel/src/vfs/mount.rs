@@ -84,7 +84,7 @@ pub fn move_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str) -> i64
     };
     let tgt_inode = match super::path::resolve(ctx, &ctx.root, t_norm) {
         Ok(i) => i,
-        Err(e) => return e.errno(),
+        Err(e) => return e.as_neg_i64(),
     };
     ctx.remove_mount(s_norm);
     ctx.install_mount(
@@ -106,11 +106,11 @@ pub fn bind_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str, flags:
     }
     let src_inode = match super::path::resolve(ctx, &ctx.root, s_norm) {
         Ok(i) => i,
-        Err(e) => return e.errno(),
+        Err(e) => return e.as_neg_i64(),
     };
     let tgt_inode = match super::path::resolve(ctx, &ctx.root, t_norm) {
         Ok(i) => i,
-        Err(e) => return e.errno(),
+        Err(e) => return e.as_neg_i64(),
     };
     let src_entry = ctx
         .lookup_mount_full(s_norm)
@@ -188,7 +188,7 @@ pub fn install_new(
 pub fn do_umount(ctx: &super::path::Context, normalized: &str, flags: u64) -> i64 {
     if (flags & UMOUNT_NOFOLLOW) != 0 {
         if let Err(e) = super::path::resolve_no_follow(ctx, &ctx.root, normalized) {
-            return e.errno();
+            return e.as_neg_i64();
         }
     }
 

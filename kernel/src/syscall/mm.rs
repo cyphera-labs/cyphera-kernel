@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 use frame::mm::vm::{Perms, VmSpace};
 use frame::mm::{Page, Size4KiB, VirtAddr};
 
+use crate::core as sched;
 use crate::errno::{EBADF, EFAULT, EINVAL, ENOMEM, EPERM, ESRCH};
-use crate::sched;
 use crate::vfs::Inode;
 
 const PROT_NONE: u64 = 0;
@@ -19,7 +19,12 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_POPULATE: u64 = 0x8000;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+
+const MCL_CURRENT: u64 = 1;
+const MCL_FUTURE: u64 = 2;
+const MCL_ONFAULT: u64 = 4;
 
 fn align_up_page(addr: u64) -> u64 {
     (addr + 0xfff) & !0xfff
@@ -141,7 +146,7 @@ fn map_shared_segment(
     perms: Perms,
     segment: Arc<crate::ipc::shm::ShmSegment>,
 ) -> i64 {
-    use crate::process::{Vma, VmaBacking, VmaFlags};
+    use crate::process_model::{Vma, VmaBacking, VmaFlags};
     let pages = (length_aligned / 4096) as usize;
     let vm_arc = match sched::current_vmspace() {
         Some(v) => v,
@@ -192,7 +197,7 @@ fn map_shared_segment(
 }
 
 pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64 {
-    use crate::process::{Vma, VmaBacking, VmaFlags};
+    use crate::process_model::{Vma, VmaBacking, VmaFlags};
     if sched::current_is_vfork_borrower() {
         return ENOMEM;
     }
@@ -278,11 +283,13 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
             if !is_shared {
                 return EINVAL;
             }
-            let segment =
-                match crate::drm::segment_for_mmap(*file_offset_base, length_aligned as usize) {
-                    Some(s) => s,
-                    None => return EINVAL,
-                };
+            let segment = match crate::device::drm::segment_for_mmap(
+                *file_offset_base,
+                length_aligned as usize,
+            ) {
+                Some(s) => s,
+                None => return EINVAL,
+            };
             return map_shared_segment(vaddr, length_aligned, perms, segment);
         }
     }
@@ -294,7 +301,7 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
     if is_shared {
         vflags |= VmaFlags::SHARED;
     }
-    sched::with_current_mmap_mut(|m| {
+    let mlockall_flags = sched::with_current_mmap_mut(|m| {
         m.insert(Vma {
             start: vaddr,
             end: vaddr + length_aligned,
@@ -302,18 +309,35 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
             flags: vflags,
             backing,
         });
+        m.mlockall_flags as u64
     });
+
+    let lock_future = mlockall_flags & MCL_FUTURE != 0;
+    if lock_future {
+        sched::with_current_mmap_mut(|m| {
+            m.lock_range(vaddr, vaddr + length_aligned, true);
+        });
+    }
+
+    if (flags & MAP_POPULATE) != 0 || (lock_future && mlockall_flags & MCL_ONFAULT == 0) {
+        let mut p = vaddr;
+        let end = vaddr + length_aligned;
+        while p < end {
+            let _ = crate::mm::mmap_fault::populate_one_page(p);
+            p += 4096;
+        }
+    }
 
     vaddr as i64
 }
 
 fn detach_shared_dropped(
     vmspace: &mut VmSpace,
-    dropped: &[crate::process::Vma],
+    dropped: &[crate::process_model::Vma],
     addr: u64,
     end: u64,
 ) {
-    use crate::process::{VmaBacking, VmaFlags};
+    use crate::process_model::{VmaBacking, VmaFlags};
     for vma in dropped {
         match &vma.backing {
             VmaBacking::File {
@@ -381,12 +405,12 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> i64 {
     };
     let dropped = sched::with_current_mmap_mut(|m| m.unmap_range(addr, addr + length_aligned));
     for vma in &dropped {
-        if let crate::process::VmaBacking::File {
+        if let crate::process_model::VmaBacking::File {
             inode,
             file_offset_base,
         } = &vma.backing
         {
-            if vma.flags.contains(crate::process::VmaFlags::SHARED) {
+            if vma.flags.contains(crate::process_model::VmaFlags::SHARED) {
                 let lo = vma.start.max(addr);
                 let hi = vma.end.min(addr + length_aligned);
                 if lo < hi {
@@ -421,7 +445,7 @@ pub(super) fn sys_mremap(
     flags: u64,
     _new_addr: u64,
 ) -> i64 {
-    use crate::process::{Vma, VmaFlags};
+    use crate::process_model::{Vma, VmaFlags};
 
     if sched::current_is_vfork_borrower() {
         return ENOMEM;
@@ -561,7 +585,7 @@ fn unmap_pages_locked(vaddr: u64, pages: usize) {
     }
 }
 
-fn m_last_end_bump(m: &mut crate::process::MmapState, new_end: u64) {
+fn m_last_end_bump(m: &mut crate::process_model::MmapState, new_end: u64) {
     if new_end > m.last_end {
         m.last_end = new_end;
     }
@@ -577,10 +601,10 @@ pub(super) fn sys_msync(addr: u64, length: u64, _flags: u64) -> i64 {
     let targets: alloc::vec::Vec<MsyncTarget> = sched::with_current_mmap(|m| {
         m.vmas
             .iter()
-            .filter(|v| v.flags.contains(crate::process::VmaFlags::SHARED))
+            .filter(|v| v.flags.contains(crate::process_model::VmaFlags::SHARED))
             .filter(|v| v.start < end && addr < v.end)
             .filter_map(|v| {
-                if let crate::process::VmaBacking::File {
+                if let crate::process_model::VmaBacking::File {
                     inode,
                     file_offset_base,
                 } = &v.backing
@@ -679,9 +703,9 @@ pub(super) fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
             .iter()
             .filter(|v| v.start < end && addr < v.end)
             .filter(|v| {
-                v.flags.contains(crate::process::VmaFlags::ANON)
-                    || (matches!(v.backing, crate::process::VmaBacking::File { .. })
-                        && !v.flags.contains(crate::process::VmaFlags::SHARED))
+                v.flags.contains(crate::process_model::VmaFlags::ANON)
+                    || (matches!(v.backing, crate::process_model::VmaBacking::File { .. })
+                        && !v.flags.contains(crate::process_model::VmaFlags::SHARED))
             })
             .map(|v| (v.start.max(addr), v.end.min(end)))
             .collect()
@@ -714,31 +738,39 @@ pub(super) fn sys_membarrier(cmd: u64, _flags: u64, _cpu_id: u64) -> i64 {
 }
 
 pub(super) fn sys_mlock(addr: u64, len: u64) -> i64 {
-    mlock_validate(addr, len)
-}
-
-pub(super) fn sys_munlock(addr: u64, len: u64) -> i64 {
-    mlock_validate(addr, len)
+    mlock_common(addr, len, true)
 }
 
 pub(super) fn sys_mlock2(addr: u64, len: u64, flags: u64) -> i64 {
-    if flags & !1u64 != 0 {
+    const MLOCK_ONFAULT: u64 = 1;
+    if flags & !MLOCK_ONFAULT != 0 {
         return EINVAL;
     }
-    mlock_validate(addr, len)
+    let populate = flags & MLOCK_ONFAULT == 0;
+    mlock_common(addr, len, populate)
 }
 
-fn mlock_validate(addr: u64, len: u64) -> i64 {
+pub(super) fn sys_munlock(addr: u64, len: u64) -> i64 {
     if len == 0 {
         return 0;
     }
-    let end = match addr.checked_add(len) {
-        Some(e) => e,
-        None => return EINVAL,
+    let (lo, hi) = match mlock_range(addr, len) {
+        Ok(r) => r,
+        Err(e) => return e,
     };
+    sched::with_current_mmap_mut(|m| {
+        m.lock_range(lo, hi, false);
+    });
+    0
+}
+
+fn mlock_range(addr: u64, len: u64) -> Result<(u64, u64), i64> {
+    let end = addr.checked_add(len).ok_or(EINVAL)?;
+    let lo = addr & !0xfff;
+    let hi = (end + 0xfff) & !0xfff;
     let ok = sched::with_current_mmap(|m| {
-        let mut cur = addr & !0xfff;
-        while cur < end {
+        let mut cur = lo;
+        while cur < hi {
             if m.find_containing(cur).is_none() {
                 return false;
             }
@@ -747,19 +779,81 @@ fn mlock_validate(addr: u64, len: u64) -> i64 {
         true
     });
     if !ok {
-        return ENOMEM;
+        return Err(ENOMEM);
     }
+    Ok((lo, hi))
+}
+
+fn mlock_common(addr: u64, len: u64, populate: bool) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let (lo, hi) = match mlock_range(addr, len) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if populate {
+        let mut p = lo;
+        while p < hi {
+            if !crate::mm::mmap_fault::populate_one_page(p) {
+                return ENOMEM;
+            }
+            p += 4096;
+        }
+    }
+    sched::with_current_mmap_mut(|m| {
+        m.lock_range(lo, hi, true);
+    });
     0
 }
 
 pub(super) fn sys_mlockall(flags: u64) -> i64 {
-    if flags == 0 || flags & !0b111 != 0 {
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
         return EINVAL;
     }
+    if flags & MCL_CURRENT != 0 {
+        let ranges: alloc::vec::Vec<(u64, u64)> =
+            sched::with_current_mmap(|m| m.vmas.iter().map(|v| (v.start, v.end)).collect());
+        if flags & MCL_ONFAULT == 0 {
+            for (s, e) in &ranges {
+                let mut p = *s;
+                while p < *e {
+                    if !crate::mm::mmap_fault::populate_one_page(p) {
+                        return ENOMEM;
+                    }
+                    p += 4096;
+                }
+            }
+        }
+        if let (Some(min), Some(max)) = (
+            ranges.iter().map(|r| r.0).min(),
+            ranges.iter().map(|r| r.1).max(),
+        ) {
+            sched::with_current_mmap_mut(|m| {
+                m.lock_range(min, max, true);
+            });
+        }
+    }
+    sched::with_current_mmap_mut(|m| {
+        m.mlockall_flags = (flags & (MCL_FUTURE | MCL_ONFAULT)) as u32;
+    });
     0
 }
 
 pub(super) fn sys_munlockall() -> i64 {
+    let ranges: alloc::vec::Vec<(u64, u64)> =
+        sched::with_current_mmap(|m| m.vmas.iter().map(|v| (v.start, v.end)).collect());
+    if let (Some(min), Some(max)) = (
+        ranges.iter().map(|r| r.0).min(),
+        ranges.iter().map(|r| r.1).max(),
+    ) {
+        sched::with_current_mmap_mut(|m| {
+            m.lock_range(min, max, false);
+        });
+    }
+    sched::with_current_mmap_mut(|m| {
+        m.mlockall_flags = 0;
+    });
     0
 }
 

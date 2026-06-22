@@ -37,7 +37,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     kernel::init();
 
     let mut vmspace = VmSpace::new_user().expect("alloc proc_argv vmspace");
-    let loaded = kernel::elf::load_static(PROC_ARGV_ELF, &mut vmspace).expect("load proc_argv");
+    let loaded =
+        kernel::loader::elf::load_static(PROC_ARGV_ELF, &mut vmspace).expect("load proc_argv");
     let _ = vmspace
         .map_anon(
             VirtAddr::new(STACK_VADDR),
@@ -49,8 +50,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     let argv: [&[u8]; 3] = [b"/bin/proc_argv", b"hello", b"world"];
     let envp: [&[u8]; 1] = [b"FOO=bar"];
 
-    let aux = kernel::stack_init::AuxvInfo::for_exec(&loaded, 0, 0, 0, 0, false);
-    let pid = kernel::sched::register_with_argv(
+    let aux = kernel::loader::stack_init::AuxvInfo::for_exec(&loaded, 0, 0, 0, 0, false);
+    let pid = kernel::process_model::register_with_argv(
         vmspace,
         loaded.entry,
         STACK_VADDR + (STACK_PAGES * 4096) as u64,
@@ -68,5 +69,5 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
         loaded.entry
     );
     println!("------ user output ------");
-    kernel::sched::start_first()
+    kernel::core::start_first()
 }

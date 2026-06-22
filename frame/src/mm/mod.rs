@@ -6,6 +6,7 @@ pub mod mmio_map;
 pub mod vm;
 
 pub use addr::{PAGE_SIZE, Page, PhysAddr, PhysFrame, Size4KiB, VirtAddr};
+pub use vm::AddrSpaceRoot;
 
 pub fn zero_frame(frame: PhysFrame<x86_64::structures::paging::Size4KiB>) {
     let kva = crate::mm::direct_map::phys_to_virt(frame.start_address().as_u64());

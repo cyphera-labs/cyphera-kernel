@@ -25,13 +25,13 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     }
     println!("[test] io_throttle: io.max wbps=4KiB/s on root cgroup");
 
-    kernel::sched::spawn_kthread("io_throttle_worker", io_worker_entry);
+    kernel::process_model::spawn_kthread("io_throttle_worker", io_worker_entry);
 
-    kernel::sched::start_first()
+    kernel::core::start_first()
 }
 
 extern "C" fn io_worker_entry() -> ! {
-    let cg = kernel::sched::current_cgroup();
+    let cg = kernel::core::current_cgroup();
     let expected_root = kernel::cgroup::root();
     if cg.is_none() || !Arc::ptr_eq(&cg.unwrap(), &expected_root) {
         println!("[test] io_throttle: kthread not in root cgroup — fail");

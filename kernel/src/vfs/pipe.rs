@@ -9,17 +9,23 @@ use frame_host as frame;
 
 use frame::sync::SpinIrq;
 
-use crate::wait::WaitQueue;
+use crate::core::wait::WaitQueue;
 
 #[cfg(not(host_test))]
-use super::{FsError, Inode, InodeKind, OpenFlags, PollMask, Stat};
+use super::{Inode, InodeKind, OpenFlags, PollMask, Stat};
+
+#[cfg(not(host_test))]
+use cyphera_kapi::{Errno, KResult};
 
 const PIPE_CAPACITY: usize = 65_536;
+const PIPE_MIN_CAPACITY: usize = 4096;
+const PIPE_MAX_CAPACITY: usize = 1 << 20;
 
 struct PipeState {
     buf: VecDeque<u8>,
     readers: u32,
     writers: u32,
+    cap: usize,
 }
 
 pub struct Pipe {
@@ -35,6 +41,7 @@ impl Pipe {
                 buf: VecDeque::with_capacity(PIPE_CAPACITY),
                 readers: 0,
                 writers: 0,
+                cap: PIPE_CAPACITY,
             }),
             read_waiters: WaitQueue::new(),
             write_waiters: WaitQueue::new(),
@@ -109,7 +116,7 @@ impl Pipe {
         if s.readers == 0 {
             return WriteStep::BrokenPipe;
         }
-        let room = PIPE_CAPACITY.saturating_sub(s.buf.len());
+        let room = s.cap.saturating_sub(s.buf.len());
         if room > 0 {
             let n = buf.len().min(room);
             s.buf.extend(buf[..n].iter().copied());
@@ -126,7 +133,7 @@ impl Pipe {
         if !s.buf.is_empty() || s.writers == 0 {
             in_ = true;
         }
-        if s.buf.len() < PIPE_CAPACITY || s.readers == 0 {
+        if s.buf.len() < s.cap || s.readers == 0 {
             out_ = true;
         }
         if s.writers == 0 && s.buf.is_empty() {
@@ -150,6 +157,21 @@ impl Pipe {
     #[allow(dead_code)]
     pub(crate) fn capacity() -> usize {
         PIPE_CAPACITY
+    }
+
+    pub(crate) fn get_capacity(&self) -> usize {
+        self.state.lock().cap
+    }
+
+    pub(crate) fn set_capacity(&self, want: usize) -> Option<usize> {
+        let want = want.clamp(PIPE_MIN_CAPACITY, PIPE_MAX_CAPACITY);
+        let rounded = want.next_multiple_of(PIPE_MIN_CAPACITY);
+        let mut s = self.state.lock();
+        if rounded < s.buf.len() {
+            return None;
+        }
+        s.cap = rounded;
+        Some(rounded)
     }
 }
 
@@ -175,22 +197,21 @@ impl Inode for Pipe {
         Stat::fresh(InodeKind::Pipe, self.buffered() as u64, 0o600)
     }
 
-    fn peek_at(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn as_pipe(&self) -> Option<&Pipe> {
+        Some(self)
+    }
+
+    fn peek_at(&self, buf: &mut [u8]) -> KResult<usize> {
         Ok(self.peek_inner(buf))
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         self.read_at_with_flags(offset, buf, OpenFlags::empty())
     }
 
-    fn read_at_with_flags(
-        &self,
-        _offset: u64,
-        buf: &mut [u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn read_at_with_flags(&self, _offset: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
-        let cur = crate::sched::current_pid();
+        let cur = crate::core::current_pid();
         loop {
             self.read_waiters.enqueue(cur);
             match self.read_step(buf) {
@@ -205,29 +226,25 @@ impl Inode for Pipe {
                 }
                 ReadStep::WouldPark if nonblock => {
                     self.read_waiters.dequeue(cur);
-                    return Err(FsError::WouldBlock);
+                    return Err(Errno::AGAIN);
                 }
                 ReadStep::WouldPark => {}
             }
-            let outcome =
-                crate::wait::wait_guarded("pipe_read", None, &|| self.read_waiters.contains(cur));
+            let outcome = crate::core::wait::wait_guarded("pipe_read", None, &|| {
+                self.read_waiters.contains(cur)
+            });
             self.read_waiters.dequeue(cur);
-            if outcome == crate::wait::WaitOutcome::Interrupted {
-                return Err(FsError::Interrupted);
+            if outcome == crate::core::wait::WaitOutcome::Interrupted {
+                return Err(Errno::INTR);
             }
         }
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
         self.write_at_with_flags(offset, buf, OpenFlags::empty())
     }
 
-    fn write_at_with_flags(
-        &self,
-        _offset: u64,
-        buf: &[u8],
-        flags: OpenFlags,
-    ) -> Result<usize, FsError> {
+    fn write_at_with_flags(&self, _offset: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
         use crate::vfs::blocking::IoAttempt;
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
         crate::vfs::blocking::block_io("pipe_write", &self.write_waiters, nonblock, None, || {
@@ -236,7 +253,7 @@ impl Inode for Pipe {
                     self.read_waiters.wake_one();
                     IoAttempt::Ready(n)
                 }
-                WriteStep::BrokenPipe => IoAttempt::Err(FsError::BrokenPipe),
+                WriteStep::BrokenPipe => IoAttempt::Err(Errno::PIPE),
                 WriteStep::WouldPark => IoAttempt::WouldBlock,
             }
         })
