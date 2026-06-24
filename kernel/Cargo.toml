@@ -45,7 +45,7 @@ virtio = { path = "../drivers/virtio", optional = true }
 # Result everywhere (no panics on malformed input) and is exercised by
 # every Rust compile.
 # read_core + elf only — no compression, no write, no archive.
-object = { version = "0.36", default-features = false, features = ["read_core", "elf"], optional = true }
+object = { version = "0.39", default-features = false, features = ["read_core", "elf"], optional = true }
 bitflags = { version = "2.12", default-features = false }
 # smoltcp — TCP/IP stack. Wraps our virtio-net driver via a Device
 # adapter. MIT/Apache, used under MIT. The heapless "medium-ip"
