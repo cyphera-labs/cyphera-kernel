@@ -297,4 +297,49 @@ pub fn apply_exec_transition(c: &mut crate::process_model::Credentials, t: &Exec
         c.sgid = gid;
         c.fsgid = gid;
     }
+    let privileged = c.euid == 0 || c.ruid == 0;
+    c.caps_perm = if privileged {
+        c.caps_bnd | c.caps_inh
+    } else {
+        0
+    };
+    c.caps_eff = if c.euid == 0 { c.caps_perm } else { 0 };
+}
+
+pub fn set_supplementary_groups(
+    c: &mut crate::process_model::Credentials,
+    ns_gids: &[u32],
+) -> Result<(), i64> {
+    let mut kgroups = alloc::vec::Vec::with_capacity(ns_gids.len());
+    for &g in ns_gids {
+        match c.gid_into_kernel(g) {
+            Some(k) => kgroups.push(k),
+            None => return Err(EINVAL),
+        }
+    }
+    c.groups = kgroups;
+    Ok(())
+}
+
+pub fn clear_supplementary_groups(c: &mut crate::process_model::Credentials) {
+    c.groups.clear();
+}
+
+pub fn enter_user_namespace(
+    c: &mut crate::process_model::Credentials,
+    new_ns: alloc::sync::Arc<crate::process_model::UserNamespace>,
+) {
+    c.user_ns = Some(new_ns);
+    c.caps_eff = crate::process_model::ALL_CAPS_MASK;
+    c.caps_perm = crate::process_model::ALL_CAPS_MASK;
+    c.caps_inh = crate::process_model::ALL_CAPS_MASK;
+    c.caps_bnd = crate::process_model::ALL_CAPS_MASK;
+}
+
+pub fn set_loginuid(c: &mut crate::process_model::Credentials, val: u32) -> bool {
+    if !c.has_cap(crate::process_model::CAP_AUDIT_CONTROL) {
+        return false;
+    }
+    c.loginuid = val;
+    true
 }

@@ -115,9 +115,15 @@ impl Inode for PidDir {
             "setgroups" => Ok(Arc::new(SetgroupsFile { pid: self.pid })),
             "loginuid" => Ok(Arc::new(LoginuidFile { pid: self.pid })),
             "exe" => {
-                let target = crate::core::process_exe(self.pid).ok_or(Errno::NOENT)?;
-                let s = alloc::string::String::from_utf8(target).map_err(|_| Errno::NOENT)?;
-                Ok(crate::fs::tmpfs::TmpfsInode::new_symlink(s))
+                let underlying = crate::core::process_exe_inode(self.pid);
+                let target = match crate::core::process_exe(self.pid) {
+                    Some(t) => alloc::string::String::from_utf8(t).map_err(|_| Errno::NOENT)?,
+                    None => match underlying.as_ref() {
+                        Some(inode) => synthesize_fd_link_target(inode.as_ref()),
+                        None => return Err(Errno::NOENT),
+                    },
+                };
+                Ok(Arc::new(MagicFdLink { target, underlying }))
             }
             "ns" => Ok(Arc::new(PidNsDir { pid: self.pid })),
             _ => Err(Errno::NOENT),
@@ -162,7 +168,9 @@ impl Inode for PidDir {
                 inode_id: 0xa800_0000_0000_0000 | pid,
             },
         ];
-        if crate::core::process_exe(self.pid).is_some() {
+        if crate::core::process_exe_inode(self.pid).is_some()
+            || crate::core::process_exe(self.pid).is_some()
+        {
             entries.push(DirEntry {
                 name: "exe".to_string(),
                 kind: InodeKind::Symlink,
@@ -856,7 +864,7 @@ impl Inode for IdMapFile {
         let cap = if is_uid { CAP_SETUID } else { CAP_SETGID };
         let (writer_id, privileged) = crate::core::with_current_creds(|c| {
             let id = if is_uid { c.euid } else { c.egid };
-            (id, c.capable_host(cap))
+            (id, c.capable_in(cap, ns.parent.as_ref()))
         });
         if !privileged {
             if parsed.len() != 1 || parsed[0].length != 1 || parsed[0].outside_start != writer_id {
@@ -950,13 +958,8 @@ impl Inode for LoginuidFile {
         }
         let s = core::str::from_utf8(buf).map_err(|_| Errno::INVAL)?;
         let val: u32 = s.trim().parse().map_err(|_| Errno::INVAL)?;
-        let ok = crate::core::with_current_creds_mut(|c| {
-            if !c.has_cap(crate::process_model::CAP_AUDIT_CONTROL) {
-                return false;
-            }
-            c.loginuid = val;
-            true
-        });
+        let ok =
+            crate::core::with_current_creds_mut(|c| crate::security::setid::set_loginuid(c, val));
         if ok { Ok(buf.len()) } else { Err(Errno::ACCES) }
     }
 }
@@ -1096,7 +1099,8 @@ impl Inode for CpuInfoFile {
             let _ = writeln!(body, "siblings\t: {count}");
             let _ = writeln!(body, "core id\t\t: {cpu}");
             let _ = writeln!(body, "cpu cores\t: {count}");
-            let _ = writeln!(body, "apicid\t\t: {cpu}");
+            let apicid = frame::cpu::cpu_registry::apic_for_index(cpu).unwrap_or(cpu as u8);
+            let _ = writeln!(body, "apicid\t\t: {apicid}");
             let _ = writeln!(body, "flags\t\t: fpu pae nx lm rdtscp");
             let _ = writeln!(body);
         }

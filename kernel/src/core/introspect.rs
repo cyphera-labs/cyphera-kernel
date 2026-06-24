@@ -158,6 +158,23 @@ pub fn set_exe_path(pid: Pid, path: Vec<u8>) {
     }
 }
 
+pub fn process_exe_inode(pid: Pid) -> Option<alloc::sync::Arc<dyn crate::vfs::Inode>> {
+    GLOBAL
+        .lock()
+        .processes
+        .get(&pid)
+        .and_then(|p| p.identity.exe_inode())
+}
+
+pub fn process_exe_mnt_flags(pid: Pid) -> u64 {
+    GLOBAL
+        .lock()
+        .processes
+        .get(&pid)
+        .map(|p| p.identity.exe_mnt_flags())
+        .unwrap_or(0)
+}
+
 pub extern "C" fn dump_all_processes() {
     frame::println!("=== dump_all_processes ===");
     let g = GLOBAL.lock();

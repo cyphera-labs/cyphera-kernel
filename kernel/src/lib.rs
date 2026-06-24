@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod errno;
+pub mod sched_state;
 
 #[cfg(host_test)]
 pub mod vfs {

@@ -150,6 +150,7 @@ pub enum VmaBacking {
     },
     Shm {
         segment: alloc::sync::Arc<crate::ipc::shm::ShmSegment>,
+        offset: u64,
     },
 }
 
@@ -268,13 +269,19 @@ impl MmapState {
                 continue;
             }
             if v.start < lo && v.end > hi {
+                if let VmaBacking::Shm { segment, .. } = &v.backing {
+                    segment
+                        .attached
+                        .fetch_add(2, core::sync::atomic::Ordering::AcqRel);
+                }
                 let off_left = lo - v.start;
                 let off_mid = hi - v.start;
                 let backing_left = v.backing.clone();
                 let shift_backing = |delta: u64| match &v.backing {
                     VmaBacking::Anonymous => VmaBacking::Anonymous,
-                    VmaBacking::Shm { segment } => VmaBacking::Shm {
+                    VmaBacking::Shm { segment, offset } => VmaBacking::Shm {
                         segment: segment.clone(),
+                        offset: offset + delta,
                     },
                     VmaBacking::File {
                         inode,
@@ -310,12 +317,18 @@ impl MmapState {
                 continue;
             }
             if v.start < lo {
+                if let VmaBacking::Shm { segment, .. } = &v.backing {
+                    segment
+                        .attached
+                        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                }
                 let backing_kept = v.backing.clone();
                 let off_drop = lo - v.start;
                 let backing_drop = match &v.backing {
                     VmaBacking::Anonymous => VmaBacking::Anonymous,
-                    VmaBacking::Shm { segment } => VmaBacking::Shm {
+                    VmaBacking::Shm { segment, offset } => VmaBacking::Shm {
                         segment: segment.clone(),
+                        offset: offset + off_drop,
                     },
                     VmaBacking::File {
                         inode,
@@ -340,11 +353,17 @@ impl MmapState {
                     backing: backing_drop,
                 });
             } else {
+                if let VmaBacking::Shm { segment, .. } = &v.backing {
+                    segment
+                        .attached
+                        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                }
                 let off_kept = hi - v.start;
                 let backing_kept = match &v.backing {
                     VmaBacking::Anonymous => VmaBacking::Anonymous,
-                    VmaBacking::Shm { segment } => VmaBacking::Shm {
+                    VmaBacking::Shm { segment, offset } => VmaBacking::Shm {
                         segment: segment.clone(),
+                        offset: offset + off_kept,
                     },
                     VmaBacking::File {
                         inode,
@@ -386,8 +405,9 @@ impl MmapState {
         fn shift_backing(b: &VmaBacking, delta: u64) -> VmaBacking {
             match b {
                 VmaBacking::Anonymous => VmaBacking::Anonymous,
-                VmaBacking::Shm { segment } => VmaBacking::Shm {
+                VmaBacking::Shm { segment, offset } => VmaBacking::Shm {
                     segment: segment.clone(),
+                    offset: offset + delta,
                 },
                 VmaBacking::File {
                     inode,
@@ -412,6 +432,14 @@ impl MmapState {
             }
             let mid_lo = v.start.max(lo);
             let mid_hi = v.end.min(hi);
+            if let VmaBacking::Shm { segment, .. } = &v.backing {
+                let extra = (v.start < mid_lo) as u32 + (mid_hi < v.end) as u32;
+                if extra > 0 {
+                    segment
+                        .attached
+                        .fetch_add(extra, core::sync::atomic::Ordering::AcqRel);
+                }
+            }
             if v.start < mid_lo {
                 new_vmas.push(Vma {
                     start: v.start,
@@ -452,8 +480,9 @@ impl MmapState {
         fn shift_backing(b: &VmaBacking, delta: u64) -> VmaBacking {
             match b {
                 VmaBacking::Anonymous => VmaBacking::Anonymous,
-                VmaBacking::Shm { segment } => VmaBacking::Shm {
+                VmaBacking::Shm { segment, offset } => VmaBacking::Shm {
                     segment: segment.clone(),
+                    offset: offset + delta,
                 },
                 VmaBacking::File {
                     inode,
@@ -478,6 +507,14 @@ impl MmapState {
             }
             let mid_lo = v.start.max(lo);
             let mid_hi = v.end.min(hi);
+            if let VmaBacking::Shm { segment, .. } = &v.backing {
+                let extra = (v.start < mid_lo) as u32 + (mid_hi < v.end) as u32;
+                if extra > 0 {
+                    segment
+                        .attached
+                        .fetch_add(extra, core::sync::atomic::Ordering::AcqRel);
+                }
+            }
             if v.start < mid_lo {
                 new_vmas.push(Vma {
                     start: v.start,

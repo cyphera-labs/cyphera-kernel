@@ -161,16 +161,41 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
         perms |= Perms::WRITE;
     }
 
-    let mapping_addr = sched::current_addr_space_opt().and_then(|a| pick_address(&a, addr, length));
-    let vaddr = match mapping_addr {
+    let addr_space = match sched::current_addr_space_opt() {
         Some(a) => a,
         None => return EINVAL,
     };
-
-    let vm_arc = match sched::current_vmspace() {
-        Some(v) => v,
-        None => return EINVAL,
+    let vaddr = {
+        let mut m = addr_space.mmap.lock();
+        let vaddr = match pick_address(&m, addr, length) {
+            Some(a) => a,
+            None => return EINVAL,
+        };
+        let pos = m
+            .vmas
+            .binary_search_by_key(&vaddr, |v| v.start)
+            .unwrap_or_else(|e| e);
+        m.vmas.insert(
+            pos,
+            Vma {
+                start: vaddr,
+                end: vaddr + length,
+                prot: perms,
+                flags: VmaFlags::SHARED,
+                backing: VmaBacking::Shm {
+                    segment: seg.clone(),
+                    offset: 0,
+                },
+            },
+        );
+        let new_end = vaddr + length;
+        if new_end > m.last_end {
+            m.last_end = new_end;
+        }
+        vaddr
     };
+
+    let vm_arc = addr_space.vmspace.clone();
     {
         let mut vm = vm_arc.lock();
         let mut mapped = 0usize;
@@ -194,30 +219,9 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
             for j in 0..mapped {
                 vm.unmap_keep_frame(VirtAddr::new(vaddr + (j * PAGE_SIZE) as u64));
             }
+            drop(vm);
+            addr_space.mmap.lock().vmas.retain(|v| v.start != vaddr);
             return ENOMEM;
-        }
-    }
-
-    {
-        let vma = Vma {
-            start: vaddr,
-            end: vaddr + length,
-            prot: perms,
-            flags: VmaFlags::SHARED,
-            backing: VmaBacking::Shm {
-                segment: seg.clone(),
-            },
-        };
-        let addr_space = sched::current_addr_space_opt().expect("shmat: no address space");
-        let mut m = addr_space.mmap.lock();
-        let pos = m
-            .vmas
-            .binary_search_by_key(&vaddr, |v| v.start)
-            .unwrap_or_else(|e| e);
-        m.vmas.insert(pos, vma);
-        let new_end = vaddr + length;
-        if new_end > m.last_end {
-            m.last_end = new_end;
         }
     }
     seg.attached.fetch_add(1, Ordering::AcqRel);
@@ -233,7 +237,7 @@ pub fn shmdt(addr: u64) -> i64 {
         let pos = m.vmas.iter().position(|v| v.start == addr)?;
         let vma = &m.vmas[pos];
         match &vma.backing {
-            VmaBacking::Shm { segment } => {
+            VmaBacking::Shm { segment, .. } => {
                 let length = vma.end - vma.start;
                 let segment = segment.clone();
                 m.vmas.remove(pos);
@@ -290,7 +294,7 @@ pub fn detach_all_for(
         let mut out = Vec::new();
         let mut i = 0;
         while i < m.vmas.len() {
-            if let VmaBacking::Shm { segment } = &m.vmas[i].backing {
+            if let VmaBacking::Shm { segment, .. } = &m.vmas[i].backing {
                 let v = &m.vmas[i];
                 out.push((segment.clone(), v.start, v.end - v.start));
                 m.vmas.remove(i);
@@ -457,18 +461,17 @@ fn now_secs() -> u64 {
     ns / 1_000_000_000
 }
 
-fn pick_address(
-    addr_space: &crate::process_model::AddressSpace,
-    addr: u64,
-    length: u64,
-) -> Option<u64> {
-    let m = addr_space.mmap.lock();
+fn pick_address(m: &crate::process_model::MmapState, addr: u64, length: u64) -> Option<u64> {
     if addr != 0 {
         if (addr & 0xfff) != 0 {
             return None;
         }
+        let end = match addr.checked_add(length) {
+            Some(e) if e <= frame::mm::vm::USER_VA_END => e,
+            _ => return None,
+        };
         for vma in &m.vmas {
-            if !(vma.end <= addr || vma.start >= addr + length) {
+            if !(vma.end <= addr || vma.start >= end) {
                 return None;
             }
         }
@@ -500,8 +503,9 @@ fn check_access(seg: &ShmSegment, flags: u32) -> bool {
 }
 
 fn ipc_owner_or_admin(seg: &ShmSegment) -> bool {
+    let ipc_owner = sched::with_current_ipc(|i| i.owner_user_ns.clone());
     sched::with_current_creds(|c| {
-        c.capable_host(crate::process_model::CAP_SYS_ADMIN)
+        c.capable_in(crate::process_model::CAP_SYS_ADMIN, ipc_owner.as_ref())
             || c.euid == seg.uid.load(Ordering::Relaxed)
             || c.euid == seg.creator_uid
     })

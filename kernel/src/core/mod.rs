@@ -183,11 +183,13 @@ pub fn send_resched_ipi_pub(target_cpu: u32) {
 
 pub(crate) fn send_resched_ipi(target_cpu: u32) {
     if target_cpu < MAX_CPUS as u32 {
-        frame::intr::lapic::send_ipi(
-            target_cpu as u8,
-            frame::intr::lapic::RESCHED_IPI_VECTOR,
-            frame::intr::lapic::IpiKind::Fixed,
-        );
+        if let Some(apic) = frame::cpu::cpu_registry::apic_for_index(target_cpu) {
+            frame::intr::lapic::send_ipi(
+                apic,
+                frame::intr::lapic::RESCHED_IPI_VECTOR,
+                frame::intr::lapic::IpiKind::Fixed,
+            );
+        }
     }
 }
 
@@ -219,7 +221,7 @@ fn fmt_owner(o: SchedOwner) -> &'static str {
     }
 }
 
-pub struct SchedCell<T>(pub(crate) T);
+pub struct SchedCell<T>(pub(in crate::core) T);
 
 impl<T> SchedCell<T> {
     pub const fn new(v: T) -> Self {
@@ -231,41 +233,10 @@ impl<T> SchedCell<T> {
     }
 }
 
-pub(crate) fn set_sched_owner(proc: &mut Process, new: SchedOwner, site: &'static str) {
+pub(in crate::core) fn set_sched_owner(proc: &mut Process, new: SchedOwner, site: &'static str) {
     let cur = proc.sched_owner.0;
     let pid = proc.pid;
-    let ok = match (cur, new) {
-        (SchedOwner::None, SchedOwner::Runnable { .. }) => true,
-        (SchedOwner::None, SchedOwner::Running { .. }) => true,
-
-        (SchedOwner::Runnable { cpu: a }, SchedOwner::Running { cpu: b }) => a == b,
-        (SchedOwner::Running { cpu: a }, SchedOwner::Runnable { cpu: b }) => a == b,
-
-        (SchedOwner::Running { .. }, SchedOwner::Parked { .. }) => true,
-        (SchedOwner::Parked { .. }, SchedOwner::Runnable { .. }) => true,
-
-        (SchedOwner::Parked { .. }, SchedOwner::Running { cpu: _ }) => true,
-
-        (SchedOwner::Runnable { .. }, SchedOwner::Runnable { .. }) => true,
-
-        (SchedOwner::Running { .. }, SchedOwner::Stopped) => true,
-        (SchedOwner::Running { .. }, SchedOwner::Traced) => true,
-        (SchedOwner::Stopped, SchedOwner::Runnable { .. }) => true,
-        (SchedOwner::Traced, SchedOwner::Runnable { .. }) => true,
-
-        (SchedOwner::Running { .. }, SchedOwner::Zombie) => true,
-        (SchedOwner::Runnable { .. }, SchedOwner::Zombie) => true,
-        (SchedOwner::Parked { .. }, SchedOwner::Zombie) => true,
-        (SchedOwner::Stopped, SchedOwner::Zombie) => true,
-        (SchedOwner::Traced, SchedOwner::Zombie) => true,
-
-        (SchedOwner::Zombie, SchedOwner::Reaping) => true,
-        (SchedOwner::Reaping, SchedOwner::None) => true,
-
-        (a, b) if a == b => true,
-
-        _ => false,
-    };
+    let ok = crate::sched_state::sched_owner_transition_ok(cur, new);
     if !ok {
         panic!(
             "[sched-invariant] BAD TRANSITION at {site}: pid {} {} -> {} (full: {:?} -> {:?})",
@@ -286,6 +257,51 @@ pub(crate) fn set_sched_owner(proc: &mut Process, new: SchedOwner, site: &'stati
         _ => {}
     }
     proc.sched_owner.0 = new;
+}
+
+pub(in crate::core) fn set_state(
+    proc: &mut Process,
+    new: crate::process_model::ProcessState,
+    site: &'static str,
+) {
+    if !crate::sched_state::state_transition_ok(&proc.state.0, &new) {
+        panic!(
+            "[sched-invariant] dead-task resurrection at {site}: pid {} {:?} -> {:?}",
+            proc.pid.0, proc.state.0, new
+        );
+    }
+    proc.state.0 = new;
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn swap_current_address_space(
+    pid: Pid,
+    new_as: alloc::sync::Arc<crate::process_model::AddressSpace>,
+    root: frame::mm::vm::AddrSpaceRoot,
+    vm_arc: alloc::sync::Arc<frame::sync::SpinIrq<frame::mm::vm::VmSpace>>,
+) -> Option<(
+    alloc::sync::Arc<crate::process_model::AddressSpace>,
+    Option<alloc::sync::Arc<crate::process_model::IpcNamespace>>,
+)> {
+    let _irq = frame::sync::IrqGuard::new();
+    let cpu = this_cpu() as usize;
+    let mut q = CPU_QUEUES[cpu].lock();
+    let leaving = {
+        let mut g = GLOBAL.lock();
+        match g.processes.get_mut(&pid) {
+            Some(proc) => {
+                let old = proc.addr_space.clone().map(|o| (o, proc.namespaces.ipc()));
+                proc.addr_space = Some(new_as);
+                proc.addr_space_root = Some(root);
+                proc.lifecycle.set_vfork_shared_vm(false);
+                old
+            }
+            None => None,
+        }
+    };
+    frame::mm::vm::VmSpace::activate_root(root);
+    q.active_vmspace = Some(vm_arc);
+    leaving
 }
 
 pub fn global_lock() -> frame::sync::SpinIrqGuard<'static, Global> {

@@ -278,7 +278,7 @@ fn switch_to_pid(pid: Pid) {
         ) {
             return;
         }
-        proc.state.0 = ProcessState::Running;
+        set_state(proc, ProcessState::Running, "dispatch");
         let cpu = this_cpu();
         set_sched_owner(proc, SchedOwner::Running { cpu }, "switch_to_pid");
         proc.sched.last_run_ns = frame::cpu::clock::nanos_since_boot();
@@ -420,7 +420,7 @@ pub fn yield_current(_tf: &mut TrapFrame) {
         let now_ns = frame::cpu::clock::nanos_since_boot();
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
-        proc.state.0 = ProcessState::Runnable;
+        set_state(proc, ProcessState::Runnable, "dispatch");
         set_sched_owner(
             proc,
             SchedOwner::Runnable { cpu: this_cpu() },
@@ -508,7 +508,7 @@ pub fn on_tick(is_timer: bool) {
                         if cgroup_throttled_now {
                             bank_cpu_time(cur_proc, delta);
                             cur_proc.sched.last_run_ns = now_ns;
-                            cur_proc.state.0 = ProcessState::CgroupThrottled;
+                            set_state(cur_proc, ProcessState::CgroupThrottled, "dispatch");
                             force_throttle = true;
                         } else if runqueue_empty {
                             charge_runtime(cur_proc, delta);
@@ -564,7 +564,7 @@ pub fn on_tick(is_timer: bool) {
                         cur_proc.sched.last_run_ns = now_ns;
                         if cur_proc.sched.dl_runtime_remaining == 0 {
                             cur_proc.sched.dl_throttled = true;
-                            cur_proc.state.0 = ProcessState::DlThrottled;
+                            set_state(cur_proc, ProcessState::DlThrottled, "dispatch");
                             force_throttle = true;
                         } else if runqueue_empty {
                             return;
@@ -645,7 +645,7 @@ pub fn on_tick(is_timer: bool) {
         let mut g = GLOBAL.lock();
         let cur_proc = g.processes.get_mut(&cur).unwrap();
         if !force_throttle {
-            cur_proc.state.0 = ProcessState::Runnable;
+            set_state(cur_proc, ProcessState::Runnable, "dispatch");
             set_sched_owner(
                 cur_proc,
                 SchedOwner::Runnable { cpu: this_cpu() },
@@ -697,7 +697,7 @@ pub fn on_tick(is_timer: bool) {
                 this_cpu(),
             );
         }
-        next_proc.state.0 = ProcessState::Running;
+        set_state(next_proc, ProcessState::Running, "dispatch");
         set_sched_owner(
             next_proc,
             SchedOwner::Running { cpu: this_cpu() },
@@ -817,7 +817,7 @@ fn cgroup_replenish_throttled(now_ns: u64) {
         let mut g = GLOBAL.lock();
         if let Some(proc) = g.processes.get_mut(&pid) {
             if proc.state.0 == ProcessState::CgroupThrottled {
-                proc.state.0 = ProcessState::Runnable;
+                set_state(proc, ProcessState::Runnable, "dispatch");
                 set_sched_owner(
                     proc,
                     SchedOwner::Runnable { cpu: home },

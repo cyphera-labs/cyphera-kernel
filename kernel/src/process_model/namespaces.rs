@@ -5,6 +5,7 @@ use super::*;
 pub struct UtsNamespace {
     pub hostname: frame::sync::SpinIrq<alloc::string::String>,
     pub domainname: frame::sync::SpinIrq<alloc::string::String>,
+    pub owner_user_ns: Option<alloc::sync::Arc<super::UserNamespace>>,
 }
 
 impl UtsNamespace {
@@ -12,12 +13,17 @@ impl UtsNamespace {
         alloc::sync::Arc::new(Self {
             hostname: frame::sync::SpinIrq::new(String::from("cyphera")),
             domainname: frame::sync::SpinIrq::new(String::from("(none)")),
+            owner_user_ns: None,
         })
     }
-    pub fn snapshot(&self) -> alloc::sync::Arc<Self> {
+    pub fn snapshot(
+        &self,
+        owner_user_ns: Option<alloc::sync::Arc<super::UserNamespace>>,
+    ) -> alloc::sync::Arc<Self> {
         alloc::sync::Arc::new(Self {
             hostname: frame::sync::SpinIrq::new(self.hostname.lock().clone()),
             domainname: frame::sync::SpinIrq::new(self.domainname.lock().clone()),
+            owner_user_ns,
         })
     }
 }
@@ -28,20 +34,24 @@ pub struct IpcNamespace {
     >,
     pub key_to_id: frame::sync::SpinIrq<alloc::collections::BTreeMap<i32, i32>>,
     pub shm_next_id: core::sync::atomic::AtomicI32,
+    pub owner_user_ns: Option<alloc::sync::Arc<super::UserNamespace>>,
 }
 impl IpcNamespace {
-    fn empty() -> Self {
+    fn empty(owner_user_ns: Option<alloc::sync::Arc<super::UserNamespace>>) -> Self {
         Self {
             shm_table: frame::sync::SpinIrq::new(alloc::collections::BTreeMap::new()),
             key_to_id: frame::sync::SpinIrq::new(alloc::collections::BTreeMap::new()),
             shm_next_id: core::sync::atomic::AtomicI32::new(1),
+            owner_user_ns,
         }
     }
     pub fn host() -> alloc::sync::Arc<Self> {
-        alloc::sync::Arc::new(Self::empty())
+        alloc::sync::Arc::new(Self::empty(None))
     }
-    pub fn fresh() -> alloc::sync::Arc<Self> {
-        alloc::sync::Arc::new(Self::empty())
+    pub fn fresh_with_owner(
+        owner_user_ns: Option<alloc::sync::Arc<super::UserNamespace>>,
+    ) -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self::empty(owner_user_ns))
     }
 }
 

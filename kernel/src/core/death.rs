@@ -87,7 +87,7 @@ pub fn exit_group_current(tf: &mut TrapFrame, code: i32) -> ! {
                     p.lifecycle.set_pending_exit(ProcessState::Zombie(code));
                 }
             } else {
-                p.state.0 = ProcessState::Zombie(code);
+                set_state(p, ProcessState::Zombie(code), "death");
                 dying_sibling_fds.push(core::mem::replace(
                     &mut p.fds,
                     Arc::new(crate::vfs::fd::FdTable::new()),
@@ -123,7 +123,7 @@ pub(crate) fn publish_corpse(dead: Pid) {
         let Some(st) = p.lifecycle.take_pending_exit() else {
             return;
         };
-        p.state.0 = st.clone();
+        set_state(p, st.clone(), "death");
         let exit_waiters = p.wait_sites.exit_waiters.drain();
         (st, p.parent, exit_waiters)
     };

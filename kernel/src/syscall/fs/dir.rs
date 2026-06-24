@@ -182,7 +182,7 @@ pub(crate) fn sys_mkdirat(dirfd: u64, pathname: u64, mode: u64) -> i64 {
         Err(_) => return EINVAL,
     };
     if path == "/" {
-        return -17;
+        return EEXIST;
     }
     let (parent, leaf) = match resolve_at_parent(dirfd as i64, path) {
         Ok(p) => p,
@@ -214,8 +214,13 @@ pub(crate) fn sys_mknodat(dirfd: u64, pathname: u64, mode: u64, dev: u64) -> i64
         0o010_000 => InodeKind::Pipe,
         _ => return EINVAL,
     };
-    if kind == InodeKind::CharDevice && !crate::security::capable(crate::process_model::CAP_MKNOD) {
-        return EPERM;
+    if kind == InodeKind::CharDevice {
+        let mnt_owner =
+            sched::with_current_mount_table(|m| m.as_ref().and_then(|t| t.owner_user_ns()))
+                .flatten();
+        if !crate::security::capable_in(crate::process_model::CAP_MKNOD, mnt_owner.as_ref()) {
+            return EPERM;
+        }
     }
     match parent.mknod(&leaf, kind, dev) {
         Ok(i) => {
@@ -228,8 +233,10 @@ pub(crate) fn sys_mknodat(dirfd: u64, pathname: u64, mode: u64, dev: u64) -> i64
 }
 
 pub(crate) fn sys_chroot(pathname: u64) -> i64 {
-    if !crate::security::has_cap(crate::process_model::CAP_SYS_CHROOT) {
-        return -1;
+    let mnt_owner =
+        sched::with_current_mount_table(|m| m.as_ref().and_then(|t| t.owner_user_ns())).flatten();
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_CHROOT, mnt_owner.as_ref()) {
+        return EPERM;
     }
     let inode = match resolve_path(AT_FDCWD as u64, pathname, true) {
         Ok(i) => i,

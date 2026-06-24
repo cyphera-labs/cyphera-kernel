@@ -176,6 +176,40 @@ impl Credentials {
     pub fn capable_host(&self, cap: u32) -> bool {
         self.has_cap(cap) && self.in_host_user_ns()
     }
+    fn dominates(&self, governing_user_ns: Option<&alloc::sync::Arc<UserNamespace>>) -> bool {
+        let caller_ns = match &self.user_ns {
+            None => return true,
+            Some(ns) if ns.level == 0 => return true,
+            Some(ns) => ns,
+        };
+        let mut cur = governing_user_ns.cloned();
+        while let Some(ns) = cur {
+            if alloc::sync::Arc::ptr_eq(&ns, caller_ns) {
+                return true;
+            }
+            cur = ns.parent.clone();
+        }
+        false
+    }
+    pub fn capable_in(
+        &self,
+        cap: u32,
+        governing_user_ns: Option<&alloc::sync::Arc<UserNamespace>>,
+    ) -> bool {
+        self.has_cap(cap) && self.dominates(governing_user_ns)
+    }
+    pub fn owns_kuid(&self, kuid: u32) -> bool {
+        match &self.user_ns {
+            None => true,
+            Some(ns) => ns.uid_from_kernel(kuid).is_some(),
+        }
+    }
+    pub fn owns_kgid(&self, kgid: u32) -> bool {
+        match &self.user_ns {
+            None => true,
+            Some(ns) => ns.gid_from_kernel(kgid).is_some(),
+        }
+    }
     pub fn uid_into_kernel(&self, ns_uid: u32) -> Option<u32> {
         match &self.user_ns {
             None => Some(ns_uid),
@@ -266,7 +300,7 @@ pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 pub const CAP_SETUID: u32 = 7;
 pub const CAP_SETPCAP: u32 = 8;
-pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+pub const CAP_IMMUTABLE: u32 = 9;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_BROADCAST: u32 = 11;
 pub const CAP_NET_ADMIN: u32 = 12;

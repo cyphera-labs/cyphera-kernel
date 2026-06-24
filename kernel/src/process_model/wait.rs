@@ -6,7 +6,7 @@ fn root_has_live_user(root_phys: u64) -> bool {
     g.processes.values().any(|p| {
         p.addr_space_root.map(|r| r.as_phys()) == Some(root_phys)
             && !matches!(
-                p.state.0,
+                *p.state.get(),
                 ProcessState::Zombie(_)
                     | ProcessState::KilledByFault { .. }
                     | ProcessState::KilledBySignal { .. }
@@ -68,7 +68,7 @@ fn wait4_scan(g: &Global, cur: Pid, target_pid: i64, options: u64) -> WaitScan {
         if !wait_selector_matches(target_pid, *cpid, child.identity.pgid(), caller_pgid) {
             continue;
         }
-        match child.state.0 {
+        match *child.state.get() {
             ProcessState::Zombie(code) => {
                 return WaitScan::Reap(*cpid, exit_status_code(code));
             }
@@ -126,18 +126,7 @@ pub fn wait4_current(
                     .saturating_add(child_s)
                     .saturating_add(child_cs);
                 drop(g);
-                let mut stale: Option<(&'static str, usize)> = None;
-                for (cpu, q_lock) in CPU_QUEUES.iter().enumerate() {
-                    let q = q_lock.lock();
-                    if q.current == Some(rpid) {
-                        stale = Some(("current", cpu));
-                        break;
-                    }
-                    if q.runnable.contains_pid(rpid) {
-                        stale = Some(("runqueue", cpu));
-                        break;
-                    }
-                }
+                let stale = crate::core::find_stale_scheduled(rpid);
                 if let Some((slot, cpu)) = stale {
                     print_stale_pid_provenance(rpid, this_cpu(), "wait4_reap_drain");
                     panic!(
@@ -180,37 +169,12 @@ pub fn wait4_current(
                 if options & WNOHANG != 0 {
                     return Ok(None);
                 }
-                let park_ctx = {
-                    let mut q = CPU_QUEUES[this_cpu() as usize].lock();
-                    let mut g = GLOBAL.lock();
-                    match wait4_scan(&g, cur_pid, target_pid, options) {
-                        WaitScan::NoneReady => {
-                            let me = g.processes.get_mut(&cur_pid).unwrap();
-                            me.wait_sites.child_exit.enqueue(cur_pid);
-                            let _ = q.current.take();
-                            bank_slice_off_cpu(me);
-                            me.state.0 = ProcessState::Parked;
-                            set_sched_owner(
-                                me,
-                                SchedOwner::Parked {
-                                    waitq_addr: &me.wait_sites.child_exit as *const _ as usize,
-                                },
-                                "wait4_park",
-                            );
-                            Some((
-                                me.task.0.context_ptr(),
-                                me.task.0.xsave_ptr(),
-                                me.task.0.kstack_bounds(),
-                            ))
-                        }
-                        _ => None,
-                    }
-                };
-                let (cur_ctx, cur_xsave, cur_kstack) = match park_ctx {
-                    Some(c) => c,
-                    None => continue,
-                };
-                park_current_off_cpu("wait4_park", cur_pid, cur_kstack, cur_ctx, cur_xsave);
+                park_on_child_exit(|g| {
+                    !matches!(
+                        wait4_scan(g, cur_pid, target_pid, options),
+                        WaitScan::NoneReady
+                    )
+                });
                 let other_signal = {
                     let g = GLOBAL.lock();
                     g.processes

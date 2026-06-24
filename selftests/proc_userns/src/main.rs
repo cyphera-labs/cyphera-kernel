@@ -9,7 +9,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     sys_exit(1);
 }
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+const CAPABILITY_VERSION_3: u32 = 0x20080522;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
 
 const AF_INET: i32 = 2;
@@ -107,11 +107,19 @@ fn child() -> ! {
         sys_exit(63);
     }
 
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
+    if sys_unshare(CLONE_NEWUTS) != 0 {
+        sys_exit(70);
+    }
+    if sys_sethostname(b"cyph".as_ptr(), 4) != 0 {
+        sys_exit(71);
+    }
+
     sys_exit(0);
 }
 
 fn capget_self() -> (u64, u64, u64) {
-    let mut hdr: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    let mut hdr: [u32; 2] = [CAPABILITY_VERSION_3, 0];
     let mut data: [u32; 6] = [0; 6];
     let r = sys_capget(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64);
     if r != 0 {
@@ -233,6 +241,16 @@ fn sys_unshare(flags: u64) -> i64 {
     let r: i64;
     unsafe {
         asm!("syscall", in("rax") 272u64, in("rdi") flags,
+        lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_sethostname(name: *const u8, len: usize) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 170u64, in("rdi") name, in("rsi") len,
         lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
     }
     r

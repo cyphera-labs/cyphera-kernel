@@ -15,6 +15,9 @@ pub(crate) fn sys_unlinkat(dirfd: u64, pathname: u64, flags: u64) -> i64 {
         Err(e) => return e,
     };
     let ctx = vfs::path::Context::current();
+    if ctx.parent_mount_flags(&ctx.root, &normalized) & vfs::mount::MS_RDONLY != 0 {
+        return crate::errno::EROFS;
+    }
     let (parent, leaf) = match vfs::path::resolve_parent(&ctx, &ctx.root, &normalized) {
         Ok(p) => p,
         Err(e) => return e.as_neg_i64(),
@@ -24,7 +27,7 @@ pub(crate) fn sys_unlinkat(dirfd: u64, pathname: u64, flags: u64) -> i64 {
         Err(e) => return e.as_neg_i64(),
     };
     if vfs::is_mountpoint_inode(Some(&ctx.mounts), target.inode_id()) {
-        return -16;
+        return EBUSY;
     }
     let want_dir = (flags & AT_REMOVEDIR) != 0;
     let is_dir = target.kind() == InodeKind::Directory;
@@ -32,7 +35,7 @@ pub(crate) fn sys_unlinkat(dirfd: u64, pathname: u64, flags: u64) -> i64 {
         return ENOTDIR;
     }
     if !want_dir && is_dir {
-        return -21;
+        return EISDIR;
     }
     if is_dir {
         match parent.rmdir(leaf) {
@@ -74,6 +77,11 @@ pub(crate) fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: 
         Err(e) => return e,
     };
     let ctx = vfs::path::Context::current();
+    if ctx.parent_mount_flags(&ctx.root, &old_norm) & vfs::mount::MS_RDONLY != 0
+        || ctx.parent_mount_flags(&ctx.root, &new_norm) & vfs::mount::MS_RDONLY != 0
+    {
+        return crate::errno::EROFS;
+    }
     let (old_parent, old_leaf) = match vfs::path::resolve_parent(&ctx, &ctx.root, &old_norm) {
         Ok(p) => p,
         Err(e) => return e.as_neg_i64(),
@@ -84,6 +92,18 @@ pub(crate) fn sys_renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: 
     };
     let old_leaf = old_leaf.to_string();
     let new_leaf = new_leaf.to_string();
+    if old_parent.fs_id() != new_parent.fs_id() {
+        return crate::errno::EXDEV;
+    }
+    if let Ok(src) = old_parent.lookup(&old_leaf) {
+        if src.kind() == InodeKind::Directory
+            && new_norm.len() > old_norm.len()
+            && new_norm.starts_with(&old_norm)
+            && new_norm.as_bytes()[old_norm.len()] == b'/'
+        {
+            return EINVAL;
+        }
+    }
     match old_parent.rename(&old_leaf, &new_parent, &new_leaf) {
         Ok(()) => 0,
         Err(e) => e.as_neg_i64(),
@@ -124,12 +144,15 @@ pub(crate) fn sys_linkat(
         Err(e) => return e,
     };
     let ctx = vfs::path::Context::current();
+    if ctx.parent_mount_flags(&ctx.root, &new_norm) & vfs::mount::MS_RDONLY != 0 {
+        return crate::errno::EROFS;
+    }
     let target = match vfs::path::resolve(&ctx, &ctx.root, &old_norm) {
         Ok(t) => t,
         Err(e) => return e.as_neg_i64(),
     };
     if target.kind() == InodeKind::Directory {
-        return -1;
+        return EPERM;
     }
     let (new_parent, new_leaf) = match vfs::path::resolve_parent(&ctx, &ctx.root, &new_norm) {
         Ok(p) => p,
@@ -212,8 +235,20 @@ pub(crate) fn sys_renameat2(
     oldpath: u64,
     newdirfd: u64,
     newpath: u64,
-    _flags: u64,
+    flags: u64,
 ) -> i64 {
+    const RENAME_NOREPLACE: u64 = 1;
+    const RENAME_EXCHANGE: u64 = 2;
+    const RENAME_WHITEOUT: u64 = 4;
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return EINVAL;
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        return crate::errno::EINVAL;
+    }
+    if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
+        return EINVAL;
+    }
     let old = match copy_path(oldpath) {
         Ok(s) => s,
         Err(e) => return e,
@@ -231,6 +266,11 @@ pub(crate) fn sys_renameat2(
         Err(e) => return e,
     };
     let ctx = vfs::path::Context::current();
+    if ctx.parent_mount_flags(&ctx.root, &old_norm) & vfs::mount::MS_RDONLY != 0
+        || ctx.parent_mount_flags(&ctx.root, &new_norm) & vfs::mount::MS_RDONLY != 0
+    {
+        return crate::errno::EROFS;
+    }
     let (old_parent, old_name) = match vfs::path::resolve_parent(&ctx, &ctx.root, &old_norm) {
         Ok(x) => x,
         Err(e) => return e.as_neg_i64(),
@@ -239,6 +279,27 @@ pub(crate) fn sys_renameat2(
         Ok(x) => x,
         Err(e) => return e.as_neg_i64(),
     };
+    if old_parent.fs_id() != new_parent.fs_id() {
+        return crate::errno::EXDEV;
+    }
+    if let Ok(src) = old_parent.lookup(old_name) {
+        if src.kind() == InodeKind::Directory
+            && new_norm.len() > old_norm.len()
+            && new_norm.starts_with(&old_norm)
+            && new_norm.as_bytes()[old_norm.len()] == b'/'
+        {
+            return EINVAL;
+        }
+    }
+    if flags & RENAME_EXCHANGE != 0 {
+        return match old_parent.rename_exchange(old_name, &new_parent, new_name) {
+            Ok(()) => 0,
+            Err(e) => e.as_neg_i64(),
+        };
+    }
+    if flags & RENAME_NOREPLACE != 0 && new_parent.lookup(new_name).is_ok() {
+        return crate::errno::EEXIST;
+    }
     match old_parent.rename(old_name, &new_parent, new_name) {
         Ok(()) => 0,
         Err(e) => e.as_neg_i64(),

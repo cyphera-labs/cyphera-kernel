@@ -48,10 +48,36 @@ impl Context {
         self.mounts.lookup(path)
     }
 
+    pub fn set_mount_flags(&self, path: &str, mount_flags: u64) -> bool {
+        self.mounts.set_flags_at(path, mount_flags)
+    }
+
+    pub fn set_mount_flags_by_inode(&self, inode_id: u64, mount_flags: u64) -> bool {
+        self.mounts.set_flags_by_inode(inode_id, mount_flags)
+    }
+
+    pub fn mount_flags_of(&self, base: &Arc<dyn Inode>, path: &str) -> u64 {
+        match resolve_with_mount(self, base, path) {
+            Ok((_, Some(tag))) => tag.flags(),
+            _ => 0,
+        }
+    }
+
+    pub fn parent_mount_flags(&self, base: &Arc<dyn Inode>, path: &str) -> u64 {
+        let trimmed = path.trim_end_matches('/');
+        let parent = match trimmed.rfind('/') {
+            Some(0) => "/",
+            Some(i) => &trimmed[..i],
+            None => ".",
+        };
+        self.mount_flags_of(base, parent)
+    }
+
     pub fn lookup_mount_full(&self, path: &str) -> Option<MountEntry> {
         self.mounts.snapshot_one(path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn install_mount(
         &self,
@@ -61,6 +87,7 @@ impl Context {
         propagation: MountPropagation,
         source: &str,
         fstype: &str,
+        mount_flags: u64,
     ) {
         self.mounts.install(
             target_path,
@@ -69,9 +96,11 @@ impl Context {
             propagation,
             source,
             fstype,
+            mount_flags,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn install_mount_propagating(
         &self,
@@ -81,6 +110,7 @@ impl Context {
         propagation: MountPropagation,
         source: &str,
         fstype: &str,
+        mount_flags: u64,
     ) -> alloc::vec::Vec<alloc::string::String> {
         use alloc::string::String;
 
@@ -92,6 +122,7 @@ impl Context {
             propagation.clone(),
             source,
             fstype,
+            mount_flags,
         );
 
         let (containing_path, containing_entry) = match containing {
@@ -128,6 +159,7 @@ impl Context {
                     propagation.clone(),
                     source,
                     fstype,
+                    mount_flags,
                 );
                 mirrored.push(mirror_path);
             }
@@ -143,6 +175,7 @@ impl Context {
                     MountPropagation::Private,
                     source,
                     fstype,
+                    mount_flags,
                 );
                 mirrored.push(mirror_path);
             }

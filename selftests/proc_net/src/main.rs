@@ -444,6 +444,8 @@ pub extern "C" fn _start() -> ! {
     sys_close(tcp as u64);
     log("TCP loopback accept peer-addr OK\n");
 
+    loopback_listener_regression();
+
     let mut nd = [0u8; 512];
     let n = read_path(b"/proc/net/dev\0", &mut nd);
     if n <= 0 || find(&nd[..n as usize], b"eth0:").is_none() {
@@ -1009,6 +1011,94 @@ pub extern "C" fn _start() -> ! {
 
     log("all networking tests OK\n");
     sys_exit(0);
+}
+
+#[inline(never)]
+fn loopback_listener_regression() {
+    let lsn = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if lsn < 0 {
+        log("loopback listener socket failed\n");
+        sys_exit(1);
+    }
+    let la = build_sockaddr_in([127, 0, 0, 1], 9997);
+    if sys_bind(lsn as u64, la.as_ptr(), la.len() as u64) != 0 {
+        log("loopback listener bind failed\n");
+        sys_exit(1);
+    }
+    if sys_listen(lsn as u64, 8) != 0 {
+        log("loopback listener listen failed\n");
+        sys_exit(1);
+    }
+    sys_close(lsn as u64);
+    log("loopback listener close (no accept) OK\n");
+
+    let lsn = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if lsn < 0 {
+        log("reuse listener socket failed\n");
+        sys_exit(1);
+    }
+    let la = build_sockaddr_in([127, 0, 0, 1], 9996);
+    if sys_bind(lsn as u64, la.as_ptr(), la.len() as u64) != 0 || sys_listen(lsn as u64, 8) != 0 {
+        log("reuse listener bind/listen failed\n");
+        sys_exit(1);
+    }
+    let c = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if c < 0 {
+        log("reuse client socket failed\n");
+        sys_exit(1);
+    }
+    let crc = sys_connect(c as u64, la.as_ptr(), la.len() as u64);
+    if crc != 0 && crc != EINPROGRESS {
+        log("reuse connect failed\n");
+        sys_exit(1);
+    }
+    let mut conn = -1i64;
+    for _ in 0..100_000 {
+        let r = sys_accept(lsn as u64, core::ptr::null_mut(), core::ptr::null_mut());
+        if r >= 0 {
+            conn = r;
+            break;
+        }
+        if r != EAGAIN {
+            log("reuse accept hard error\n");
+            sys_exit(1);
+        }
+        let _ = sys_getpeername(c as u64, core::ptr::null_mut(), core::ptr::null_mut());
+    }
+    if conn < 0 {
+        log("reuse accept never completed\n");
+        sys_exit(1);
+    }
+    let _ = so_error(c as u64);
+    sys_close(conn as u64);
+    let mut tbuf = [0u8; 4];
+    let mut saw_teardown = false;
+    for _ in 0..100_000 {
+        let r = sys_read(c as u64, tbuf.as_mut_ptr(), tbuf.len());
+        if r != EAGAIN && r <= 0 {
+            saw_teardown = true;
+            break;
+        }
+        let _ = sys_getpeername(c as u64, core::ptr::null_mut(), core::ptr::null_mut());
+    }
+    if !saw_teardown {
+        log("client never saw RST teardown after server close\n");
+        sys_exit(1);
+    }
+    log("close sends RST; peer observes teardown OK\n");
+    sys_close(c as u64);
+    sys_close(lsn as u64);
+    let lsn2 = sys_socket(AF_INET, SOCK_STREAM, 0);
+    let la2 = build_sockaddr_in([127, 0, 0, 1], 9995);
+    if lsn2 < 0
+        || sys_bind(lsn2 as u64, la2.as_ptr(), la2.len() as u64) != 0
+        || sys_listen(lsn2 as u64, 8) != 0
+    {
+        log("reuse second listener failed\n");
+        sys_exit(1);
+    }
+    sys_close(lsn2 as u64);
+    log("loopback listener slot-reuse OK\n");
 }
 
 fn build_sockaddr_in(ip: [u8; 4], port: u16) -> [u8; 16] {

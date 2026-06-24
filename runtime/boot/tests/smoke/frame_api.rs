@@ -15,7 +15,7 @@ use frame::{
     },
     mm::{
         VirtAddr, frame_alloc,
-        vm::{Perms, VmSpace},
+        vm::{MapError, Perms, VmSpace},
     },
     println,
     sync::SpinIrq,
@@ -87,6 +87,25 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
     vmspace.unmap(region);
     println!("[test] frame_api: vm map/unmap OK (4 pages)");
 
+    let bound_frame = frame_alloc::alloc_frame().expect("alloc_frame");
+    let kernel_half = VirtAddr::new(0xFFFF_8000_0000_0000);
+    assert!(
+        matches!(
+            vmspace.map(kernel_half, bound_frame, Perms::USER_RW),
+            Err(MapError::OutOfUserRange)
+        ),
+        "USER map into kernel half must be refused"
+    );
+    assert!(
+        matches!(
+            vmspace.map_anon(kernel_half, 1, Perms::USER_RW),
+            Err(MapError::OutOfUserRange)
+        ),
+        "USER map_anon into kernel half must be refused"
+    );
+    frame_alloc::free_frame(bound_frame);
+    println!("[test] frame_api: user-half mapping bound OK (kernel-half USER refused)");
+
     fn dummy_handler(_ctx: &mut intr::IrqContext) {}
     intr::register_irq(40, dummy_handler).expect("register");
     intr::unregister_irq(40);
@@ -96,6 +115,12 @@ pub extern "C" fn kernel_main(boot_info_ptr: u32) -> ! {
 
     let _t = Task::spawn(worker_entry);
     println!("[test] frame_api: Task::spawn OK (no switch yet)");
+
+    assert!(
+        frame::cpu::cpu_registry::selftest_sparse_mapping(),
+        "sparse APIC ids must map to dense cpu indices"
+    );
+    println!("[test] frame_api: cpu_registry sparse->dense mapping OK");
 
     println!("[test] frame_api: PASS");
     exit(ExitCode::Success)

@@ -46,11 +46,13 @@ non-goals).
 
 ## Try it out!
 
-This release ships the kernel source plus a **hello-world demo**:
-`./dev demo` boots the kernel under QEMU + microvm and runs a small
-userland ELF in ring 3; `./dev test` runs the in-tree integration
-suite (the `selftests/` fixtures) against the syscall surface,
-scheduler, VFS, networking, and signal paths.
+This release ships the kernel source plus two demos: `./dev demo`
+boots the kernel under QEMU + microvm and runs a small userland ELF in
+ring 3, and `./dev demo-alpine` boots a real Alpine userland straight to
+an interactive root shell — run real-world programs on the kernel and
+poke around. `./dev test` runs the in-tree integration suite (the
+`selftests/` fixtures) against the syscall surface, scheduler, VFS,
+networking, and signal paths.
 
 **Requirements: Docker** — the pinned Rust toolchain and QEMU live
 inside the dev container, so no host Rust or QEMU is needed (`./dev`
@@ -64,6 +66,7 @@ pinned in `rust-toolchain.toml`).
 
 ```sh
 ./dev demo            # boot the kernel + run the hello-world userland (demo/)
+./dev demo-alpine     # boot the kernel into an interactive Alpine shell (demo/)
 ./dev test [kind]     # QEMU integration battery: smoke | subsystem | all (default all)
 ./dev run             # boot the kernel under QEMU (Ctrl-A then x to exit)
 ./dev build           # cargo build (debug)

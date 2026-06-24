@@ -98,7 +98,6 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
         vmspace_id,
         vaddr: uaddr,
     };
-    let q = queue_for(key);
     let me = crate::core::current_pid();
     let my_tid = crate::core::current_local_pid();
     if my_tid > FUTEX_TID_MASK {
@@ -114,11 +113,7 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
         let entry = pis.entry(key).or_insert_with(PiState::new);
         entry.holder = Some(me);
         drop(pis);
-        crate::core::with_pi_mut(me, |pi| {
-            if !pi.held.contains(&key) {
-                pi.held.push(key);
-            }
-        });
+        crate::core::add_pi_held(me, key);
         return 0;
     }
 
@@ -140,6 +135,7 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
         .map(effective_priority)
         .unwrap_or(0);
 
+    crate::core::set_pi_blocked_on(me, key);
     {
         let mut pis = PI_STATES.lock();
         let entry = pis.entry(key).or_insert_with(PiState::new);
@@ -148,28 +144,20 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
         }
         entry.waiters.insert((255 - my_prio, me.raw()), ());
     }
-    {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = Some(key);
-        });
-    }
 
     if let Err(e) = boost_chain(me, holder_pid, my_prio) {
         let mut pis = PI_STATES.lock();
         if let Some(s) = pis.get_mut(&key) {
             s.waiters.remove(&(255 - my_prio, me.raw()));
         }
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-        });
+        crate::core::clear_pi_blocked_on(me);
         return e;
     }
 
     if let Some(deadline) = deadline_nanos {
         crate::core::timeout::register(deadline, me);
     }
-    q.park();
-    q.dequeue(me);
+    crate::core::park_on_pi_wait(key);
     let timed_out = deadline_nanos.is_some() && !crate::core::timeout::unregister(me);
 
     let acquired = {
@@ -177,12 +165,7 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
         pis.get(&key).map(|s| s.holder == Some(me)).unwrap_or(false)
     };
     if acquired {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-            if !pi.held.contains(&key) {
-                pi.held.push(key);
-            }
-        });
+        crate::core::pi_acquired(me, key);
         return 0;
     }
 
@@ -192,11 +175,7 @@ pub fn lock_pi(vmspace_id: u64, uaddr: u64, deadline_nanos: Option<u64>) -> i64 
             s.waiters.remove(&(255 - my_prio, me.raw()));
         }
     }
-    {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-        });
-    }
+    crate::core::clear_pi_blocked_on(me);
     if let Some(h) = {
         let pis = PI_STATES.lock();
         pis.get(&key).and_then(|s| s.holder)
@@ -234,11 +213,7 @@ pub fn trylock_pi(vmspace_id: u64, uaddr: u64) -> i64 {
         let entry = pis.entry(key).or_insert_with(PiState::new);
         entry.holder = Some(me);
         drop(pis);
-        crate::core::with_pi_mut(me, |pi| {
-            if !pi.held.contains(&key) {
-                pi.held.push(key);
-            }
-        });
+        crate::core::add_pi_held(me, key);
         return 0;
     }
     if (observed & FUTEX_TID_MASK) == my_tid {
@@ -288,6 +263,7 @@ pub fn unlock_pi(vmspace_id: u64, uaddr: u64) -> i64 {
                     s.holder = Some(winner_pid);
                 }
             }
+            crate::core::clear_pi_blocked_on(winner_pid);
             let _ = crate::core::wait::wake(winner_pid);
             w
         }
@@ -298,11 +274,7 @@ pub fn unlock_pi(vmspace_id: u64, uaddr: u64) -> i64 {
         return EFAULT;
     }
 
-    {
-        crate::core::with_pi_mut(me, |pi| {
-            pi.held.retain(|k| *k != key);
-        });
-    }
+    crate::core::remove_pi_held(me, key);
     crate::core::pi_refresh(me, top_waiter_prio_for(me));
 
     {
@@ -351,6 +323,7 @@ pub fn pi_owner_died(vmspace_id: u64, dying_pid: crate::process_model::Pid) {
                     s.holder = Some(winner);
                 }
             }
+            crate::core::clear_pi_blocked_on(winner);
             let _ = crate::core::wait::wake(winner);
         }
     }
@@ -392,16 +365,12 @@ pub fn wait_requeue_pi(
         return EAGAIN;
     }
 
-    {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = Some(key2);
-        });
-    }
+    crate::core::set_pi_blocked_on(me, key2);
 
     if let Some(deadline) = deadline_nanos {
         crate::core::timeout::register(deadline, me);
     }
-    q1.park();
+    crate::core::park_on_pi_requeue(&q1, me);
     q1.dequeue(me);
     let timed_out = deadline_nanos.is_some() && !crate::core::timeout::unregister(me);
 
@@ -412,12 +381,7 @@ pub fn wait_requeue_pi(
             .unwrap_or(false)
     };
     if already_owner {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-            if !pi.held.contains(&key2) {
-                pi.held.push(key2);
-            }
-        });
+        crate::core::pi_acquired(me, key2);
         return 0;
     }
 
@@ -428,12 +392,10 @@ pub fn wait_requeue_pi(
             .unwrap_or(false)
     };
     if queued_on_pi && !timed_out && !crate::core::current_signal_pending() {
-        let q2 = queue_for(key2);
         if let Some(deadline) = deadline_nanos {
             crate::core::timeout::register(deadline, me);
         }
-        q2.park();
-        q2.dequeue(me);
+        crate::core::park_on_pi_wait(key2);
         let timed_out2 = deadline_nanos.is_some() && !crate::core::timeout::unregister(me);
         let acquired = {
             let pis = PI_STATES.lock();
@@ -442,12 +404,7 @@ pub fn wait_requeue_pi(
                 .unwrap_or(false)
         };
         if acquired {
-            crate::core::with_pi_mut(me, |pi| {
-                *pi.blocked_on = None;
-                if !pi.held.contains(&key2) {
-                    pi.held.push(key2);
-                }
-            });
+            crate::core::pi_acquired(me, key2);
             return 0;
         }
         {
@@ -463,9 +420,7 @@ pub fn wait_requeue_pi(
                 }
             }
         }
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-        });
+        crate::core::clear_pi_blocked_on(me);
         if crate::core::current_signal_pending() {
             return EINTR;
         }
@@ -475,11 +430,7 @@ pub fn wait_requeue_pi(
         return EAGAIN;
     }
 
-    {
-        crate::core::with_pi_mut(me, |pi| {
-            *pi.blocked_on = None;
-        });
-    }
+    crate::core::clear_pi_blocked_on(me);
     if crate::core::current_signal_pending() {
         return EINTR;
     }
@@ -525,7 +476,7 @@ pub fn cmp_requeue_pi(
     let me = crate::core::current_pid();
     let me_local = crate::core::current_local_pid();
 
-    let winner_pid = match q1.wake_one_pid() {
+    let winner_pid = match q1.pop_one_no_wake() {
         Some(p) => p,
         None => return 0,
     };
@@ -537,14 +488,8 @@ pub fn cmp_requeue_pi(
         let entry = pis.entry(key2).or_insert_with(PiState::new);
         entry.holder = Some(winner_pid);
     }
-    {
-        crate::core::with_pi_mut(winner_pid, |pi| {
-            *pi.blocked_on = None;
-            if !pi.held.contains(&key2) {
-                pi.held.push(key2);
-            }
-        });
-    }
+    crate::core::pi_acquired(winner_pid, key2);
+    let _ = crate::core::wait::wake(winner_pid);
 
     let mut requeued = 0u32;
     for _ in 0..n_requeue {

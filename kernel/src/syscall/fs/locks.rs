@@ -19,6 +19,9 @@ const F_SETLKW: u64 = 7;
 
 pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     let fd = fd as i32;
+    if cmd == F_GET_SEALS || cmd == F_ADD_SEALS {
+        return fcntl_seals(fd, cmd, arg);
+    }
     sched::with_current_fds(|t| match cmd {
         F_DUPFD => match t.get(fd) {
             Some(of) => t.install_from(of, arg as i32, 0).unwrap_or(EMFILE as i32) as i64,
@@ -67,8 +70,6 @@ pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
             },
             None => EBADF,
         },
-        F_GET_SEALS => 0xf,
-        F_ADD_SEALS => 0,
         F_GETLK | F_SETLK | F_SETLKW => {
             let file = match t.get(fd) {
                 Some(f) => f,
@@ -109,6 +110,32 @@ pub(crate) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
         }
         _ => EINVAL,
     })
+}
+
+fn fcntl_seals(fd: i32, cmd: u64, arg: u64) -> i64 {
+    let file = match sched::with_current_fds(|t| t.get(fd)) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+    match cmd {
+        F_GET_SEALS => match file.inode.memfd_seals() {
+            Some(m) => m as i64,
+            None => EINVAL,
+        },
+        F_ADD_SEALS => {
+            let add = arg as u32;
+            let writable_exists = if add & vfs::F_SEAL_WRITE != 0 {
+                crate::core::inode_has_shared_writable_mapping(file.inode.inode_id())
+            } else {
+                false
+            };
+            match file.inode.memfd_add_seals(add, writable_exists) {
+                Ok(()) => 0,
+                Err(e) => e.as_neg_i64(),
+            }
+        }
+        _ => EINVAL,
+    }
 }
 
 fn drop_with_current_fds_then_lock_inner(
@@ -185,7 +212,7 @@ fn drop_with_current_fds_then_lock_inner(
     if cmd == F_SETLK {
         return match try_set_lock(inode_id, l_type, start, end, owner) {
             Ok(()) => 0,
-            Err(_) => -11,
+            Err(_) => EAGAIN,
         };
     }
 

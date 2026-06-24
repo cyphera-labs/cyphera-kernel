@@ -1,0 +1,10 @@
+title = "cyphera-kernel gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "demo/run-alpine.sh pins public package metadata — the static package tool + signing-keys .apk filenames and their SHA256 digests. gitleaks' generic-api-key rule trips on the *_KEYS_* variable names and the high-entropy digests, but these are well-known upstream release values, not secrets. The file is a small, self-contained demo bootstrap with no credentials (trufflehog also scans it)."
+paths = [
+  '''demo/run-alpine\.sh''',
+]

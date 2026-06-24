@@ -7,7 +7,7 @@ use frame::user::TrapFrame;
 use crate::core as sched;
 use crate::errno::{EFAULT, EINVAL, ENOSYS, EPERM, ESRCH};
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+const CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> i64 {
     if hdr_ptr == 0 {
@@ -19,8 +19,8 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> i64 {
     }
     let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
     let pid_arg = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    if version != LINUX_CAPABILITY_VERSION_3 {
-        let want = LINUX_CAPABILITY_VERSION_3.to_le_bytes();
+    if version != CAPABILITY_VERSION_3 {
+        let want = CAPABILITY_VERSION_3.to_le_bytes();
         let _ = frame::user::copy_to_user(hdr_ptr, &want);
         return EINVAL;
     }
@@ -66,8 +66,8 @@ pub(super) fn sys_capset(hdr_ptr: u64, data_ptr: u64) -> i64 {
     }
     let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
     let pid_arg = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    if version != LINUX_CAPABILITY_VERSION_3 {
-        let want = LINUX_CAPABILITY_VERSION_3.to_le_bytes();
+    if version != CAPABILITY_VERSION_3 {
+        let want = CAPABILITY_VERSION_3.to_le_bytes();
         let _ = frame::user::copy_to_user(hdr_ptr, &want);
         return EINVAL;
     }
@@ -298,7 +298,8 @@ pub(super) fn sys_sethostname(name: u64, len: u64) -> i64 {
     if len > 64 || name == 0 {
         return EINVAL;
     }
-    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
+    let uts_owner = sched::with_current_uts(|n| n.owner_user_ns.clone());
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, uts_owner.as_ref()) {
         return EPERM;
     }
     let mut buf = [0u8; 64];
@@ -319,7 +320,8 @@ pub(super) fn sys_setdomainname(name: u64, len: u64) -> i64 {
     if len > 64 || name == 0 {
         return EINVAL;
     }
-    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
+    let uts_owner = sched::with_current_uts(|n| n.owner_user_ns.clone());
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, uts_owner.as_ref()) {
         return EPERM;
     }
     let mut buf = [0u8; 64];
@@ -418,7 +420,7 @@ pub(super) fn sys_setgroups(size: u64, list: u64) -> i64 {
         return EINVAL;
     }
     if n == 0 {
-        sched::with_current_creds_mut(|c| c.groups.clear());
+        sched::with_current_creds_mut(crate::security::setid::clear_supplementary_groups);
         return 0;
     }
     let mut buf = alloc::vec![0u8; n * 4];
@@ -428,15 +430,10 @@ pub(super) fn sys_setgroups(size: u64, list: u64) -> i64 {
     let supplied: Vec<u32> = (0..n)
         .map(|i| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap()))
         .collect();
-    sched::with_current_creds_mut(|c| {
-        let mut kgroups = Vec::with_capacity(n);
-        for &g in &supplied {
-            match c.gid_into_kernel(g) {
-                Some(k) => kgroups.push(k),
-                None => return EINVAL,
-            }
-        }
-        c.groups = kgroups;
-        0
-    })
+    match sched::with_current_creds_mut(|c| {
+        crate::security::setid::set_supplementary_groups(c, &supplied)
+    }) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }

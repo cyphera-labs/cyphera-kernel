@@ -112,6 +112,14 @@ pub mod cpu {
         pub struct Task;
         pub struct Context;
     }
+    pub mod clock {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        pub fn nanos_since_boot() -> u64 {
+            static START: OnceLock<Instant> = OnceLock::new();
+            START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+        }
+    }
 }
 
 pub mod mm {

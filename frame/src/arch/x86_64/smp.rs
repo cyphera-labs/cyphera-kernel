@@ -73,6 +73,18 @@ pub fn bring_up(apic_ids: &[u8]) {
         .as_u64();
 
     for &apic_id in apic_ids {
+        let cpu_index =
+            match crate::cpu::cpu_registry::register_cpu(crate::cpu::cpu_registry::ApicId(apic_id))
+            {
+                Some(c) => c,
+                None => {
+                    crate::println!("smp: ap{apic_id} exceeds MAX_CPUS; skipping");
+                    continue;
+                }
+            };
+        if cpu_index.raw() == 0 {
+            continue;
+        }
         let layout = Layout::from_size_align(64 * 1024, 16).unwrap();
         // SAFETY: `layout` is non-zero-size (64 KiB) and 16-aligned,
         // built via `from_size_align(...).unwrap()`, so it satisfies
@@ -111,7 +123,7 @@ pub fn bring_up(apic_ids: &[u8]) {
                     rsp: stack_top,
                     entry: ap_low_entry as *const () as u64,
                     cr3,
-                    cpu_id: apic_id as u64,
+                    cpu_id: cpu_index.raw() as u64,
                 },
             );
         }
@@ -124,7 +136,7 @@ pub fn bring_up(apic_ids: &[u8]) {
 
         crate::intr::lapic::send_ipi(apic_id, AP_SIPI_VECTOR, IpiKind::Startup);
 
-        let ap_bit = 1u64 << apic_id;
+        let ap_bit = 1u64 << cpu_index.raw();
         let deadline_ns = 100_000_000;
         let start_ns = crate::cpu::nanos_since_boot();
         while CPU_ONLINE_MASK.load(Ordering::Acquire) & ap_bit == 0 {

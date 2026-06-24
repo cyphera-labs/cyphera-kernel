@@ -162,7 +162,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> cyphera_kapi:
                                 offset_base: *file_offset_base,
                             },
                         )),
-                        crate::process_model::VmaBacking::Shm { segment } => Some((
+                        crate::process_model::VmaBacking::Shm { segment, .. } => Some((
                             v.start,
                             v.end,
                             ShareKind::Shm {
@@ -386,7 +386,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> cyphera_kapi:
             if share_vmspace {
                 if let Some(p) = g.processes.get(&child_pid) {
                     let was_live = !matches!(
-                        p.state.0,
+                        *p.state.get(),
                         ProcessState::Zombie(_)
                             | ProcessState::KilledByFault { .. }
                             | ProcessState::KilledBySignal { .. }
@@ -534,7 +534,7 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> cyphera_
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get(&child_pid) {
                 let was_live = !matches!(
-                    p.state.0,
+                    *p.state.get(),
                     ProcessState::Zombie(_)
                         | ProcessState::KilledByFault { .. }
                         | ProcessState::KilledBySignal { .. }

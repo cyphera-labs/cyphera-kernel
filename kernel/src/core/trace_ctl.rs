@@ -118,7 +118,7 @@ pub(crate) fn detach_orphaned_tracees(tracer: Pid) {
                 if t.trace.traced_by(tracer) {
                     t.trace.detach();
                     if t.state.0 == ProcessState::Traced {
-                        t.state.0 = ProcessState::Runnable;
+                        set_state(t, ProcessState::Runnable, "trace_ctl");
                         resume.push(*tpid);
                     }
                 }
@@ -146,7 +146,7 @@ pub fn park_for_trace_stop(reason: crate::process_model::TraceStop) {
         }
         let _ = q.current.take();
         bank_slice_off_cpu(me);
-        me.state.0 = ProcessState::Traced;
+        set_state(me, ProcessState::Traced, "trace_ctl");
         set_sched_owner(me, SchedOwner::Traced, "park_for_trace_stop");
         me.trace.enter_stop(reason);
         (
@@ -171,7 +171,13 @@ pub fn park_for_trace_stop(reason: crate::process_model::TraceStop) {
     park_current_off_cpu("park_for_trace_stop", cur, cur_kstack, cur_ctx, cur_xsave);
 }
 
-pub fn resume_traced(target: Pid, inject_signal: u32, trace_syscall: bool) -> bool {
+pub fn resume_traced(
+    target: Pid,
+    caller: Pid,
+    inject_signal: u32,
+    trace_syscall: bool,
+    single_step: bool,
+) -> bool {
     let needs_enqueue = {
         let mut g = GLOBAL.lock();
         let inject_capped = inject_signal >= crate::process_model::RT_SIG_MIN
@@ -188,8 +194,11 @@ pub fn resume_traced(target: Pid, inject_signal: u32, trace_syscall: bool) -> bo
             Some(p) => p,
             None => return false,
         };
-        if p.state.0 != ProcessState::Traced {
+        if !p.trace.traced_by(caller) || p.state.0 != ProcessState::Traced {
             return false;
+        }
+        if single_step {
+            p.trace.enable_single_step();
         }
         p.trace.resume(trace_syscall);
         if inject_signal != 0 && (inject_signal as usize) < NSIG && !inject_capped {
@@ -198,7 +207,7 @@ pub fn resume_traced(target: Pid, inject_signal: u32, trace_syscall: bool) -> bo
             p.signals.enqueue_signal(inject_signal, info, usize::MAX);
             p.trace.set_pending_inject(inject_signal);
         }
-        p.state.0 = ProcessState::Runnable;
+        set_state(p, ProcessState::Runnable, "trace_ctl");
         true
     };
     if needs_enqueue {
@@ -211,6 +220,7 @@ pub enum AttachOutcome {
     Gone,
     AlreadyTraced,
     Untraceable,
+    Denied,
     Deferred(u32),
     Stopped,
 }
@@ -218,6 +228,13 @@ pub enum AttachOutcome {
 pub fn request_ptrace_attach(target: Pid, tracer: Pid) -> AttachOutcome {
     let (outcome, waiters) = {
         let mut g = GLOBAL.lock();
+        let (caller_uid, caller_is_root) = match g.processes.get(&tracer) {
+            Some(p) => {
+                let c = p.creds.lock();
+                (c.euid, c.euid == 0)
+            }
+            None => return AttachOutcome::Gone,
+        };
         match g.processes.get(&target) {
             None => return AttachOutcome::Gone,
             Some(p) => {
@@ -235,6 +252,13 @@ pub fn request_ptrace_attach(target: Pid, tracer: Pid) -> AttachOutcome {
                 ) {
                     return AttachOutcome::Gone;
                 }
+                if !caller_is_root {
+                    let target_uid = p.creds.lock().euid;
+                    let dumpable = p.security.dumpable();
+                    if target_uid != caller_uid || dumpable == 0 {
+                        return AttachOutcome::Denied;
+                    }
+                }
             }
         }
         let p = g.processes.get_mut(&target).unwrap();
@@ -244,7 +268,7 @@ pub fn request_ptrace_attach(target: Pid, tracer: Pid) -> AttachOutcome {
                 AttachOutcome::Deferred(cpu_to_nudge(p))
             }
             _ => {
-                p.state.0 = ProcessState::Traced;
+                set_state(p, ProcessState::Traced, "trace_ctl");
                 p.trace.attach(tracer);
                 AttachOutcome::Stopped
             }
@@ -267,13 +291,16 @@ pub enum PtraceResume {
     Kill,
 }
 
-pub fn request_ptrace_continue(target: Pid, how: PtraceResume) -> bool {
+pub fn request_ptrace_continue(target: Pid, caller: Pid, how: PtraceResume) -> bool {
     let reenqueue = {
         let mut g = GLOBAL.lock();
         let p = match g.processes.get_mut(&target) {
             Some(p) => p,
             None => return false,
         };
+        if !p.trace.traced_by(caller) {
+            return false;
+        }
         match how {
             PtraceResume::Detach { signal } => {
                 p.trace.detach();
@@ -286,7 +313,7 @@ pub fn request_ptrace_continue(target: Pid, how: PtraceResume) -> bool {
             }
         }
         if p.state.0 == ProcessState::Traced {
-            p.state.0 = ProcessState::Runnable;
+            set_state(p, ProcessState::Runnable, "trace_ctl");
             if matches!(how, PtraceResume::Kill) {
                 p.trace.clear_stop();
             }

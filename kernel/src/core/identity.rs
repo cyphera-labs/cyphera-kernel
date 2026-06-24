@@ -51,15 +51,15 @@ pub fn setpgid(target_pid: Pid, new_pgid: Pid) -> Result<(), i64> {
     let caller_sid = current_sid();
     with_identity_mut(actual_target, |id| {
         if id.sid() != caller_sid {
-            return Err(-1);
+            return Err(crate::errno::EPERM);
         }
         if id.sid() == actual_target {
-            return Err(-1);
+            return Err(crate::errno::EPERM);
         }
         id.set_pgid(actual_pgid);
         Ok(())
     })
-    .unwrap_or(Err(-3))
+    .unwrap_or(Err(crate::errno::ESRCH))
 }
 
 pub fn getpgid(target_pid: Pid) -> Result<Pid, i64> {
@@ -68,7 +68,7 @@ pub fn getpgid(target_pid: Pid) -> Result<Pid, i64> {
     } else {
         target_pid
     };
-    with_identity(actual, |id| id.pgid()).ok_or(-3)
+    with_identity(actual, |id| id.pgid()).ok_or(crate::errno::ESRCH)
 }
 
 pub fn getsid(target_pid: Pid) -> Result<Pid, i64> {
@@ -77,20 +77,20 @@ pub fn getsid(target_pid: Pid) -> Result<Pid, i64> {
     } else {
         target_pid
     };
-    with_identity(actual, |id| id.sid()).ok_or(-3)
+    with_identity(actual, |id| id.sid()).ok_or(crate::errno::ESRCH)
 }
 
 pub fn setsid() -> Result<Pid, i64> {
     let pid = current_pid();
     with_identity_mut(pid, |id| {
         if id.pgid() == pid {
-            return Err(-1);
+            return Err(crate::errno::EPERM);
         }
         id.set_pgid(pid);
         id.set_sid(pid);
         Ok(pid)
     })
-    .unwrap_or(Err(-3))
+    .unwrap_or(Err(crate::errno::ESRCH))
 }
 
 pub fn set_current_name(name: [u8; 16]) {

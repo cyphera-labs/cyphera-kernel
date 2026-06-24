@@ -3,6 +3,11 @@ use alloc::sync::Arc;
 
 use crate::errno::EINVAL;
 
+pub const MS_RDONLY: u64 = 0x0001;
+pub const MS_NOSUID: u64 = 0x0002;
+pub const MS_NODEV: u64 = 0x0004;
+pub const MS_NOEXEC: u64 = 0x0008;
+pub const MOUNT_FLAG_MASK: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
 pub const MS_BIND: u64 = 0x1000;
 const MS_REC: u64 = 0x4000;
 pub const MS_REMOUNT: u64 = 0x0020;
@@ -87,6 +92,7 @@ pub fn move_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str) -> i64
         Err(e) => return e.as_neg_i64(),
     };
     ctx.remove_mount(s_norm);
+    let moved_flags = entry.in_use.flags();
     ctx.install_mount(
         t_norm,
         tgt_inode.inode_id(),
@@ -94,6 +100,7 @@ pub fn move_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str) -> i64
         entry.propagation,
         &entry.source,
         &entry.fstype,
+        moved_flags,
     );
     0
 }
@@ -136,6 +143,7 @@ pub fn bind_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str, flags:
         bind_prop,
         s_norm,
         &bind_fstype,
+        flags & MOUNT_FLAG_MASK,
     );
     if (flags & MS_REC) != 0 {
         for (suffix, entry) in ctx.collect_subtree(s_norm) {
@@ -150,6 +158,7 @@ pub fn bind_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str, flags:
                 s
             };
             if let Ok(mirror_target_inode) = super::path::resolve(ctx, &ctx.root, &mirror_path) {
+                let sub_flags = entry.in_use.flags();
                 ctx.install_mount_propagating(
                     &mirror_path,
                     mirror_target_inode.inode_id(),
@@ -157,6 +166,7 @@ pub fn bind_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str, flags:
                     entry.propagation,
                     &entry.source,
                     &entry.fstype,
+                    sub_flags,
                 );
             }
         }
@@ -182,6 +192,7 @@ pub fn install_new(
         new_prop,
         source,
         fstype,
+        flags & MOUNT_FLAG_MASK,
     );
 }
 

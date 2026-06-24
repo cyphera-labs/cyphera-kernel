@@ -106,6 +106,15 @@ pub extern "C" fn _start() -> ! {
     sys_close(fd2 as u64);
     log("/tmp/foo persisted across close\n");
 
+    const O_EXCL: u64 = 0o200;
+    const EEXIST: i64 = -17;
+    let xfd = sys_openat(AT_FDCWD, foo_path.as_ptr(), O_CREAT | O_EXCL, 0o644);
+    if xfd != EEXIST {
+        log("O_CREAT|O_EXCL on existing file did not return EEXIST\n");
+        sys_exit(1);
+    }
+    log("O_EXCL rejects existing file OK\n");
+
     const O_PATH: u64 = 0o10_000_000;
     const EBADF: i64 = -9;
     let pfd = sys_openat(AT_FDCWD, b"/tmp\0".as_ptr(), O_PATH, 0);

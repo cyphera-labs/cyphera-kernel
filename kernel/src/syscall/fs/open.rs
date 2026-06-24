@@ -23,10 +23,18 @@ fn resolve_or_create_regular(
     mode: u64,
 ) -> ResolvedOpen {
     match vfs::path::resolve_with_mount(ctx, base, path) {
-        Ok((inode, tag)) => Ok((inode, tag.map(vfs::MountInUseGuard::new), false)),
+        Ok((inode, tag)) => {
+            if open_flags.contains(OpenFlags::CREAT) && open_flags.contains(OpenFlags::EXCL) {
+                return Err(EEXIST);
+            }
+            Ok((inode, tag.map(vfs::MountInUseGuard::new), false))
+        }
         Err(Errno::NOENT) if open_flags.contains(OpenFlags::CREAT) => {
             let (parent, leaf) =
                 vfs::path::resolve_parent(ctx, base, path).map_err(|e| e.as_neg_i64())?;
+            if ctx.parent_mount_flags(base, path) & vfs::mount::MS_RDONLY != 0 {
+                return Err(crate::errno::EROFS);
+            }
             let inode = parent
                 .create(leaf, InodeKind::Regular)
                 .map_err(|e| e.as_neg_i64())?;
@@ -54,7 +62,7 @@ fn check_open_access(inode: &Arc<dyn vfs::Inode>, open_flags: OpenFlags) -> Resu
         let allowed =
             sched::with_current_creds(|c| c.can_access(st.uid, st.gid, st.mode, mode_req));
         if !allowed {
-            return Err(-13);
+            return Err(EACCES);
         }
     }
     Ok(())
@@ -66,8 +74,32 @@ fn finish_open(
     mount_guard: Option<vfs::MountInUseGuard>,
     path: String,
 ) -> i64 {
-    if open_flags.contains(OpenFlags::TRUNC) && open_flags.is_writable() {
-        let _ = inode.truncate(0);
+    if open_flags.contains(OpenFlags::DIRECTORY) && inode.kind() != InodeKind::Directory {
+        return ENOTDIR;
+    }
+    if inode.kind() == InodeKind::Directory
+        && (open_flags.is_writable() || open_flags.contains(OpenFlags::TRUNC))
+    {
+        return crate::errno::EISDIR;
+    }
+    let mount_flags = mount_guard.as_ref().map(|g| g.flags()).unwrap_or(0);
+    if mount_flags & vfs::mount::MS_RDONLY != 0
+        && (open_flags.is_writable()
+            || open_flags.contains(OpenFlags::TRUNC)
+            || open_flags.contains(OpenFlags::CREAT))
+    {
+        return crate::errno::EROFS;
+    }
+    if mount_flags & vfs::mount::MS_NODEV != 0 && inode.kind() == InodeKind::CharDevice {
+        return EACCES;
+    }
+    if open_flags.contains(OpenFlags::TRUNC)
+        && open_flags.is_writable()
+        && inode.kind() == InodeKind::Regular
+    {
+        if let Err(e) = inode.truncate(0) {
+            return e.as_neg_i64();
+        }
     }
     let file = Arc::new(OpenFile::new_with_mount(inode, open_flags, mount_guard).with_path(path));
     match sched::with_current_fds(|t| t.install(file)) {
@@ -123,25 +155,31 @@ pub(crate) fn sys_openat(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> i6
             None => return EBADF,
         };
         if dir_file.inode.kind() != InodeKind::Directory {
-            return -20;
+            return ENOTDIR;
         }
         let ctx = vfs::path::Context::current();
         let open_flags = OpenFlags::from_bits_truncate(flags as u32);
-        let (inode, mount_guard, created) =
-            match resolve_or_create_regular(&ctx, &dir_file.inode, path, open_flags, mode) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
-        if !created {
-            if let Err(e) = check_open_access(&inode, open_flags) {
-                return e;
-            }
-        }
         let child_path = if dir_file.path.is_empty() {
             String::new()
         } else {
             vfs::path::normalize(&dir_file.path, path)
         };
+        let (inode, mount_guard, created) = if child_path.is_empty() {
+            match resolve_or_create_regular(&ctx, &dir_file.inode, path, open_flags, mode) {
+                Ok(t) => t,
+                Err(e) => return e,
+            }
+        } else {
+            match resolve_or_create_regular(&ctx, &ctx.root, &child_path, open_flags, mode) {
+                Ok(t) => t,
+                Err(e) => return e,
+            }
+        };
+        if !created {
+            if let Err(e) = check_open_access(&inode, open_flags) {
+                return e;
+            }
+        }
         return finish_open(inode, open_flags, mount_guard, child_path);
     }
 
@@ -215,9 +253,6 @@ pub(crate) fn sys_close_range(first: u64, last: u64, _flags: u64) -> i64 {
 }
 
 pub(crate) fn sys_memfd_create(name_ptr: u64, flags: u64) -> i64 {
-    if sched::with_current_lifecycle(|l| l.did_memfd_exec()).unwrap_or(false) {
-        return -38;
-    }
     const MFD_CLOEXEC: u64 = 0x0001;
     const MFD_ALLOW_SEALING: u64 = 0x0002;
     const MFD_HUGETLB: u64 = 0x0004;
@@ -236,7 +271,8 @@ pub(crate) fn sys_memfd_create(name_ptr: u64, flags: u64) -> i64 {
         Err(e) => return e,
     };
 
-    let inode = crate::fs::tmpfs::TmpfsInode::new_file();
+    let allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
+    let inode = crate::fs::tmpfs::TmpfsInode::new_memfd(allow_sealing);
     let inode_dyn: Arc<dyn Inode> = inode;
     let file = Arc::new(OpenFile::new(inode_dyn, OpenFlags::RDWR));
     let fd_flags = if (flags & MFD_CLOEXEC) != 0 {

@@ -61,7 +61,7 @@ impl FdTable {
     pub fn install_from(&self, file: Arc<OpenFile>, min_fd: i32, fd_flags: u8) -> Result<i32, i32> {
         let cap = self.soft_cap.load(Ordering::Acquire);
         if min_fd < 0 || (min_fd as usize) >= cap {
-            return Err(-22);
+            return Err(crate::errno::EINVAL as i32);
         }
         let mut t = self.inner.lock();
         let start = min_fd as usize;
@@ -74,7 +74,7 @@ impl FdTable {
         }
         let i = t.len().max(start);
         if i >= cap {
-            return Err(-24);
+            return Err(crate::errno::EMFILE as i32);
         }
         Self::ensure_len(&mut t, i + 1);
         t[i].file = Some(file);
@@ -118,13 +118,13 @@ impl FdTable {
     pub fn dup_to(&self, src: i32, dst: i32, fd_flags: u8) -> Result<i32, i32> {
         let cap = self.soft_cap.load(Ordering::Acquire);
         if src < 0 || (src as usize) >= cap || dst < 0 || (dst as usize) >= cap {
-            return Err(-9);
+            return Err(crate::errno::EBADF as i32);
         }
         let mut t = self.inner.lock();
         let entry = t
             .get(src as usize)
             .and_then(|s| s.file.clone())
-            .ok_or(-9i32)?;
+            .ok_or(crate::errno::EBADF as i32)?;
         if src != dst {
             Self::ensure_len(&mut t, dst as usize + 1);
             t[dst as usize].file = Some(entry);
@@ -149,12 +149,12 @@ impl FdTable {
 
     pub fn set_fd_flags(&self, fd: i32, flags: u8) -> Result<(), i32> {
         if fd < 0 {
-            return Err(-9);
+            return Err(crate::errno::EBADF as i32);
         }
         let mut t = self.inner.lock();
-        let slot = t.get_mut(fd as usize).ok_or(-9i32)?;
+        let slot = t.get_mut(fd as usize).ok_or(crate::errno::EBADF as i32)?;
         if slot.file.is_none() {
-            return Err(-9);
+            return Err(crate::errno::EBADF as i32);
         }
         slot.fd_flags = flags;
         Ok(())

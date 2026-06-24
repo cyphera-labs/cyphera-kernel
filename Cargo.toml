@@ -20,7 +20,7 @@ members = [
 default-members = ["runtime/boot"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Horizon Digital Engineering LLC <security@horizondigital.dev>"]
@@ -42,6 +42,7 @@ opt-level = "s"
 debug = true
 lto = "thin"
 codegen-units = 1
+overflow-checks = true
 # Trim absolute source paths from debug info + panic messages.
 # Without this, two builds of the same source from different paths
 # produce different SHA256s (the only delta is the embedded source

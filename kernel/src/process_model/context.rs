@@ -382,7 +382,6 @@ pub struct LifecycleContext {
     in_syscall: bool,
     vfork_done_set: core::sync::atomic::AtomicBool,
     vfork_shared_vm: core::sync::atomic::AtomicBool,
-    did_memfd_exec: core::sync::atomic::AtomicBool,
     child_subreaper: core::sync::atomic::AtomicBool,
 }
 
@@ -431,16 +430,6 @@ impl LifecycleContext {
 
     pub fn set_vfork_shared_vm(&self, v: bool) {
         self.vfork_shared_vm
-            .store(v, core::sync::atomic::Ordering::Release);
-    }
-
-    pub fn did_memfd_exec(&self) -> bool {
-        self.did_memfd_exec
-            .load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn set_did_memfd_exec(&self, v: bool) {
-        self.did_memfd_exec
             .store(v, core::sync::atomic::Ordering::Release);
     }
 
@@ -527,7 +516,7 @@ impl SignalContext {
     }
 
     pub fn set_blocked(&mut self, mask: u64) {
-        self.blocked = mask;
+        self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
     pub fn raise(&mut self, mask: u64) {
@@ -862,6 +851,8 @@ pub struct IdentityContext {
     sid: Pid,
     cmdline: alloc::vec::Vec<u8>,
     exe_path: alloc::vec::Vec<u8>,
+    exe_inode: Option<Arc<dyn Inode>>,
+    exe_mnt_flags: u64,
 }
 
 impl IdentityContext {
@@ -871,6 +862,8 @@ impl IdentityContext {
             sid: pid,
             cmdline: alloc::vec::Vec::new(),
             exe_path: alloc::vec::Vec::new(),
+            exe_inode: None,
+            exe_mnt_flags: 0,
         }
     }
 
@@ -880,6 +873,8 @@ impl IdentityContext {
             sid: parent.sid,
             cmdline: parent.cmdline.clone(),
             exe_path: parent.exe_path.clone(),
+            exe_inode: parent.exe_inode.clone(),
+            exe_mnt_flags: parent.exe_mnt_flags,
         }
     }
 
@@ -913,6 +908,22 @@ impl IdentityContext {
 
     pub fn set_exe_path(&mut self, exe_path: alloc::vec::Vec<u8>) {
         self.exe_path = exe_path;
+    }
+
+    pub fn exe_inode(&self) -> Option<Arc<dyn Inode>> {
+        self.exe_inode.clone()
+    }
+
+    pub fn set_exe_inode(&mut self, inode: Option<Arc<dyn Inode>>) {
+        self.exe_inode = inode;
+    }
+
+    pub fn exe_mnt_flags(&self) -> u64 {
+        self.exe_mnt_flags
+    }
+
+    pub fn set_exe_mnt_flags(&mut self, flags: u64) {
+        self.exe_mnt_flags = flags;
     }
 }
 

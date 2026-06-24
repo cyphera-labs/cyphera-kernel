@@ -55,6 +55,8 @@ pub struct TmpfsInode {
     xattrs: SpinIrq<BTreeMap<String, Vec<u8>>>,
     state: SpinIrq<TmpfsData>,
     dir_removed: core::sync::atomic::AtomicBool,
+    sealable: core::sync::atomic::AtomicBool,
+    seals: AtomicU32,
 }
 
 enum TmpfsData {
@@ -238,7 +240,18 @@ impl TmpfsInode {
             xattrs: SpinIrq::new(BTreeMap::new()),
             state: SpinIrq::new(data),
             dir_removed: core::sync::atomic::AtomicBool::new(false),
+            sealable: core::sync::atomic::AtomicBool::new(false),
+            seals: AtomicU32::new(0),
         })
+    }
+
+    pub fn new_memfd(allow_sealing: bool) -> Arc<Self> {
+        let i = Self::new_with(InodeKind::Regular, TmpfsData::Regular(PagedFile::new()));
+        i.sealable.store(true, Ordering::Release);
+        if !allow_sealing {
+            i.seals.store(crate::vfs::F_SEAL_SEAL, Ordering::Release);
+        }
+        i
     }
 
     pub fn new_mount_root() -> Arc<Self> {
@@ -402,9 +415,18 @@ impl Inode for TmpfsInode {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
+        let seals = self.seals.load(Ordering::Acquire);
+        if seals & (crate::vfs::F_SEAL_WRITE | crate::vfs::F_SEAL_FUTURE_WRITE) != 0 {
+            return Err(Errno::PERM);
+        }
         let mut g = self.state.lock();
         match &mut *g {
             TmpfsData::Regular(data) => {
+                if seals & crate::vfs::F_SEAL_GROW != 0
+                    && offset.saturating_add(buf.len() as u64) > data.len
+                {
+                    return Err(Errno::PERM);
+                }
                 let written = data.write_from(offset, buf);
                 drop(g);
                 if written == 0 && !buf.is_empty() {
@@ -431,12 +453,27 @@ impl Inode for TmpfsInode {
         self.write_at(offset, buf)
     }
 
+    fn writeback_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
+        let mut g = self.state.lock();
+        match &mut *g {
+            TmpfsData::Regular(data) => Ok(data.write_from(offset, buf)),
+            _ => Err(Errno::ISDIR),
+        }
+    }
+
     fn truncate(&self, len: u64) -> KResult<()> {
         let mut g = self.state.lock();
         let TmpfsData::Regular(data) = &mut *g else {
             return Err(Errno::ISDIR);
         };
         let old_len = data.len;
+        let seals = self.seals.load(Ordering::Acquire);
+        if len < old_len && seals & crate::vfs::F_SEAL_SHRINK != 0 {
+            return Err(Errno::PERM);
+        }
+        if len > old_len && seals & crate::vfs::F_SEAL_GROW != 0 {
+            return Err(Errno::PERM);
+        }
         data.resize(len);
         drop(g);
         self.touch_mtime();
@@ -444,6 +481,39 @@ impl Inode for TmpfsInode {
             crate::fs::pagecache::invalidate_range(self.id, len, u64::MAX);
         }
         Ok(())
+    }
+
+    fn memfd_seals(&self) -> Option<u32> {
+        if self.sealable.load(Ordering::Acquire) {
+            Some(self.seals.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
+    fn memfd_add_seals(&self, add: u32, writable_mapping_exists: bool) -> KResult<()> {
+        if !self.sealable.load(Ordering::Acquire) {
+            return Err(Errno::INVAL);
+        }
+        if add & !crate::vfs::SEAL_MASK != 0 {
+            return Err(Errno::INVAL);
+        }
+        loop {
+            let cur = self.seals.load(Ordering::Acquire);
+            if cur & crate::vfs::F_SEAL_SEAL != 0 {
+                return Err(Errno::PERM);
+            }
+            if add & crate::vfs::F_SEAL_WRITE != 0 && writable_mapping_exists {
+                return Err(Errno::BUSY);
+            }
+            if self
+                .seals
+                .compare_exchange(cur, cur | add, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
     }
 
     fn lookup(&self, name: &str) -> KResult<Arc<dyn Inode>> {
@@ -718,47 +788,130 @@ impl Inode for TmpfsInode {
             return Err(Errno::NOENT);
         }
 
-        if let Ok(dst) = new_parent.lookup(new_name) {
-            let src = self.lookup(old_name)?;
-            if Arc::ptr_eq(&src, &dst) {
-                return Ok(());
-            }
-            validate_and_seal_overwrite(&src, &dst)?;
-            drop(src);
-            match new_parent.unlink_if_matches(new_name, &dst) {
-                Ok(true) => {}
-                Ok(false) => dst.unseal_dir(),
-                Err(e) => {
-                    dst.unseal_dir();
-                    return Err(e);
+        let np = match new_parent
+            .as_any()
+            .and_then(|a| a.downcast_ref::<TmpfsInode>())
+        {
+            Some(p) => p,
+            None => return Err(Errno::XDEV),
+        };
+        for _attempt in 0..64 {
+            let (src, dst) = {
+                let (sg, ng);
+                if (self as *const _ as usize) < (np as *const _ as usize) {
+                    sg = self.state.lock();
+                    ng = np.state.lock();
+                } else {
+                    ng = np.state.lock();
+                    sg = self.state.lock();
                 }
+                let TmpfsData::Directory(smap) = &*sg else {
+                    return Err(Errno::NOTDIR);
+                };
+                let TmpfsData::Directory(nmap) = &*ng else {
+                    return Err(Errno::NOTDIR);
+                };
+                let src = smap.get(old_name).cloned().ok_or(Errno::NOENT)?;
+                let dst = nmap.get(new_name).cloned();
+                (src, dst)
+            };
+            if let Some(ref d) = dst {
+                if Arc::ptr_eq(&src, d) {
+                    return Ok(());
+                }
+                validate_and_seal_overwrite(&src, d)?;
             }
-        }
-        let entry = {
-            let mut g = self.state.lock();
-            let TmpfsData::Directory(map) = &mut *g else {
+            let (mut sg, mut ng);
+            if (self as *const _ as usize) < (np as *const _ as usize) {
+                sg = self.state.lock();
+                ng = np.state.lock();
+            } else {
+                ng = np.state.lock();
+                sg = self.state.lock();
+            }
+            let TmpfsData::Directory(smap) = &mut *sg else {
                 return Err(Errno::NOTDIR);
             };
-            map.remove(old_name).ok_or(Errno::NOENT)?
-        };
-        let moved_is_dir = entry.kind() == InodeKind::Directory;
-        match new_parent.attach(new_name, entry.clone()) {
-            Ok(()) => {
-                self.touch_mtime();
-                if moved_is_dir {
-                    self.drop_nlink();
-                    new_parent.bump_nlink();
+            let TmpfsData::Directory(nmap) = &mut *ng else {
+                return Err(Errno::NOTDIR);
+            };
+            let src_ok = smap.get(old_name).is_some_and(|c| Arc::ptr_eq(c, &src));
+            let cur_dst = nmap.get(new_name).cloned();
+            let dst_ok = match (&dst, &cur_dst) {
+                (None, None) => true,
+                (Some(d), Some(c)) => Arc::ptr_eq(d, c),
+                _ => false,
+            };
+            if !src_ok {
+                drop(sg);
+                drop(ng);
+                if let Some(d) = &dst {
+                    d.unseal_dir();
                 }
-                Ok(())
+                return Err(Errno::NOENT);
             }
-            Err(e) => {
-                let mut g = self.state.lock();
-                if let TmpfsData::Directory(map) = &mut *g {
-                    map.insert(old_name.to_string(), entry);
+            if !dst_ok {
+                drop(sg);
+                drop(ng);
+                if let Some(d) = &dst {
+                    d.unseal_dir();
                 }
-                Err(e)
+                continue;
             }
+            let removed_target = nmap.remove(new_name);
+            let entry = smap.remove(old_name).unwrap_or_else(|| src.clone());
+            let moved_is_dir = entry.kind() == InodeKind::Directory;
+            nmap.insert(new_name.to_string(), entry);
+            drop(sg);
+            drop(ng);
+            self.touch_mtime();
+            np.touch_mtime();
+            if let Some(t) = removed_target {
+                if t.kind() == InodeKind::Directory {
+                    np.nlink.fetch_sub(1, Ordering::AcqRel);
+                }
+                t.drop_nlink();
+            }
+            if moved_is_dir {
+                self.drop_nlink();
+                np.bump_nlink();
+            }
+            return Ok(());
         }
+        Err(Errno::NOENT)
+    }
+
+    fn fs_id(&self) -> usize {
+        0x746d_7066
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
+    fn rename_exchange(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn Inode>,
+        new_name: &str,
+    ) -> KResult<()> {
+        if Arc::as_ptr(new_parent) as *const () != self as *const _ as *const () {
+            return Err(Errno::NOSYS);
+        }
+        let mut g = self.state.lock();
+        let TmpfsData::Directory(map) = &mut *g else {
+            return Err(Errno::NOTDIR);
+        };
+        if !map.contains_key(old_name) || !map.contains_key(new_name) {
+            return Err(Errno::NOENT);
+        }
+        let a = map.remove(old_name).unwrap();
+        let b = map.remove(new_name).unwrap();
+        map.insert(old_name.to_string(), b);
+        map.insert(new_name.to_string(), a);
+        drop(g);
+        self.touch_mtime();
+        Ok(())
     }
 
     fn on_open(&self, flags: OpenFlags) {

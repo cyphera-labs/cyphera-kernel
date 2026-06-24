@@ -198,25 +198,28 @@ pub(crate) fn sys_faccessat(dirfd: u64, pathname: u64, mode: u64, _flags: u64) -
 
 fn chmod_permitted(file_uid: u32) -> bool {
     sched::with_current_creds(|c| {
-        c.capable_host(crate::process_model::CAP_FOWNER) || c.fsuid == file_uid
+        (c.has_cap(crate::process_model::CAP_FOWNER) && c.owns_kuid(file_uid))
+            || c.fsuid == file_uid
     })
 }
 
-fn chown_permitted(file_uid: u32, want_uid: Option<u32>, want_gid: Option<u32>) -> bool {
+fn chown_permitted(
+    file_uid: u32,
+    file_gid: u32,
+    want_uid: Option<u32>,
+    want_gid: Option<u32>,
+) -> bool {
     sched::with_current_creds(|c| {
+        let cap_chown = c.has_cap(crate::process_model::CAP_CHOWN)
+            && c.owns_kuid(file_uid)
+            && c.owns_kgid(file_gid);
         let uid_ok = match want_uid {
             None => true,
-            Some(nu) => {
-                c.capable_host(crate::process_model::CAP_CHOWN)
-                    || (c.fsuid == file_uid && nu == file_uid)
-            }
+            Some(nu) => cap_chown || (c.fsuid == file_uid && nu == file_uid),
         };
         let gid_ok = match want_gid {
             None => true,
-            Some(ng) => {
-                c.capable_host(crate::process_model::CAP_CHOWN)
-                    || (c.fsuid == file_uid && (c.fsgid == ng || c.is_in_group(ng)))
-            }
+            Some(ng) => cap_chown || (c.fsuid == file_uid && (c.fsgid == ng || c.is_in_group(ng))),
         };
         uid_ok && gid_ok
     })
@@ -241,6 +244,9 @@ pub(crate) fn sys_fchmod(fd: u64, mode: u64) -> i64 {
         Some(f) => f,
         None => return EBADF,
     };
+    if fd_mount_is_rdonly(&file) {
+        return crate::errno::EROFS;
+    }
     if !chmod_permitted(file.inode.stat().uid) {
         return EPERM;
     }
@@ -251,7 +257,7 @@ pub(crate) fn sys_fchmod(fd: u64, mode: u64) -> i64 {
 }
 
 pub(crate) fn sys_fchmodat(dirfd: u64, pathname: u64, mode: u64) -> i64 {
-    let inode = match resolve_path(dirfd, pathname, true) {
+    let inode = match resolve_path_writable(dirfd, pathname, true) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -269,6 +275,9 @@ pub(crate) fn sys_fchown(fd: u64, uid: u64, gid: u64) -> i64 {
         Some(f) => f,
         None => return EBADF,
     };
+    if fd_mount_is_rdonly(&file) {
+        return crate::errno::EROFS;
+    }
     let u = if (uid as i32) == -1 {
         None
     } else {
@@ -286,7 +295,8 @@ pub(crate) fn sys_fchown(fd: u64, uid: u64, gid: u64) -> i64 {
         Ok(x) => x,
         Err(e) => return e,
     };
-    if !chown_permitted(file.inode.stat().uid, u, g) {
+    let st = file.inode.stat();
+    if !chown_permitted(st.uid, st.gid, u, g) {
         return EPERM;
     }
     match file.inode.set_owner(u, g) {
@@ -296,7 +306,7 @@ pub(crate) fn sys_fchown(fd: u64, uid: u64, gid: u64) -> i64 {
 }
 
 pub(crate) fn sys_fchownat(dirfd: u64, pathname: u64, uid: u64, gid: u64, _flags: u64) -> i64 {
-    let inode = match resolve_path(dirfd, pathname, true) {
+    let inode = match resolve_path_writable(dirfd, pathname, true) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -317,7 +327,8 @@ pub(crate) fn sys_fchownat(dirfd: u64, pathname: u64, uid: u64, gid: u64, _flags
         Ok(x) => x,
         Err(e) => return e,
     };
-    if !chown_permitted(inode.stat().uid, u, g) {
+    let st = inode.stat();
+    if !chown_permitted(st.uid, st.gid, u, g) {
         return EPERM;
     }
     match inode.set_owner(u, g) {
@@ -327,17 +338,26 @@ pub(crate) fn sys_fchownat(dirfd: u64, pathname: u64, uid: u64, gid: u64, _flags
 }
 
 pub(crate) fn sys_statfs(arg: u64, statfs_ptr: u64, fd: bool) -> i64 {
-    let inode = if fd {
+    let (inode, mut mnt_flags) = if fd {
         match sched::with_current_fds(|t| t.get(arg as i32)) {
-            Some(f) => f.inode.clone(),
+            Some(f) => {
+                let mf = f._mount_guard.as_ref().map(|g| g.flags()).unwrap_or(0);
+                (f.inode.clone(), mf)
+            }
             None => return EBADF,
         }
     } else {
         match resolve_path(AT_FDCWD as u64, arg, true) {
-            Ok(i) => i,
+            Ok(i) => (i, 0u64),
             Err(e) => return e,
         }
     };
+    let cur = sched::current_pid();
+    if let Some(exe) = crate::core::process_exe_inode(cur) {
+        if alloc::sync::Arc::ptr_eq(&inode, &exe) {
+            mnt_flags = crate::core::process_exe_mnt_flags(cur);
+        }
+    }
     let st = inode.stat();
     let mut buf = [0u8; STATFS_SIZE];
     let magic: u64 = if (st.dev_id >> 56) == 0xe4 {
@@ -358,6 +378,8 @@ pub(crate) fn sys_statfs(arg: u64, statfs_ptr: u64, fd: bool) -> i64 {
     buf[56..64].copy_from_slice(&st.dev_id.to_le_bytes());
     buf[64..72].copy_from_slice(&255u64.to_le_bytes());
     buf[72..80].copy_from_slice(&(st.blksize as u64).to_le_bytes());
+    let f_flags = mnt_flags & crate::vfs::mount::MOUNT_FLAG_MASK;
+    buf[80..88].copy_from_slice(&f_flags.to_le_bytes());
     if frame::user::copy_to_user(statfs_ptr, &buf).is_err() {
         return EFAULT;
     }
@@ -367,11 +389,16 @@ pub(crate) fn sys_statfs(arg: u64, statfs_ptr: u64, fd: bool) -> i64 {
 pub(crate) fn sys_utimensat(dirfd: u64, pathname: u64, times_ptr: u64, _flags: u64) -> i64 {
     let inode = if pathname == 0 {
         match sched::with_current_fds(|t| t.get(dirfd as i32)) {
-            Some(f) => f.inode.clone(),
+            Some(f) => {
+                if fd_mount_is_rdonly(&f) {
+                    return crate::errno::EROFS;
+                }
+                f.inode.clone()
+            }
             None => return EBADF,
         }
     } else {
-        match resolve_path(dirfd, pathname, true) {
+        match resolve_path_writable(dirfd, pathname, true) {
             Ok(i) => i,
             Err(e) => return e,
         }

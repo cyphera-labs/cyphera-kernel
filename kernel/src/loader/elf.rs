@@ -1,10 +1,13 @@
 extern crate alloc;
 
 use cyphera_kapi::{Errno, KResult};
-use frame::mm::{VirtAddr, frame_alloc, vm::Perms, vm::VmSpace, write_to_frame, zero_frame};
+use frame::mm::{
+    VirtAddr, frame_alloc, vm::Perms, vm::USER_VA_END, vm::VmSpace, write_to_frame, zero_frame,
+};
 use object::Endianness;
 use object::elf::{FileHeader64, PF_R, PF_W, PF_X, PT_INTERP, PT_LOAD};
 use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
+use object::{Object, ObjectSection};
 
 type Elf64<'a> = ElfFile<'a, FileHeader64<Endianness>>;
 
@@ -16,6 +19,7 @@ fn map_err(e: frame::mm::vm::MapError) -> Errno {
         M::OutOfFrames => Errno::NOMEM,
         M::Misaligned => Errno::NOEXEC,
         M::AlreadyMapped | M::ParentTableHugePage => Errno::INVAL,
+        M::OutOfUserRange => Errno::NOEXEC,
     }
 }
 
@@ -50,6 +54,8 @@ pub fn load_static(elf_bytes: &[u8], vmspace: &mut VmSpace) -> KResult<Loaded> {
     let header = elf.elf_header();
     let endian = header.endian().map_err(|_| Errno::NOEXEC)?;
 
+    let relocs = collect_relative_relocs(&elf, 0)?;
+
     let mut image_end: u64 = 0;
     let mut interp_path: Option<alloc::string::String> = None;
     let mut segments: alloc::vec::Vec<(u64, u64, Perms)> = alloc::vec::Vec::new();
@@ -64,7 +70,7 @@ pub fn load_static(elf_bytes: &[u8], vmspace: &mut VmSpace) -> KResult<Loaded> {
             }
             PT_LOAD => {
                 let (seg_start, seg_end, seg_perms) =
-                    load_segment(elf_bytes, ph, endian, vmspace, 0)?;
+                    load_segment(elf_bytes, ph, endian, vmspace, 0, &relocs)?;
                 if seg_end > image_end {
                     image_end = seg_end;
                 }
@@ -145,7 +151,8 @@ fn load_interpreter(path: &str, vmspace: &mut VmSpace) -> KResult<(u64, u64, Seg
     let mut interp_segments: alloc::vec::Vec<(u64, u64, Perms)> = alloc::vec::Vec::new();
     for ph in interp.elf_program_headers() {
         if ph.p_type(endian) == PT_LOAD {
-            let (seg_start, seg_end, seg_perms) = load_segment(&buf, ph, endian, vmspace, base)?;
+            let (seg_start, seg_end, seg_perms) =
+                load_segment(&buf, ph, endian, vmspace, base, &[])?;
             interp_segments.push((seg_start, seg_end, seg_perms));
         }
     }
@@ -159,6 +166,7 @@ fn load_segment(
     endian: Endianness,
     vmspace: &mut VmSpace,
     base: u64,
+    relocs: &[(u64, u64)],
 ) -> KResult<(u64, u64, Perms)> {
     let vaddr = ph.p_vaddr(endian).checked_add(base).ok_or(Errno::NOEXEC)?;
     let mem_size = ph.p_memsz(endian);
@@ -185,6 +193,9 @@ fn load_segment(
     let file_top = vaddr.checked_add(file_size).ok_or(Errno::NOEXEC)?;
     let page_start = vaddr & !0xfff;
     let page_end = seg_top & !0xfff;
+    if page_end > USER_VA_END {
+        return Err(Errno::NOEXEC);
+    }
     let num_pages = ((page_end - page_start) / 4096) as usize;
 
     for i in 0..num_pages {
@@ -205,6 +216,12 @@ fn load_segment(
                 offset_in_page,
                 &segment_data[data_start_in_segment..data_start_in_segment + copy_len],
             );
+        }
+
+        for &(target_va, value) in relocs {
+            if target_va >= page_va && target_va + 8 <= page_va + 4096 {
+                write_to_frame(frame, (target_va - page_va) as usize, &value.to_le_bytes());
+            }
         }
 
         let region = vmspace
@@ -228,4 +245,24 @@ fn elf_perms(r: bool, w: bool, x: bool) -> Perms {
         p |= Perms::EXECUTE;
     }
     p
+}
+
+const R_X86_64_RELATIVE: u32 = 8;
+
+fn collect_relative_relocs(elf: &Elf64<'_>, base: u64) -> KResult<alloc::vec::Vec<(u64, u64)>> {
+    let mut out = alloc::vec::Vec::new();
+    let section = match elf.section_by_name(".rela.dyn") {
+        Some(s) => s,
+        None => return Ok(out),
+    };
+    let data = section.data().map_err(|_| Errno::NOEXEC)?;
+    for entry in data.chunks_exact(24) {
+        let r_offset = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+        let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        let r_addend = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+        if (r_info & 0xffff_ffff) as u32 == R_X86_64_RELATIVE {
+            out.push((base.wrapping_add(r_offset), base.wrapping_add(r_addend)));
+        }
+    }
+    Ok(out)
 }

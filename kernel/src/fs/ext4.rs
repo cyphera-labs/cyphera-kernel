@@ -1267,6 +1267,10 @@ impl Inode for Ext4Inode {
         self.fs.dev_id ^ (self.ino as u64)
     }
 
+    fn fs_id(&self) -> usize {
+        Arc::as_ptr(&self.fs) as usize
+    }
+
     fn stat(&self) -> Stat {
         let raw = self.raw().unwrap_or(RawInode {
             i_mode: 0,
@@ -1662,6 +1666,20 @@ impl Inode for Ext4Inode {
             }
         }
         let (ino, ft) = found.ok_or(Errno::NOENT)?;
+        if let Ok(existing) = new_parent.lookup(new_name) {
+            let existing_ino = (existing.inode_id() ^ self.fs.dev_id) as u32;
+            if existing_ino == ino {
+                return Ok(());
+            }
+            let src_dir = ft == FT_DIR;
+            let dst_dir = existing.kind() == InodeKind::Directory;
+            match (src_dir, dst_dir) {
+                (false, true) => return Err(Errno::ISDIR),
+                (true, false) => return Err(Errno::NOTDIR),
+                (true, true) => new_parent.rmdir(new_name)?,
+                (false, false) => new_parent.unlink(new_name)?,
+            }
+        }
         let new_target = Ext4Inode::new(self.fs.clone(), ino);
         let new_target_arc: Arc<dyn Inode> = Arc::new(new_target);
         new_parent

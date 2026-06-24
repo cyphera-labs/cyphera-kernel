@@ -289,7 +289,7 @@ pub fn free_frame(frame: PhysFrame<Size4KiB>) {
         let mut cur = slot.load(Ordering::Acquire);
         loop {
             debug_assert!(cur != 0, "frame_alloc: free of a frame with refcount 0");
-            if cur == 0 {
+            if cur == 0 || cur == u16::MAX {
                 return;
             }
             match slot.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
@@ -326,13 +326,21 @@ pub fn reclaim_module(paddr: u64, size: u64) -> usize {
 
 pub fn free_contiguous(frame: PhysFrame<Size4KiB>, count: usize) {
     if let Some(slot) = refcount_slot(frame) {
-        let prev = slot.swap(0, Ordering::AcqRel);
-        debug_assert!(
-            prev == 1,
-            "frame_alloc: free_contiguous of a head with refcount != 1"
-        );
-        if prev == 0 {
-            return;
+        let mut cur = slot.load(Ordering::Acquire);
+        loop {
+            if cur == u16::MAX || cur == 0 {
+                return;
+            }
+            match slot.compare_exchange_weak(cur, 0, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    debug_assert!(
+                        cur == 1,
+                        "frame_alloc: free_contiguous of a head with refcount != 1"
+                    );
+                    break;
+                }
+                Err(observed) => cur = observed,
+            }
         }
     }
     let idx = (frame.start_address().as_u64() / 4096) as usize;

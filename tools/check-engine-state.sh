@@ -24,4 +24,13 @@ if [ -n "$hits" ]; then
     printf '\nRoute it through an engine door (sched::params::{set_class,set_deadline,set_affinity,set_nice}, pi_boost / pi_refresh, or admit_task for a new task).\n'
     exit 1
 fi
-printf 'OK: scheduler placement state is mutated only by the engine.\n'
+state_hits=$(grep -rnE '\.(state|sched_owner)\.0[[:space:]]*=[^=]' kernel/src --include='*.rs' \
+    | grep -vE '^kernel/src/core/mod.rs:' \
+    || true)
+
+if [ -n "$state_hits" ]; then
+    printf '\nengine-state leak — ProcessState/SchedOwner written outside its core door:\n%s\n' "$state_hits"
+    printf '\nRoute it through set_state(...) or set_sched_owner(...) in kernel/src/core/mod.rs.\n'
+    exit 1
+fi
+printf 'OK: scheduler placement state mutated only by the engine; ProcessState/SchedOwner only via their doors.\n'

@@ -16,6 +16,13 @@ pub fn target_capable(pid: crate::process_model::Pid, cap: u32) -> bool {
     sched::with_target_creds(pid, |c| c.capable_host(cap)).unwrap_or(false)
 }
 
+pub fn capable_in(
+    cap: u32,
+    governing_user_ns: Option<&alloc::sync::Arc<crate::process_model::UserNamespace>>,
+) -> bool {
+    sched::with_current_creds(|c| c.capable_in(cap, governing_user_ns))
+}
+
 pub fn capset(new_eff: u64, new_perm: u64, new_inh: u64) -> Result<(), i64> {
     sched::with_current_creds_mut(|c| {
         if (new_perm & !c.caps_perm) != 0 {

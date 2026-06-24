@@ -21,7 +21,7 @@ pub(super) fn sys_sigaltstack(new_ptr: u64, old_ptr: u64, current_rsp: u64) -> i
 
     if new_ptr != 0 {
         if sched::current_on_altstack(current_rsp) {
-            return -1;
+            return EPERM;
         }
         let mut buf = [0u8; 24];
         if frame::user::copy_from_user(new_ptr, &mut buf).is_err() {
@@ -39,7 +39,7 @@ pub(super) fn sys_sigaltstack(new_ptr: u64, old_ptr: u64, current_rsp: u64) -> i
         }
 
         if sched::set_current_altstack(new).is_err() {
-            return -3;
+            return ESRCH;
         }
     }
     0
@@ -72,7 +72,7 @@ pub(super) fn sys_kill(pid: u64, signal: u64) -> i64 {
     let permitted =
         sched::with_target_creds(target, |tgt| caller_snap.can_signal(tgt)).unwrap_or(false);
     if !permitted {
-        return -1;
+        return EPERM;
     }
     match sched::send_signal(target, signal as u32) {
         Ok(()) => 0,
@@ -260,7 +260,7 @@ pub(super) fn sys_pidfd_send_signal(pidfd: u64, sig: u64, _info: u64, flags: u64
     let permitted =
         sched::with_target_creds(target, |tgt| caller_snap.can_signal(tgt)).unwrap_or(false);
     if !permitted {
-        return -1;
+        return EPERM;
     }
     if sig == 0 {
         return 0;
@@ -273,10 +273,10 @@ pub(super) fn sys_pidfd_send_signal(pidfd: u64, sig: u64, _info: u64, flags: u64
 
 pub(super) fn sys_pause() -> i64 {
     if sched::current_signal_pending() {
-        return -4;
+        return EINTR;
     }
     sched::park_on_signalfd_wait();
-    -4
+    EINTR
 }
 
 pub(super) fn sys_rt_sigtimedwait(
@@ -286,7 +286,7 @@ pub(super) fn sys_rt_sigtimedwait(
     sigsetsize: u64,
 ) -> i64 {
     if sigsetsize as usize != 8 {
-        return -22;
+        return EINVAL;
     }
     if set_ptr == 0 {
         return EFAULT;
@@ -334,7 +334,7 @@ pub(super) fn sys_rt_sigtimedwait(
         if let Some(d) = deadline_ns {
             let now = frame::cpu::clock::nanos_since_boot();
             if d == 0 || d <= now {
-                return -11;
+                return EAGAIN;
             }
         }
         if let Some(d) = deadline_ns {

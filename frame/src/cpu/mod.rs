@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 pub mod clock;
+pub mod cpu_registry;
 pub mod hwrng;
 pub mod per_cpu;
 pub mod rtc;
@@ -106,9 +107,12 @@ pub fn set_kernel_stack(top: u64) {
 
 pub fn bring_up_secondaries(entry: SecondaryEntry) {
     crate::arch::x86_64::smp::set_ap_main(entry);
+    let bsp_apic = crate::intr::lapic::local_apic_id();
+    let _ = crate::cpu::cpu_registry::register_cpu(crate::cpu::cpu_registry::ApicId(bsp_apic));
     let ids = crate::arch::x86_64::madt::parse_apic_ids(crate::boot::rsdp_paddr());
-    if !ids.is_empty() {
-        crate::println!("smp: bringing up {} secondary CPUs", ids.len());
+    let ap_count = ids.iter().filter(|&&a| a != bsp_apic).count();
+    if ap_count > 0 {
+        crate::println!("smp: bringing up {ap_count} secondary CPUs");
     }
     crate::arch::x86_64::smp::bring_up(&ids);
 }

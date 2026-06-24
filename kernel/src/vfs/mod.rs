@@ -70,6 +70,14 @@ pub struct DirEntry {
     pub inode_id: u64,
 }
 
+pub const F_SEAL_SEAL: u32 = 0x0001;
+pub const F_SEAL_SHRINK: u32 = 0x0002;
+pub const F_SEAL_GROW: u32 = 0x0004;
+pub const F_SEAL_WRITE: u32 = 0x0008;
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+pub const SEAL_MASK: u32 =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+
 pub trait Inode: Send + Sync {
     fn kind(&self) -> InodeKind;
     fn stat(&self) -> Stat;
@@ -98,6 +106,10 @@ pub trait Inode: Send + Sync {
         self.write_at(offset, buf)
     }
 
+    fn writeback_at(&self, offset: u64, buf: &[u8]) -> KResult<usize> {
+        self.write_at(offset, buf)
+    }
+
     fn write_with_fds(
         &self,
         buf: &[u8],
@@ -121,6 +133,14 @@ pub trait Inode: Send + Sync {
 
     fn truncate(&self, _len: u64) -> KResult<()> {
         Err(Errno::ISDIR)
+    }
+
+    fn memfd_seals(&self) -> Option<u32> {
+        None
+    }
+
+    fn memfd_add_seals(&self, _add: u32, _writable_mapping_exists: bool) -> KResult<()> {
+        Err(Errno::INVAL)
     }
 
     fn lookup(&self, _name: &str) -> KResult<Arc<dyn Inode>> {
@@ -160,6 +180,19 @@ pub trait Inode: Send + Sync {
         new_parent.attach(new_name, inode)?;
         self.unlink(old_name)?;
         Ok(())
+    }
+
+    fn rename_exchange(
+        &self,
+        _old_name: &str,
+        _new_parent: &Arc<dyn Inode>,
+        _new_name: &str,
+    ) -> KResult<()> {
+        Err(Errno::NOSYS)
+    }
+
+    fn fs_id(&self) -> usize {
+        0
     }
 
     fn on_open(&self, _flags: OpenFlags) {}
@@ -204,6 +237,10 @@ pub trait Inode: Send + Sync {
     }
 
     fn unseal_dir(&self) {}
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 
     fn unlink_if_matches(&self, name: &str, _expect: &Arc<dyn Inode>) -> KResult<bool> {
         self.unlink(name).map(|_| true)
@@ -500,17 +537,32 @@ impl MountPropagation {
 
 pub struct MountInUseTag {
     refs: core::sync::atomic::AtomicUsize,
+    flags: core::sync::atomic::AtomicU64,
 }
 
 impl MountInUseTag {
     pub fn new() -> Arc<Self> {
+        Self::new_with_flags(0)
+    }
+
+    pub fn new_with_flags(flags: u64) -> Arc<Self> {
         Arc::new(Self {
             refs: core::sync::atomic::AtomicUsize::new(0),
+            flags: core::sync::atomic::AtomicU64::new(flags),
         })
     }
 
     pub fn refs(&self) -> usize {
         self.refs.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn flags(&self) -> u64 {
+        self.flags.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_flags(&self, flags: u64) {
+        self.flags
+            .store(flags, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -522,6 +574,10 @@ impl MountInUseGuard {
     pub fn new(tag: Arc<MountInUseTag>) -> Self {
         tag.refs.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         Self { tag }
+    }
+
+    pub fn flags(&self) -> u64 {
+        self.tag.flags()
     }
 }
 
@@ -563,6 +619,7 @@ impl MountTableInner {
 
 pub struct MountTable {
     inner: VfsSpinIrq<MountTableInner>,
+    owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
 }
 
 impl Default for MountTable {
@@ -580,9 +637,15 @@ impl MountTable {
     pub const fn new() -> Self {
         Self {
             inner: VfsSpinIrq::new(MountTableInner::new()),
+            owner_user_ns: None,
         }
     }
 
+    pub fn owner_user_ns(&self) -> Option<Arc<crate::process_model::UserNamespace>> {
+        self.owner_user_ns.clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn install(
         self: &Arc<Self>,
@@ -592,6 +655,7 @@ impl MountTable {
         propagation: MountPropagation,
         source: &str,
         fstype: &str,
+        mount_flags: u64,
     ) {
         let weak = Arc::downgrade(self);
         let mut g = self.inner.lock();
@@ -604,6 +668,7 @@ impl MountTable {
             propagation,
             source,
             fstype,
+            mount_flags,
         );
     }
 
@@ -617,6 +682,7 @@ impl MountTable {
         propagation: MountPropagation,
         source: &str,
         fstype: &str,
+        mount_flags: u64,
     ) {
         if let Some(prev) = g.mounts.get(target_path) {
             match &prev.propagation {
@@ -635,8 +701,11 @@ impl MountTable {
             _ => {}
         }
         let in_use = match g.mounts.get(target_path) {
-            Some(prev) => prev.in_use.clone(),
-            None => MountInUseTag::new(),
+            Some(prev) => {
+                prev.in_use.set_flags(mount_flags);
+                prev.in_use.clone()
+            }
+            None => MountInUseTag::new_with_flags(mount_flags),
         };
         g.mounts.insert(
             String::from(target_path),
@@ -657,6 +726,36 @@ impl MountTable {
             .mounts
             .get(target_path)
             .map(|e| e.root.clone())
+    }
+
+    pub fn set_flags_at(&self, target_path: &str, mount_flags: u64) -> bool {
+        match self.inner.lock().mounts.get(target_path) {
+            Some(e) => {
+                e.in_use.set_flags(mount_flags);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_flags_by_inode(&self, inode_id: u64, mount_flags: u64) -> bool {
+        let g = self.inner.lock();
+        let mut hit: Option<&MountEntry> = None;
+        for e in g.mounts.values() {
+            if e.root.inode_id() == inode_id {
+                if hit.is_some() {
+                    return false;
+                }
+                hit = Some(e);
+            }
+        }
+        match hit {
+            Some(e) => {
+                e.in_use.set_flags(mount_flags);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn snapshot_one(&self, target_path: &str) -> Option<MountEntry> {
@@ -774,6 +873,7 @@ impl MountTable {
                 e.root.clone(),
                 e.source.clone(),
                 e.fstype.clone(),
+                e.in_use.flags(),
             ),
             None => return false,
         };
@@ -786,11 +886,15 @@ impl MountTable {
             new_prop,
             &existing.2,
             &existing.3,
+            existing.4,
         );
         true
     }
 
-    pub fn snapshot(self: &Arc<Self>) -> Arc<MountTable> {
+    pub fn snapshot(
+        self: &Arc<Self>,
+        owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
+    ) -> Arc<MountTable> {
         let parent_entries: alloc::vec::Vec<(String, MountEntry)> = {
             let g = self.inner.lock();
             g.mounts
@@ -810,10 +914,13 @@ impl MountTable {
                     }
                     _ => {}
                 }
-                new_mounts.insert(path.clone(), entry.clone());
+                let mut child_entry = entry.clone();
+                child_entry.in_use = MountInUseTag::new_with_flags(entry.in_use.flags());
+                new_mounts.insert(path.clone(), child_entry);
             }
             MountTable {
                 inner: VfsSpinIrq::new(MountTableInner { mounts: new_mounts }),
+                owner_user_ns: owner_user_ns.clone(),
             }
         })
     }
@@ -844,6 +951,7 @@ pub fn mount_install(
         propagation,
         source,
         fstype,
+        0,
     );
 }
 

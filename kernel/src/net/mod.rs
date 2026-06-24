@@ -14,9 +14,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use frame::sync::SpinIrq;
-use smoltcp::iface::{Config, Interface, PollResult, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
+use smoltcp::socket::{AnySocket, tcp, udp};
 use smoltcp::time::Instant;
+use smoltcp::wire::IpEndpoint;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address,
 };
@@ -83,14 +85,116 @@ pub struct NetStack {
     pub loop_iface: Interface,
     pub sockets: SocketSet<'static>,
     pub loop_sockets: SocketSet<'static>,
+    socket_gen: alloc::vec::Vec<(bool, SocketHandle, u64)>,
+    gen_ctr: u64,
+}
+
+#[derive(Copy, Clone)]
+pub struct SockRef {
+    handle: SocketHandle,
+    loopback: bool,
+    generation: u64,
+}
+
+impl SockRef {
+    pub(crate) fn is_loop(&self) -> bool {
+        self.loopback
+    }
 }
 
 impl NetStack {
-    pub fn set(&mut self, loopback: bool) -> &mut SocketSet<'static> {
+    fn set_for(&mut self, loopback: bool) -> &mut SocketSet<'static> {
         if loopback {
             &mut self.loop_sockets
         } else {
             &mut self.sockets
+        }
+    }
+
+    fn set_ref(&self, loopback: bool) -> &SocketSet<'static> {
+        if loopback {
+            &self.loop_sockets
+        } else {
+            &self.sockets
+        }
+    }
+
+    fn assert_member(&self, r: SockRef) {
+        assert!(
+            self.socket_gen
+                .iter()
+                .any(|&(lb, h, g)| lb == r.loopback && h == r.handle && g == r.generation),
+            "SockRef used against the wrong socket set or a reused slot"
+        );
+    }
+
+    pub fn add_socket<T: AnySocket<'static>>(&mut self, loopback: bool, sock: T) -> SockRef {
+        let handle = self.set_for(loopback).add(sock);
+        let generation = self.gen_ctr;
+        self.gen_ctr = self.gen_ctr.wrapping_add(1);
+        self.socket_gen.push((loopback, handle, generation));
+        SockRef {
+            handle,
+            loopback,
+            generation,
+        }
+    }
+
+    pub fn remove_socket(&mut self, r: SockRef) -> smoltcp::socket::Socket<'static> {
+        self.assert_member(r);
+        self.socket_gen
+            .retain(|&(lb, h, g)| !(lb == r.loopback && h == r.handle && g == r.generation));
+        self.set_for(r.loopback).remove(r.handle)
+    }
+
+    pub fn tcp(&self, r: SockRef) -> &tcp::Socket<'static> {
+        self.assert_member(r);
+        self.set_ref(r.loopback).get::<tcp::Socket>(r.handle)
+    }
+
+    pub fn tcp_mut(&mut self, r: SockRef) -> &mut tcp::Socket<'static> {
+        self.assert_member(r);
+        self.set_for(r.loopback).get_mut::<tcp::Socket>(r.handle)
+    }
+
+    pub fn udp(&self, r: SockRef) -> &udp::Socket<'static> {
+        self.assert_member(r);
+        self.set_ref(r.loopback).get::<udp::Socket>(r.handle)
+    }
+
+    pub fn udp_mut(&mut self, r: SockRef) -> &mut udp::Socket<'static> {
+        self.assert_member(r);
+        self.set_for(r.loopback).get_mut::<udp::Socket>(r.handle)
+    }
+
+    pub fn icmp_mut(&mut self, r: SockRef) -> &mut smoltcp::socket::icmp::Socket<'static> {
+        self.assert_member(r);
+        self.set_for(r.loopback)
+            .get_mut::<smoltcp::socket::icmp::Socket>(r.handle)
+    }
+
+    pub fn connect_tcp(
+        &mut self,
+        r: SockRef,
+        ep: IpEndpoint,
+        local: u16,
+    ) -> Result<(), tcp::ConnectError> {
+        self.assert_member(r);
+        if r.loopback {
+            let ctx = self.loop_iface.context();
+            self.loop_sockets
+                .get_mut::<tcp::Socket>(r.handle)
+                .connect(ctx, ep, local)
+        } else if let Some(iface) = self.iface.as_mut() {
+            let ctx = iface.context();
+            self.sockets
+                .get_mut::<tcp::Socket>(r.handle)
+                .connect(ctx, ep, local)
+        } else {
+            let ctx = self.loop_iface.context();
+            self.sockets
+                .get_mut::<tcp::Socket>(r.handle)
+                .connect(ctx, ep, local)
         }
     }
 }
@@ -101,17 +205,26 @@ pub struct NetNamespace {
     icmp_registry: SpinIrq<BTreeMap<usize, Arc<icmp::IcmpSocket>>>,
     abstract_bound: SpinIrq<BTreeMap<String, Weak<unix::UnixSocket>>>,
     ephemeral_next: AtomicU16,
+    owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
 }
 
 impl NetNamespace {
-    fn new(stack: NetStack) -> Arc<Self> {
+    fn new(
+        stack: NetStack,
+        owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             stack: SpinIrq::new(stack),
             inet_registry: SpinIrq::new(BTreeMap::new()),
             icmp_registry: SpinIrq::new(BTreeMap::new()),
             abstract_bound: SpinIrq::new(BTreeMap::new()),
             ephemeral_next: AtomicU16::new(32768),
+            owner_user_ns,
         })
+    }
+
+    pub fn owner_user_ns(&self) -> Option<Arc<crate::process_model::UserNamespace>> {
+        self.owner_user_ns.clone()
     }
 
     pub fn with_stack<R>(&self, f: impl FnOnce(&mut NetStack) -> R) -> R {
@@ -287,8 +400,10 @@ pub fn init() {
         loop_iface,
         sockets: SocketSet::new(Vec::new()),
         loop_sockets: SocketSet::new(Vec::new()),
+        socket_gen: Vec::new(),
+        gen_ctr: 0,
     };
-    let ns = NetNamespace::new(stack);
+    let ns = NetNamespace::new(stack, None);
     register_ns(&ns);
     *HOST_NS.lock() = Some(ns);
     INITIALIZED.store(true, Ordering::Release);
@@ -303,6 +418,12 @@ pub fn host_net_ns() -> Arc<NetNamespace> {
 }
 
 pub fn new_namespace() -> Arc<NetNamespace> {
+    new_namespace_with_owner(None)
+}
+
+pub fn new_namespace_with_owner(
+    owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
+) -> Arc<NetNamespace> {
     let (loop_device, loop_iface) = build_loopback();
     let stack = NetStack {
         device: None,
@@ -311,8 +432,10 @@ pub fn new_namespace() -> Arc<NetNamespace> {
         loop_iface,
         sockets: SocketSet::new(Vec::new()),
         loop_sockets: SocketSet::new(Vec::new()),
+        socket_gen: Vec::new(),
+        gen_ctr: 0,
     };
-    let ns = NetNamespace::new(stack);
+    let ns = NetNamespace::new(stack, owner_user_ns);
     register_ns(&ns);
     ns
 }

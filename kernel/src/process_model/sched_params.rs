@@ -43,28 +43,4 @@ pub fn nice_to_weight(nice: i8) -> u64 {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SchedOwner {
-    None,
-    Running { cpu: u32 },
-    Runnable { cpu: u32 },
-    Parked { waitq_addr: usize },
-    Stopped,
-    Traced,
-    Zombie,
-    Reaping,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProcessState {
-    Runnable,
-    Running,
-    Parked,
-    Zombie(i32),
-    KilledByFault { vector: u8, addr: u64, error: u64 },
-    Stopped,
-    DlThrottled,
-    CgroupThrottled,
-    Traced,
-    KilledBySignal { signal: u32 },
-}
+pub use crate::sched_state::{ProcessState, SchedOwner};

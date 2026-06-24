@@ -69,6 +69,7 @@ members = [
     "proc_rt",
     "proc_seccomp",
     "proc_pipe_size",
+    "proc_remount",
     "proc_segv",
     "proc_sa_restart",
     "proc_select",

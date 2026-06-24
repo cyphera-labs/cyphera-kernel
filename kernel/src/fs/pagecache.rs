@@ -254,7 +254,7 @@ pub fn writeback(
     };
     let mut total = 0usize;
     for (offset, buf) in dirty {
-        match inode.write_at(offset, &buf) {
+        match inode.writeback_at(offset, &buf) {
             Ok(n) => total += n,
             Err(e) => {
                 let key = Key {

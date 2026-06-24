@@ -94,7 +94,7 @@ pub fn dl_replenish_callback(key: u64) {
         let was_throttled = proc.state.0 == ProcessState::DlThrottled;
         proc.sched.dl_throttled = false;
         if was_throttled {
-            proc.state.0 = ProcessState::Runnable;
+            set_state(proc, ProcessState::Runnable, "sched_class");
         }
         proc.sched.dl_next_replenish
     };
@@ -183,7 +183,7 @@ pub fn set_sched_class(
             proc.sched.dl_next_replenish = 0;
             proc.sched.dl_throttled = false;
             if proc.state.0 == ProcessState::DlThrottled {
-                proc.state.0 = ProcessState::Runnable;
+                set_state(proc, ProcessState::Runnable, "sched_class");
             }
         }
     }

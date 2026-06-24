@@ -1,7 +1,37 @@
 use super::*;
 
+fn canon_proc_fd(norm: alloc::string::String) -> alloc::string::String {
+    let cur = sched::current_pid().0;
+    let pid_prefix = alloc::format!("/proc/{cur}/fd/");
+    let rest: alloc::string::String = match norm
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| norm.strip_prefix(pid_prefix.as_str()))
+    {
+        Some(r) => alloc::string::String::from(r),
+        None => return norm,
+    };
+    let (fd_str, sub) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest.as_str(), ""),
+    };
+    let fd: i32 = match fd_str.parse() {
+        Ok(n) => n,
+        Err(_) => return norm,
+    };
+    match sched::with_current_fds(|t| t.get(fd)) {
+        Some(f) if !f.path.is_empty() => alloc::format!("{}{}", f.path, sub),
+        _ => norm,
+    }
+}
+
+fn resolve_mount_path(dirfd: i64, path: &str) -> Result<alloc::string::String, i64> {
+    Ok(canon_proc_fd(resolve_user_path(dirfd, path)?))
+}
+
 pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _data: u64) -> i64 {
-    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
+    let mnt_owner =
+        sched::with_current_mount_table(|m| m.as_ref().and_then(|t| t.owner_user_ns())).flatten();
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, mnt_owner.as_ref()) {
         return EPERM;
     }
     use vfs::mount as m;
@@ -16,7 +46,7 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Ok(p) => p,
             Err(_) => return EINVAL,
         };
-        let t_norm = match resolve_user_path(AT_FDCWD, t) {
+        let t_norm = match resolve_mount_path(AT_FDCWD, t) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -43,11 +73,11 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Ok(p) => p,
             Err(_) => return EINVAL,
         };
-        let s_norm = match resolve_user_path(AT_FDCWD, s) {
+        let s_norm = match resolve_mount_path(AT_FDCWD, s) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let t_norm = match resolve_user_path(AT_FDCWD, t) {
+        let t_norm = match resolve_mount_path(AT_FDCWD, t) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -56,7 +86,30 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
     }
 
     if (flags & m::MS_REMOUNT) != 0 {
-        return 0;
+        let mut tbuf = [0u8; PATH_MAX];
+        let tlen = match frame::user::copy_cstr_from_user(target, &mut tbuf) {
+            Ok(n) => n,
+            Err(_) => return ENAMETOOLONG,
+        };
+        let t = match core::str::from_utf8(&tbuf[..tlen]) {
+            Ok(p) => p,
+            Err(_) => return EINVAL,
+        };
+        let t_norm = match resolve_mount_path(AT_FDCWD, t) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let ctx = vfs::path::Context::current();
+        let mf = flags & m::MOUNT_FLAG_MASK;
+        if ctx.set_mount_flags(&t_norm, mf) {
+            return 0;
+        }
+        if let Ok(inode) = vfs::path::resolve(&ctx, &ctx.root, &t_norm) {
+            if ctx.set_mount_flags_by_inode(inode.inode_id(), mf) {
+                return 0;
+            }
+        }
+        return EINVAL;
     }
 
     if (flags & m::MS_BIND) != 0 {
@@ -78,11 +131,11 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
             Ok(p) => p,
             Err(_) => return EINVAL,
         };
-        let s_norm = match resolve_user_path(AT_FDCWD, s) {
+        let s_norm = match resolve_mount_path(AT_FDCWD, s) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let t_norm = match resolve_user_path(AT_FDCWD, t) {
+        let t_norm = match resolve_mount_path(AT_FDCWD, t) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -106,9 +159,9 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         "proc" | "sysfs" | "devtmpfs" | "devpts" | "mqueue" | "cgroup" | "cgroup2"
     );
     if fst != "tmpfs" && fst != "ext4" && !virtual_fs {
-        return -19;
+        return ENODEV;
     }
-    if virtual_fs {
+    if virtual_fs && fst != "proc" && fst != "sysfs" {
         return 0;
     }
     let mut path_buf = [0u8; PATH_MAX];
@@ -120,7 +173,7 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         Ok(s) => s,
         Err(_) => return EINVAL,
     };
-    let normalized = match resolve_user_path(AT_FDCWD, path) {
+    let normalized = match resolve_mount_path(AT_FDCWD, path) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -144,21 +197,25 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         Err(e) => return e.as_neg_i64(),
     };
     if target_inode.kind() != vfs::InodeKind::Directory {
-        return -20;
+        return ENOTDIR;
     }
 
     let new_root: Arc<dyn vfs::Inode> = if fst == "ext4" {
         if src_owned != "/dev/vda" {
-            return -19;
+            return ENODEV;
         }
         let dev = match crate::fs::ext4::VirtioBlockDevice::new() {
             Some(d) => d,
-            None => return -19,
+            None => return ENODEV,
         };
         match crate::fs::ext4::Ext4Fs::mount(dev) {
             Ok(fs) => fs.root_inode(),
-            Err(_) => return -22,
+            Err(_) => return EINVAL,
         }
+    } else if fst == "proc" {
+        crate::fs::procfs::root()
+    } else if fst == "sysfs" {
+        crate::fs::sysfs::root()
     } else {
         crate::fs::tmpfs::TmpfsInode::new_dir()
     };
@@ -175,7 +232,9 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
 }
 
 pub(crate) fn sys_umount2(target: u64, flags: u64) -> i64 {
-    if !crate::security::capable(crate::process_model::CAP_SYS_ADMIN) {
+    let mnt_owner =
+        sched::with_current_mount_table(|m| m.as_ref().and_then(|t| t.owner_user_ns())).flatten();
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, mnt_owner.as_ref()) {
         return EPERM;
     }
     if (flags & vfs::mount::MNT_EXPIRE) != 0 {
@@ -191,7 +250,7 @@ pub(crate) fn sys_umount2(target: u64, flags: u64) -> i64 {
         Ok(s) => s,
         Err(_) => return EINVAL,
     };
-    let normalized = match resolve_user_path(AT_FDCWD, path) {
+    let normalized = match resolve_mount_path(AT_FDCWD, path) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -201,6 +260,11 @@ pub(crate) fn sys_umount2(target: u64, flags: u64) -> i64 {
 }
 
 pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
+    let mnt_owner =
+        sched::with_current_mount_table(|m| m.as_ref().and_then(|t| t.owner_user_ns())).flatten();
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, mnt_owner.as_ref()) {
+        return EPERM;
+    }
     let new_root_path = match copy_path(new_root_ptr) {
         Ok(p) => p,
         Err(e) => return e,
@@ -227,11 +291,11 @@ pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     let ctx = vfs::path::Context::current();
     let old_root = ctx.root.clone();
 
-    let new_root_norm = match resolve_user_path(AT_FDCWD, &new_root_path) {
+    let new_root_norm = match resolve_mount_path(AT_FDCWD, &new_root_path) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let put_old_norm = match resolve_user_path(AT_FDCWD, &put_old_path) {
+    let put_old_norm = match resolve_mount_path(AT_FDCWD, &put_old_path) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -246,13 +310,14 @@ pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     } else {
         return EINVAL;
     };
-    let (old_source, old_fstype) = ctx
+    let (old_source, old_fstype, old_flags) = ctx
         .lookup_mount_full("/")
-        .map(|e| (e.source, e.fstype))
+        .map(|e| (e.source, e.fstype, e.in_use.flags()))
         .unwrap_or_else(|| {
             (
                 alloc::string::String::from("rootfs"),
                 alloc::string::String::from("tmpfs"),
+                0,
             )
         });
     ctx.install_mount(
@@ -262,6 +327,7 @@ pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
         vfs::MountPropagation::Private,
         &old_source,
         &old_fstype,
+        old_flags,
     );
     sched::set_current_fs_root(new_root.clone());
     sched::set_current_cwd(new_root, alloc::string::String::from("/"));

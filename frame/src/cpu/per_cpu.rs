@@ -6,6 +6,7 @@ use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use crate::sync::IrqGuard;
 
 pub const MAX_CPUS: usize = 4;
+const _: () = assert!(MAX_CPUS <= 64);
 
 #[repr(C)]
 pub struct CpuArea {

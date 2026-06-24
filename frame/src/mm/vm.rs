@@ -253,6 +253,9 @@ impl VmSpace {
         frame: PhysFrame<Size4KiB>,
         perms: Perms,
     ) -> Result<MappedRegion, MapError> {
+        if !user_mapping_in_range(vaddr.as_u64(), 1, perms) {
+            return Err(MapError::OutOfUserRange);
+        }
         let page = Page::<Size4KiB>::from_start_address(vaddr).map_err(|_| MapError::Misaligned)?;
         let flags = perms.to_pte_flags();
         let mut alloc = PhysFrameAdapter;
@@ -405,6 +408,9 @@ impl VmSpace {
         perms: Perms,
     ) -> Result<MappedRegion, MapError> {
         let mut alloc = PhysFrameAdapter;
+        if !user_mapping_in_range(vaddr.as_u64(), pages, perms) {
+            return Err(MapError::OutOfUserRange);
+        }
         let start_page =
             Page::<Size4KiB>::from_start_address(vaddr).map_err(|_| MapError::Misaligned)?;
         let flags = perms.to_pte_flags();
@@ -1281,12 +1287,25 @@ impl Drop for MappedRegion {
     fn drop(&mut self) {}
 }
 
+pub const USER_VA_END: u64 = 0x0000_8000_0000_0000;
+
+fn user_mapping_in_range(start: u64, pages: usize, perms: Perms) -> bool {
+    if !perms.contains(Perms::USER) {
+        return true;
+    }
+    match start.checked_add((pages as u64).saturating_mul(4096)) {
+        Some(end) => end <= USER_VA_END,
+        None => false,
+    }
+}
+
 #[derive(Debug)]
 pub enum MapError {
     OutOfFrames,
     Misaligned,
     AlreadyMapped,
     ParentTableHugePage,
+    OutOfUserRange,
 }
 
 #[derive(Debug, PartialEq, Eq)]

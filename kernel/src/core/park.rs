@@ -38,7 +38,7 @@ fn park_on_inner(wq: &crate::core::wait::WaitQueue, pre_enqueued: bool) {
             }
         };
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Parked;
+        set_state(proc, ProcessState::Parked, "park");
         set_sched_owner(
             proc,
             SchedOwner::Parked {
@@ -52,7 +52,7 @@ fn park_on_inner(wq: &crate::core::wait::WaitQueue, pre_enqueued: bool) {
             proc.task.0.kstack_bounds(),
         );
         if !wq.contains(cur) {
-            proc.state.0 = ProcessState::Runnable;
+            set_state(proc, ProcessState::Runnable, "park");
             set_sched_owner(
                 proc,
                 SchedOwner::Running { cpu: this_cpu() },
@@ -78,7 +78,7 @@ pub(in crate::core) fn wake_pid(pid: Pid) -> bool {
         if proc.state.0 != ProcessState::Parked {
             return false;
         }
-        proc.state.0 = ProcessState::Runnable;
+        set_state(proc, ProcessState::Runnable, "park");
         let home = effective_home_cpu(proc);
         set_sched_owner(proc, SchedOwner::Runnable { cpu: home }, "wake_pid");
         home
@@ -174,7 +174,7 @@ pub fn park_on_vfork_done(child: Pid) {
             let cur_xsave = proc.task.0.xsave_ptr();
             let cur_kstack = proc.task.0.kstack_bounds();
             bank_slice_off_cpu(proc);
-            proc.state.0 = ProcessState::Parked;
+            set_state(proc, ProcessState::Parked, "park");
             let waitq_addr = {
                 let child_proc = g.processes.get_mut(&child).unwrap();
                 if first {
@@ -236,7 +236,7 @@ pub fn park_on_signalfd_wait() {
         let cur_xsave = proc.task.0.xsave_ptr();
         let cur_kstack = proc.task.0.kstack_bounds();
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Parked;
+        set_state(proc, ProcessState::Parked, "park");
         proc.wait_sites.signalfd_waiters.enqueue(cur);
         set_sched_owner(
             proc,
@@ -248,6 +248,78 @@ pub fn park_on_signalfd_wait() {
         (cur_ctx, cur_xsave, cur_kstack)
     };
     park_current_off_cpu("park_on_signalfd_wait", cur, cur_kstack, cur_ctx, cur_xsave);
+}
+
+pub fn park_on_child_exit(ready: impl FnOnce(&Global) -> bool) {
+    let cpu = this_cpu() as usize;
+    let cur;
+    let (cur_ctx, cur_xsave, cur_kstack) = {
+        let mut q = CPU_QUEUES[cpu].lock();
+        let mut g = GLOBAL.lock();
+        if ready(&g) {
+            return;
+        }
+        let cur_pid = match q.current {
+            Some(p) => p,
+            None => return,
+        };
+        cur = cur_pid;
+        let proc = match g.processes.get_mut(&cur) {
+            Some(p) => p,
+            None => return,
+        };
+        let cur_ctx = proc.task.0.context_ptr();
+        let cur_xsave = proc.task.0.xsave_ptr();
+        let cur_kstack = proc.task.0.kstack_bounds();
+        bank_slice_off_cpu(proc);
+        set_state(proc, ProcessState::Parked, "park");
+        proc.wait_sites.child_exit.enqueue(cur);
+        set_sched_owner(
+            proc,
+            SchedOwner::Parked {
+                waitq_addr: &proc.wait_sites.child_exit as *const _ as usize,
+            },
+            "wait4_park",
+        );
+        q.current = None;
+        (cur_ctx, cur_xsave, cur_kstack)
+    };
+    park_current_off_cpu("wait4_park", cur, cur_kstack, cur_ctx, cur_xsave);
+}
+
+pub fn park_on_pi_wait(key: cyphera_kapi::WaitKey) {
+    let cpu = this_cpu() as usize;
+    let cur;
+    let (cur_ctx, cur_xsave, cur_kstack) = {
+        let mut q = CPU_QUEUES[cpu].lock();
+        let mut g = GLOBAL.lock();
+        let cur_pid = match q.current {
+            Some(p) => p,
+            None => return,
+        };
+        cur = cur_pid;
+        let proc = match g.processes.get_mut(&cur) {
+            Some(p) => p,
+            None => return,
+        };
+        if proc.pi_blocked_on != Some(key) {
+            return;
+        }
+        let cur_ctx = proc.task.0.context_ptr();
+        let cur_xsave = proc.task.0.xsave_ptr();
+        let cur_kstack = proc.task.0.kstack_bounds();
+        bank_slice_off_cpu(proc);
+        set_state(proc, ProcessState::Parked, "park");
+        set_sched_owner(proc, SchedOwner::Parked { waitq_addr: 0 }, "pi_wait_park");
+        q.current = None;
+        (cur_ctx, cur_xsave, cur_kstack)
+    };
+    park_current_off_cpu("pi_wait_park", cur, cur_kstack, cur_ctx, cur_xsave);
+}
+
+pub fn park_on_pi_requeue(q: &crate::core::wait::WaitQueue, me: Pid) {
+    q.enqueue(me);
+    park_self_at_guarded("pi_requeue_wait", &|| q.contains(me));
 }
 
 pub fn park_on_exit_of(target: Pid) {
@@ -276,7 +348,7 @@ pub fn park_on_exit_of(target: Pid) {
         let cur_xsave = proc.task.0.xsave_ptr();
         let cur_kstack = proc.task.0.kstack_bounds();
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Parked;
+        set_state(proc, ProcessState::Parked, "park");
         let target_proc = g.processes.get_mut(&target).unwrap();
         target_proc.wait_sites.exit_waiters.enqueue(cur);
         let waitq_addr = &target_proc.wait_sites.exit_waiters as *const _ as usize;
@@ -313,7 +385,7 @@ pub(in crate::core) fn request_continue(target: Pid, _reason: ContinueReason) ->
         }
         let stop_mask = (1u64 << SIGSTOP) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
         p.signals.clear_pending(stop_mask);
-        p.state.0 = ProcessState::Runnable;
+        set_state(p, ProcessState::Runnable, "park");
         p.sched.home_cpu
     };
     {
@@ -342,7 +414,7 @@ pub(in crate::core) fn request_stop(_reason: StopReason) {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Stopped;
+        set_state(proc, ProcessState::Stopped, "park");
         set_sched_owner(proc, SchedOwner::Stopped, "stop_current");
         let parent = proc.parent;
         let cur_ctx = proc.task.0.context_ptr();
@@ -412,7 +484,7 @@ pub fn sleep_until_signal() {
             }
             let _ = q.current.take();
             bank_slice_off_cpu(p);
-            p.state.0 = ProcessState::Parked;
+            set_state(p, ProcessState::Parked, "park");
             set_sched_owner(
                 p,
                 SchedOwner::Parked { waitq_addr: 0 },
@@ -440,7 +512,7 @@ pub fn park_self_at(site: &'static str) {
         let mut g = GLOBAL.lock();
         let proc = g.processes.get_mut(&cur).unwrap();
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Parked;
+        set_state(proc, ProcessState::Parked, "park");
         set_sched_owner(proc, SchedOwner::Parked { waitq_addr: 0 }, site);
         (
             cur,
@@ -478,7 +550,7 @@ pub(in crate::core) fn park_self_at_guarded(site: &'static str, still_queued: &d
             }
         };
         bank_slice_off_cpu(proc);
-        proc.state.0 = ProcessState::Parked;
+        set_state(proc, ProcessState::Parked, "park");
         set_sched_owner(proc, SchedOwner::Parked { waitq_addr: 0 }, site);
         let ptrs = (
             proc.task.0.context_ptr(),
@@ -486,7 +558,7 @@ pub(in crate::core) fn park_self_at_guarded(site: &'static str, still_queued: &d
             proc.task.0.kstack_bounds(),
         );
         if !still_queued() {
-            proc.state.0 = ProcessState::Runnable;
+            set_state(proc, ProcessState::Runnable, "park");
             set_sched_owner(
                 proc,
                 SchedOwner::Running { cpu: this_cpu() },

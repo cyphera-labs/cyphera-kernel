@@ -15,6 +15,8 @@ pub fn exec_current(
     post_euid: u32,
     post_egid: u32,
     secure: bool,
+    exe_inode: Option<Arc<dyn crate::vfs::Inode>>,
+    exe_mnt_flags: u64,
     tf: &mut TrapFrame,
 ) -> cyphera_kapi::KResult<()> {
     use frame::mm::VirtAddr;
@@ -40,7 +42,7 @@ pub fn exec_current(
                 **p != pid
                     && pr.tgid == my_tgid
                     && !matches!(
-                        pr.state.0,
+                        *pr.state.get(),
                         ProcessState::Zombie(_)
                             | ProcessState::KilledByFault { .. }
                             | ProcessState::KilledBySignal { .. }
@@ -50,20 +52,9 @@ pub fn exec_current(
             .collect()
     };
 
-    let building_fresh = vfork_shared || !live_peers.is_empty();
-
-    crate::ipc::shm::detach_all_current();
-    crate::mm::mmap_fault::detach_shared_file_current();
-
-    let (vm_arc, fresh_root) = if building_fresh {
-        let fresh = frame::mm::vm::VmSpace::new_user().map_err(|_| cyphera_kapi::Errno::NOMEM)?;
-        let root = fresh.root();
-        (Arc::new(frame::sync::SpinIrq::new(fresh)), Some(root))
-    } else {
-        let g = GLOBAL.lock();
-        let proc = g.processes.get(&pid).ok_or(cyphera_kapi::Errno::INVAL)?;
-        (proc.vmspace().ok_or(cyphera_kapi::Errno::INVAL)?, None)
-    };
+    let fresh = frame::mm::vm::VmSpace::new_user().map_err(|_| cyphera_kapi::Errno::NOMEM)?;
+    let root = fresh.root();
+    let vm_arc = Arc::new(frame::sync::SpinIrq::new(fresh));
 
     if let Some(interp) = crate::loader::elf::interp_path(elf_bytes) {
         let ctx = crate::vfs::path::Context::global();
@@ -72,46 +63,9 @@ pub fn exec_current(
         }
     }
 
-    let mut leaving_as: Option<(
-        alloc::sync::Arc<crate::process_model::AddressSpace>,
-        Option<alloc::sync::Arc<crate::process_model::IpcNamespace>>,
-    )> = None;
-    if let Some(root) = fresh_root {
-        let _irq = frame::sync::IrqGuard::new();
-        let cpu = this_cpu() as usize;
-        let mut q = CPU_QUEUES[cpu].lock();
-        {
-            let mut g = GLOBAL.lock();
-            if let Some(proc) = g.processes.get_mut(&pid) {
-                if let Some(old) = proc.addr_space.clone() {
-                    leaving_as = Some((old, proc.namespaces.ipc()));
-                }
-                proc.addr_space = Some(alloc::sync::Arc::new(crate::process_model::AddressSpace {
-                    vmspace: vm_arc.clone(),
-                    mmap: frame::sync::SpinIrq::new(MmapState::for_pid(pid)),
-                    brk: frame::sync::SpinIrq::new(BrkState::new(0)),
-                    live_users: core::sync::atomic::AtomicUsize::new(1),
-                }));
-                proc.addr_space_root = Some(root);
-                proc.lifecycle.set_vfork_shared_vm(false);
-            }
-        }
-        frame::mm::vm::VmSpace::activate_root(root);
-        q.active_vmspace = Some(vm_arc.clone());
-    }
-    if let Some((old_as, old_ipc)) = leaving_as {
-        release_addr_space_user(&old_as, old_ipc.as_ref());
-    }
-
-    for peer in &live_peers {
-        let _ = send_signal(*peer, SIGKILL);
-    }
-
     let (loaded, new_rsp, brk_start) = {
         let mut vm = vm_arc.lock();
         let vm = &mut *vm;
-
-        vm.clear_user();
 
         let loaded = crate::loader::elf::load_static(elf_bytes, vm)
             .map_err(|_| cyphera_kapi::Errno::NOEXEC)?;
@@ -138,13 +92,30 @@ pub fn exec_current(
         (loaded, new_rsp, brk_start)
     };
 
+    crate::ipc::shm::detach_all_current();
+    crate::mm::mmap_fault::detach_shared_file_current();
+
+    let new_as = alloc::sync::Arc::new(crate::process_model::AddressSpace {
+        vmspace: vm_arc.clone(),
+        mmap: frame::sync::SpinIrq::new(MmapState::for_pid(pid)),
+        brk: frame::sync::SpinIrq::new(BrkState::new(brk_start)),
+        live_users: core::sync::atomic::AtomicUsize::new(1),
+    });
+    let leaving_as = swap_current_address_space(pid, new_as, root, vm_arc.clone());
+    if let Some((old_as, old_ipc)) = leaving_as {
+        release_addr_space_user(&old_as, old_ipc.as_ref());
+    }
+
+    for peer in &live_peers {
+        let _ = send_signal(*peer, SIGKILL);
+    }
+
     let proc_pid = pid;
     {
         let mut g = GLOBAL.lock();
-        let proc = g
-            .processes
-            .get_mut(&proc_pid)
-            .ok_or(cyphera_kapi::Errno::INVAL)?;
+        let Some(proc) = g.processes.get_mut(&proc_pid) else {
+            return Ok(());
+        };
 
         let mut cmdline: Vec<u8> = Vec::new();
         for s in argv {
@@ -211,6 +182,8 @@ pub fn exec_current(
         crate::core::timeout::cancel_callback(key);
         proc.identity.set_cmdline(cmdline);
         proc.identity.set_exe_path(exe_path.to_vec());
+        proc.identity.set_exe_inode(exe_inode);
+        proc.identity.set_exe_mnt_flags(exe_mnt_flags);
         proc.fds.close_cloexec();
 
         *tf = TrapFrame {

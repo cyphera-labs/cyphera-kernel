@@ -12,6 +12,7 @@ const O_RDONLY: u64 = 0o0;
 const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
+const O_DIRECTORY: u64 = 0o200000;
 const AT_FDCWD: i64 = -100;
 
 const MODE_DIR: u64 = 0o755;
@@ -217,6 +218,151 @@ pub extern "C" fn _start() -> ! {
     sys_close(fd as u64);
     log("preadv()/pwritev() OK\n");
 
+    let fa = sys_openat(AT_FDCWD, b"/tmp/ra\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    if fa < 0 {
+        log("renameat2: ra create failed\n");
+        sys_exit(1);
+    }
+    sys_write(fa as u64, b"AAA".as_ptr(), 3);
+    sys_close(fa as u64);
+    let fb = sys_openat(AT_FDCWD, b"/tmp/rb\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    if fb < 0 {
+        log("renameat2: rb create failed\n");
+        sys_exit(1);
+    }
+    sys_write(fb as u64, b"BBB".as_ptr(), 3);
+    sys_close(fb as u64);
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/ra\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/rb\0".as_ptr(),
+        1,
+    ) != -17
+    {
+        log("renameat2: NOREPLACE over existing not EEXIST\n");
+        sys_exit(1);
+    }
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/ra\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/rc\0".as_ptr(),
+        8,
+    ) != -22
+    {
+        log("renameat2: unknown flag not EINVAL\n");
+        sys_exit(1);
+    }
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/ra\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/rb\0".as_ptr(),
+        2,
+    ) != 0
+    {
+        log("renameat2: EXCHANGE failed\n");
+        sys_exit(1);
+    }
+    let mut xb = [0u8; 4];
+    if read_path(b"/tmp/ra\0", &mut xb[..3]) != 3 || &xb[..3] != b"BBB" {
+        log("renameat2: EXCHANGE ra content wrong\n");
+        sys_exit(1);
+    }
+    if read_path(b"/tmp/rb\0", &mut xb[..3]) != 3 || &xb[..3] != b"AAA" {
+        log("renameat2: EXCHANGE rb content wrong\n");
+        sys_exit(1);
+    }
+    if sys_mkdirat(AT_FDCWD, b"/tmp/dd\0".as_ptr(), MODE_DIR) != 0 {
+        log("renameat2: mkdir dd failed\n");
+        sys_exit(1);
+    }
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/dd\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/dd/sub\0".as_ptr(),
+        0,
+    ) != -22
+    {
+        log("renameat2: dir into descendant not EINVAL\n");
+        sys_exit(1);
+    }
+    log("renameat2: NOREPLACE/EXCHANGE/validation/descendant OK\n");
+
+    if sys_mkdirat(AT_FDCWD, b"/tmp/d1\0".as_ptr(), MODE_DIR) != 0 {
+        log("xdir: mkdir d1 failed\n");
+        sys_exit(1);
+    }
+    if sys_mkdirat(AT_FDCWD, b"/tmp/d2\0".as_ptr(), MODE_DIR) != 0 {
+        log("xdir: mkdir d2 failed\n");
+        sys_exit(1);
+    }
+    let fx = sys_openat(AT_FDCWD, b"/tmp/d1/x\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    if fx < 0 {
+        log("xdir: create d1/x failed\n");
+        sys_exit(1);
+    }
+    sys_write(fx as u64, b"XXX".as_ptr(), 3);
+    sys_close(fx as u64);
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/d1/x\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/d2/y\0".as_ptr(),
+        0,
+    ) != 0
+    {
+        log("xdir: cross-dir rename failed\n");
+        sys_exit(1);
+    }
+    let mut yb = [0u8; 4];
+    if read_path(b"/tmp/d2/y\0", &mut yb[..3]) != 3 || &yb[..3] != b"XXX" {
+        log("xdir: moved content wrong\n");
+        sys_exit(1);
+    }
+    if sys_openat(AT_FDCWD, b"/tmp/d1/x\0".as_ptr(), O_RDONLY, 0) != -2 {
+        log("xdir: source still present after move\n");
+        sys_exit(1);
+    }
+    let fz = sys_openat(AT_FDCWD, b"/tmp/d2/z\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    sys_write(fz as u64, b"ZZZ".as_ptr(), 3);
+    sys_close(fz as u64);
+    let fw = sys_openat(AT_FDCWD, b"/tmp/d1/w\0".as_ptr(), O_CREAT | O_RDWR, 0o644);
+    sys_write(fw as u64, b"WWW".as_ptr(), 3);
+    sys_close(fw as u64);
+    if sys_renameat2(
+        AT_FDCWD,
+        b"/tmp/d1/w\0".as_ptr(),
+        AT_FDCWD,
+        b"/tmp/d2/z\0".as_ptr(),
+        0,
+    ) != 0
+    {
+        log("xdir: cross-dir overwrite failed\n");
+        sys_exit(1);
+    }
+    if read_path(b"/tmp/d2/z\0", &mut yb[..3]) != 3 || &yb[..3] != b"WWW" {
+        log("xdir: overwrite content wrong\n");
+        sys_exit(1);
+    }
+    log("cross-dir rename + overwrite OK\n");
+
+    if sys_openat(AT_FDCWD, b"/tmp/d2/y\0".as_ptr(), O_DIRECTORY, 0) != -20 {
+        log("O_DIRECTORY on a non-dir not ENOTDIR\n");
+        sys_exit(1);
+    }
+    if sys_openat(AT_FDCWD, b"/tmp/d1\0".as_ptr(), O_RDWR, 0) != -21 {
+        log("open directory for write not EISDIR\n");
+        sys_exit(1);
+    }
+    if sys_openat(AT_FDCWD, b"/tmp/d1\0".as_ptr(), O_DIRECTORY, 0) < 0 {
+        log("O_DIRECTORY on a real dir failed\n");
+        sys_exit(1);
+    }
+    log("O_DIRECTORY/EISDIR open semantics OK\n");
+
     if sys_mkdirat(AT_FDCWD, b"/jail\0".as_ptr(), MODE_DIR) != 0 {
         log("mkdir /jail failed\n");
         sys_exit(1);
@@ -270,6 +416,23 @@ fn sys_read(fd: u64, buf: *mut u8, len: usize) -> i64 {
     let r: i64;
     unsafe {
         asm!("syscall", in("rax") 0u64, in("rdi") fd, in("rsi") buf, in("rdx") len,
+            lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_renameat2(
+    olddirfd: i64,
+    oldpath: *const u8,
+    newdirfd: i64,
+    newpath: *const u8,
+    flags: u64,
+) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!("syscall", in("rax") 316u64, in("rdi") olddirfd, in("rsi") oldpath,
+            in("rdx") newdirfd, in("r10") newpath, in("r8") flags,
             lateout("rax") r, out("rcx") _, out("r11") _, options(nostack));
     }
     r

@@ -480,6 +480,8 @@ fn is_on_altstack(rsp: u64, alt: AltStack) -> bool {
     alt.is_enabled() && rsp >= alt.sp && rsp < alt.sp + alt.size
 }
 
+const USER_RFLAGS_MASK: u64 = 0x0020_0CD5;
+
 pub fn restore_from_frame(tf: &mut TrapFrame) -> Result<u64, frame::user::UserAccessFault> {
     let mut buf = [0u8; UC_SIZE];
     frame::user::copy_from_user(tf.rsp_user, &mut buf)?;
@@ -502,6 +504,6 @@ pub fn restore_from_frame(tf: &mut TrapFrame) -> Result<u64, frame::user::UserAc
     tf.rax = ctx.rax;
     tf.rsp_user = ctx.rsp;
     tf.rip_user = ctx.rip;
-    tf.rflags_user = ctx.eflags | 0x2;
+    tf.rflags_user = (ctx.eflags & USER_RFLAGS_MASK) | 0x202;
     Ok(saved_mask)
 }

@@ -4,7 +4,9 @@ use frame::io::qemu_exit::{ExitCode, exit};
 use frame::user::TrapFrame;
 
 use crate::core as sched;
-use crate::errno::{E2BIG, EBADF, ECHILD, EFAULT, EINVAL, ENAMETOOLONG, ENOEXEC, ENOSYS, EPERM};
+use crate::errno::{
+    E2BIG, EACCES, EBADF, ECHILD, EFAULT, EINVAL, ELOOP, ENAMETOOLONG, ENOEXEC, ENOSYS, EPERM,
+};
 use crate::process_model::Rlimit;
 
 use super::{AT_FDCWD, PATH_MAX, resolve_user_path};
@@ -457,12 +459,6 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
 
     let normalized = resolve_user_path(AT_FDCWD, path)?;
 
-    if (normalized.starts_with("/proc/self/fd/") || normalized.starts_with("/proc/self/exe"))
-        && sched::with_current_lifecycle(|l| l.did_memfd_exec()).unwrap_or(false)
-    {
-        return Err(-13);
-    }
-
     let argv: Vec<Vec<u8>> = read_user_string_vec(tf.arg(1), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
     let envp: Vec<Vec<u8>> = read_user_string_vec(tf.arg(2), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
 
@@ -480,16 +476,23 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     let exe_mode: u16;
     let exe_uid: u32;
     let exe_gid: u32;
+    let exe_nosuid: bool;
+    let resolved_inode: Option<alloc::sync::Arc<dyn crate::vfs::Inode>>;
+    let resolved_mnt_flags: u64;
     let mut depth = 0usize;
     loop {
         let ctx = crate::vfs::path::Context::current();
-        let inode =
-            crate::vfs::path::resolve(&ctx, &ctx.root, &normalized).map_err(|e| e.as_neg_i64())?;
+        let (inode, mtag) = crate::vfs::path::resolve_with_mount(&ctx, &ctx.root, &normalized)
+            .map_err(|e| e.as_neg_i64())?;
+        let mflags = mtag.map(|t| t.flags()).unwrap_or(0);
+        if mflags & crate::vfs::mount::MS_NOEXEC != 0 {
+            return Err(EACCES);
+        }
         let stat = inode.stat();
         let exec_ok =
             sched::with_current_creds(|c| c.can_access(stat.uid, stat.gid, stat.mode, 0o1));
         if !exec_ok {
-            return Err(-13);
+            return Err(EACCES);
         }
         let size = stat.size as usize;
         if size == 0 {
@@ -514,7 +517,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         }
         if tmp.len() >= 2 && tmp[0] == b'#' && tmp[1] == b'!' {
             if depth >= MAX_SHEBANG_DEPTH {
-                return Err(-40);
+                return Err(ELOOP);
             }
             depth += 1;
             let line_end = tmp[2..]
@@ -558,6 +561,9 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         exe_mode = stat.mode;
         exe_uid = stat.uid;
         exe_gid = stat.gid;
+        exe_nosuid = mflags & crate::vfs::mount::MS_NOSUID != 0;
+        resolved_inode = Some(inode.clone());
+        resolved_mnt_flags = mflags;
         buf = tmp;
         break;
     }
@@ -570,7 +576,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     };
     let (ruid, pre_euid, rgid, pre_egid) =
         sched::with_current_creds(|c| (c.ruid, c.euid, c.rgid, c.egid));
-    let nosuid = false;
+    let nosuid = exe_nosuid;
     let t = crate::security::setid::exec_transition(
         exe_mode, exe_uid, exe_gid, ruid, pre_euid, rgid, pre_egid, nosuid,
     );
@@ -582,6 +588,8 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         t.post_euid,
         t.post_egid,
         t.secure,
+        resolved_inode,
+        resolved_mnt_flags,
         tf,
     )
     .map_err(|e| e.as_neg_i64())?;
@@ -594,9 +602,7 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         sched::set_current_name(comm);
     }
 
-    if t.suid_owner.is_some() || t.sgid_owner.is_some() {
-        sched::with_current_creds_mut(|c| crate::security::setid::apply_exec_transition(c, &t));
-    }
+    sched::with_current_creds_mut(|c| crate::security::setid::apply_exec_transition(c, &t));
     Ok(())
 }
 
@@ -623,10 +629,11 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
     let envp: Vec<Vec<u8>> = read_user_string_vec(envp_ptr, EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
 
     if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
-        if sched::with_current_lifecycle(|l| l.did_memfd_exec()).unwrap_or(false) {
-            return Err(-38);
-        }
         let file = sched::with_current_fds(|t| t.get(dirfd)).ok_or(crate::errno::EBADF)?;
+        let fd_mnt_flags = file._mount_guard.as_ref().map(|g| g.flags()).unwrap_or(0);
+        if fd_mnt_flags & crate::vfs::mount::MS_NOEXEC != 0 {
+            return Err(EACCES);
+        }
         let inode = file.inode.clone();
         let stat = inode.stat();
         let size = stat.size as usize;
@@ -666,14 +673,23 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
             cur_euid,
             cur_egid,
             false,
+            Some(inode.clone()),
+            fd_mnt_flags,
             tf,
         )
         .map_err(|e| e.as_neg_i64())?;
-        sched::with_current_lifecycle(|l| l.set_did_memfd_exec(true));
+        let t = crate::security::setid::ExecCredTransition {
+            post_euid: cur_euid,
+            post_egid: cur_egid,
+            secure: false,
+            suid_owner: None,
+            sgid_owner: None,
+        };
+        sched::with_current_creds_mut(|c| crate::security::setid::apply_exec_transition(c, &t));
         return Ok(());
     }
 
-    Err(-38)
+    Err(ENOSYS)
 }
 
 fn read_user_string_vec(
@@ -746,10 +762,12 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
             );
             return ENOSYS;
         }
-        if (flags & (CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)) != 0
-            && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN)
-        {
-            return EPERM;
+        if (flags & (CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)) != 0 {
+            let ns_owner = sched::with_current_creds(|c| c.user_ns.clone());
+            if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, ns_owner.as_ref())
+            {
+                return EPERM;
+            }
         }
         if (flags & CLONE_NEWPID) != 0 {
             let parent_ns = sched::with_current_pid_ns(|p| p.clone());
@@ -757,10 +775,14 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
             sched::set_current_pending_pid_ns(Some(new_ns));
         }
         if (flags & CLONE_NEWIPC) != 0 {
-            sched::set_current_pending_ipc_ns(Some(crate::process_model::IpcNamespace::fresh()));
+            let owner = sched::with_current_creds(|c| c.user_ns.clone());
+            sched::set_current_pending_ipc_ns(Some(
+                crate::process_model::IpcNamespace::fresh_with_owner(owner),
+            ));
         }
         if (flags & CLONE_NEWNET) != 0 {
-            sched::set_current_pending_net_ns(Some(crate::net::new_namespace()));
+            let owner = sched::with_current_creds(|c| c.user_ns.clone());
+            sched::set_current_pending_net_ns(Some(crate::net::new_namespace_with_owner(owner)));
         }
         if child_stack != 0 {
             let mut tf_for_child = tf.clone();
@@ -993,11 +1015,7 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
                     return;
                 }
             };
-            c.user_ns = Some(new_ns);
-            c.caps_eff = crate::process_model::ALL_CAPS_MASK;
-            c.caps_perm = crate::process_model::ALL_CAPS_MASK;
-            c.caps_inh = crate::process_model::ALL_CAPS_MASK;
-            c.caps_bnd = crate::process_model::ALL_CAPS_MASK;
+            crate::security::setid::enter_user_namespace(c, new_ns);
         });
         if err != 0 {
             return err;
@@ -1010,25 +1028,30 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
         | CLONE_NEWCGROUP
         | CLONE_NEWTIME
         | CLONE_NEWNET;
-    if flags & PRIV_NS != 0 && !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN) {
+    let ns_owner = sched::with_current_creds(|c| c.user_ns.clone());
+    if flags & PRIV_NS != 0
+        && !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, ns_owner.as_ref())
+    {
         return EPERM;
     }
     if flags & CLONE_NEWNS != 0 {
         let snap = match sched::with_current_mount_table(|m| m.clone()).flatten() {
-            Some(existing) => existing.snapshot(),
-            None => crate::vfs::global_mount_table().snapshot(),
+            Some(existing) => existing.snapshot(ns_owner.clone()),
+            None => crate::vfs::global_mount_table().snapshot(ns_owner.clone()),
         };
         sched::set_current_mount_table(Some(snap));
     }
     if flags & CLONE_NEWUTS != 0 {
-        let snap = sched::with_current_uts(|u| u.snapshot());
+        let snap = sched::with_current_uts(|u| u.snapshot(ns_owner.clone()));
         sched::set_current_uts(Some(snap));
     }
     if flags & CLONE_NEWIPC != 0 {
-        sched::set_current_ipc(Some(crate::process_model::IpcNamespace::fresh()));
+        sched::set_current_ipc(Some(crate::process_model::IpcNamespace::fresh_with_owner(
+            ns_owner.clone(),
+        )));
     }
     if flags & CLONE_NEWNET != 0 {
-        sched::set_current_net(Some(crate::net::new_namespace()));
+        sched::set_current_net(Some(crate::net::new_namespace_with_owner(ns_owner.clone())));
     }
     if flags & CLONE_NEWPID != 0 {
         let parent = sched::with_current_pid_ns(|p| p.clone());
@@ -1058,7 +1081,13 @@ pub(super) fn sys_setns(fd: u64, nstype: u64) -> i64 {
     if nstype != 0 && nstype != handle.type_flag() {
         return EINVAL;
     }
-    if !crate::security::has_cap(crate::process_model::CAP_SYS_ADMIN) {
+    let target_owner = match &handle {
+        NamespaceHandle::Uts(ns) => ns.owner_user_ns.clone(),
+        NamespaceHandle::Ipc(ns) => ns.owner_user_ns.clone(),
+        NamespaceHandle::Net(ns) => ns.owner_user_ns(),
+        _ => None,
+    };
+    if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, target_owner.as_ref()) {
         return EPERM;
     }
     match handle {

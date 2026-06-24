@@ -4,12 +4,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use frame::sync::SpinIrq;
-use smoltcp::iface::SocketHandle;
 use smoltcp::socket::icmp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use cyphera_kapi::{Errno, KResult};
 
+use super::SockRef;
 use crate::core::wait::WaitQueue;
 use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
 
@@ -21,8 +21,8 @@ const RX_BYTES: usize = 16 * 1024;
 const META_SLOTS: usize = 16;
 
 pub struct IcmpSocket {
-    handle: SocketHandle,
-    loop_handle: SocketHandle,
+    handle: SockRef,
+    loop_handle: SockRef,
     ns: Arc<crate::net::NetNamespace>,
     bound: SpinIrq<bool>,
     peer: SpinIrq<Option<IpAddress>>,
@@ -45,8 +45,8 @@ impl IcmpSocket {
     pub fn new() -> KResult<Arc<Self>> {
         let ns = crate::core::current_net_ns();
         let (handle, loop_handle) = ns.with_stack(|s| {
-            let ext = s.sockets.add(Self::new_icmp_socket());
-            let lp = s.loop_sockets.add(Self::new_icmp_socket());
+            let ext = s.add_socket(false, Self::new_icmp_socket());
+            let lp = s.add_socket(true, Self::new_icmp_socket());
             (ext, lp)
         });
         Ok(Arc::new(Self {
@@ -63,11 +63,11 @@ impl IcmpSocket {
         self.wait.wake_all();
     }
 
-    fn endpoints(&self) -> [(SocketHandle, bool); 2] {
-        [(self.handle, false), (self.loop_handle, true)]
+    fn endpoints(&self) -> [SockRef; 2] {
+        [self.handle, self.loop_handle]
     }
 
-    fn handle_for(&self, is_loop: bool) -> SocketHandle {
+    fn ref_for(&self, is_loop: bool) -> SockRef {
         if is_loop {
             self.loop_handle
         } else {
@@ -78,10 +78,10 @@ impl IcmpSocket {
     fn ensure_bound(&self, ident: u16) -> KResult<()> {
         let mut b = self.bound.lock();
         if !*b {
-            for (h, is_loop) in self.endpoints() {
+            for r in self.endpoints() {
                 self.ns.with_stack(|s| {
-                    let sock = s.set(is_loop).get_mut::<icmp::Socket>(h);
-                    sock.bind(icmp::Endpoint::Ident(ident))
+                    s.icmp_mut(r)
+                        .bind(icmp::Endpoint::Ident(ident))
                         .map_err(|_| Errno::INVAL)
                 })?;
             }
@@ -96,10 +96,9 @@ impl IcmpSocket {
         }
         let ident = u16::from_be_bytes([buf[4], buf[5]]);
         self.ensure_bound(ident)?;
-        let is_loop = super::inet::addr_is_loop(dst);
-        let h = self.handle_for(is_loop);
+        let r = self.ref_for(super::inet::addr_is_loop(dst));
         self.ns.with_stack(|s| {
-            let sock = s.set(is_loop).get_mut::<icmp::Socket>(h);
+            let sock = s.icmp_mut(r);
             if !sock.can_send() {
                 return Err(Errno::AGAIN);
             }
@@ -109,9 +108,9 @@ impl IcmpSocket {
     }
 
     fn try_recv(&self, buf: &mut [u8]) -> KResult<(usize, IpAddress)> {
-        for (h, is_loop) in self.endpoints() {
+        for rf in self.endpoints() {
             let got: KResult<Option<(usize, IpAddress)>> = self.ns.with_stack(|s| {
-                let sock = s.set(is_loop).get_mut::<icmp::Socket>(h);
+                let sock = s.icmp_mut(rf);
                 if !sock.can_recv() {
                     return Ok(None);
                 }
@@ -168,10 +167,11 @@ impl super::Socket for IcmpSocket {
             Ok((n, src)) => {
                 if let Some((addr, addrlen_ptr)) = peer_out {
                     if addr != 0 && addrlen_ptr != 0 {
-                        let mut ab = [0u8; super::inet::SOCKADDR_MAX];
-                        let len = super::inet::write_sockaddr_in(&IpEndpoint::new(src, 0), &mut ab);
-                        let _ = frame::user::copy_to_user(addr, &ab[..len]);
-                        let _ = frame::user::copy_to_user(addrlen_ptr, &(len as u32).to_le_bytes());
+                        let _ = super::inet::copy_sockaddr_to_user(
+                            &IpEndpoint::new(src, 0),
+                            addr,
+                            addrlen_ptr,
+                        );
                     }
                 }
                 n as i64
@@ -205,9 +205,9 @@ impl Inode for IcmpSocket {
 
     fn poll(&self) -> PollMask {
         let mut m = PollMask::empty();
-        for (h, is_loop) in self.endpoints() {
+        for r in self.endpoints() {
             self.ns.with_stack(|s| {
-                let sock = s.set(is_loop).get_mut::<icmp::Socket>(h);
+                let sock = s.icmp_mut(r);
                 if sock.can_recv() {
                     m |= PollMask::IN;
                 }
@@ -230,8 +230,8 @@ impl Inode for IcmpSocket {
     fn on_close(&self, _flags: OpenFlags) {
         self.ns.unregister_icmp(self);
         self.ns.with_stack(|s| {
-            s.sockets.remove(self.handle);
-            s.loop_sockets.remove(self.loop_handle);
+            s.remove_socket(self.handle);
+            s.remove_socket(self.loop_handle);
         });
     }
 }

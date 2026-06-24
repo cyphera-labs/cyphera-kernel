@@ -4,12 +4,12 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use frame::sync::SpinIrq;
-use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
 use cyphera_kapi::{Errno, KResult};
 
+use super::SockRef;
 use crate::core::wait::WaitQueue;
 use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
 
@@ -28,13 +28,6 @@ const TCP_BUFFER_BYTES: usize = 64 * 1024;
 enum SockKind {
     Udp,
     Tcp,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Realm {
-    Ext,
-    Loop,
-    Both,
 }
 
 pub(crate) fn addr_is_loop(addr: IpAddress) -> bool {
@@ -85,17 +78,20 @@ impl SockOpts {
     }
 }
 
+enum SockState {
+    Tcp(SockRef),
+    TcpListen(alloc::vec::Vec<SockRef>),
+    Udp { ext: SockRef, lo: SockRef },
+    Closed,
+}
+
 pub struct InetSocket {
-    handle: SpinIrq<SocketHandle>,
-    loop_handle: SpinIrq<Option<SocketHandle>>,
-    realm: SpinIrq<Realm>,
+    state: SpinIrq<SockState>,
     kind: SockKind,
     family: Family,
     ns: Arc<crate::net::NetNamespace>,
     peer: SpinIrq<Option<IpEndpoint>>,
     bound_local: SpinIrq<Option<IpListenEndpoint>>,
-    listening: SpinIrq<bool>,
-    listeners: SpinIrq<alloc::vec::Vec<(SocketHandle, bool)>>,
     wait: WaitQueue,
     pub opts: SpinIrq<SockOpts>,
 }
@@ -113,22 +109,18 @@ impl InetSocket {
 
     pub fn new_udp(family: Family) -> KResult<Arc<Self>> {
         let ns = crate::core::current_net_ns();
-        let (handle, loop_handle) = ns.with_stack(|s| {
-            let ext = s.sockets.add(Self::new_udp_socket());
-            let lp = s.loop_sockets.add(Self::new_udp_socket());
-            (ext, lp)
+        let state = ns.with_stack(|s| {
+            let ext = s.add_socket(false, Self::new_udp_socket());
+            let lo = s.add_socket(true, Self::new_udp_socket());
+            SockState::Udp { ext, lo }
         });
         Ok(Arc::new(Self {
-            handle: SpinIrq::new(handle),
-            loop_handle: SpinIrq::new(Some(loop_handle)),
-            realm: SpinIrq::new(Realm::Both),
+            state: SpinIrq::new(state),
             kind: SockKind::Udp,
             family,
             ns,
             peer: SpinIrq::new(None),
             bound_local: SpinIrq::new(None),
-            listening: SpinIrq::new(false),
-            listeners: SpinIrq::new(alloc::vec::Vec::new()),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts::fresh()),
         }))
@@ -139,18 +131,14 @@ impl InetSocket {
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let socket = tcp::Socket::new(rx, tx);
         let ns = crate::core::current_net_ns();
-        let handle = ns.with_stack(|s| s.sockets.add(socket));
+        let r = ns.with_stack(|s| s.add_socket(false, socket));
         Ok(Arc::new(Self {
-            handle: SpinIrq::new(handle),
-            loop_handle: SpinIrq::new(None),
-            realm: SpinIrq::new(Realm::Ext),
+            state: SpinIrq::new(SockState::Tcp(r)),
             kind: SockKind::Tcp,
             family,
             ns,
             peer: SpinIrq::new(None),
             bound_local: SpinIrq::new(None),
-            listening: SpinIrq::new(false),
-            listeners: SpinIrq::new(alloc::vec::Vec::new()),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts::fresh()),
         }))
@@ -160,54 +148,35 @@ impl InetSocket {
         ns: &Arc<crate::net::NetNamespace>,
         local: IpListenEndpoint,
         is_loop: bool,
-    ) -> KResult<SocketHandle> {
+    ) -> KResult<SockRef> {
         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
         let socket = tcp::Socket::new(rx, tx);
         ns.with_stack(|s| {
-            let h = s.set(is_loop).add(socket);
-            let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
-            sock.listen(local).map(|_| h).map_err(|_| Errno::INVAL)
+            let r = s.add_socket(is_loop, socket);
+            match s.tcp_mut(r).listen(local) {
+                Ok(()) => Ok(r),
+                Err(_) => Err(Errno::INVAL),
+            }
         })
     }
 
-    pub fn handle(&self) -> SocketHandle {
-        *self.handle.lock()
+    fn is_listening(&self) -> bool {
+        matches!(&*self.state.lock(), SockState::TcpListen(_))
     }
 
-    fn primary_loop(&self) -> bool {
-        *self.realm.lock() == Realm::Loop
-    }
-
-    fn udp_endpoints(&self) -> alloc::vec::Vec<(SocketHandle, bool)> {
-        let mut v = alloc::vec![(*self.handle.lock(), false)];
-        if let Some(h) = *self.loop_handle.lock() {
-            v.push((h, true));
-        }
-        v
-    }
-
-    fn udp_handle_for(&self, is_loop: bool) -> SocketHandle {
-        if is_loop {
-            self.loop_handle.lock().unwrap_or(*self.handle.lock())
-        } else {
-            *self.handle.lock()
+    fn tcp_ref(&self) -> Option<SockRef> {
+        match &*self.state.lock() {
+            SockState::Tcp(r) => Some(*r),
+            _ => None,
         }
     }
 
-    fn place_tcp_handle(&self, is_loop: bool) {
-        let target = if is_loop { Realm::Loop } else { Realm::Ext };
-        if *self.realm.lock() == target {
-            return;
+    fn udp_refs(&self) -> Option<(SockRef, SockRef)> {
+        match &*self.state.lock() {
+            SockState::Udp { ext, lo } => Some((*ext, *lo)),
+            _ => None,
         }
-        let old = *self.handle.lock();
-        let from_loop = self.primary_loop();
-        let moved = self.ns.with_stack(|s| {
-            let sock = s.set(from_loop).remove(old);
-            s.set(is_loop).add(sock)
-        });
-        *self.handle.lock() = moved;
-        *self.realm.lock() = target;
     }
 
     pub fn bind_endpoint(&self, ep: IpListenEndpoint) -> KResult<()> {
@@ -221,11 +190,10 @@ impl InetSocket {
                 } else {
                     ep
                 };
-                for (h, is_loop) in self.udp_endpoints() {
-                    self.ns.with_stack(|s| {
-                        let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
-                        sock.bind(ep).map_err(|_| Errno::INVAL)
-                    })?;
+                let (ext, lo) = self.udp_refs().ok_or(Errno::INVAL)?;
+                for r in [ext, lo] {
+                    self.ns
+                        .with_stack(|s| s.udp_mut(r).bind(ep).map_err(|_| Errno::INVAL))?;
                 }
                 ep
             }
@@ -249,23 +217,26 @@ impl InetSocket {
                     .filter(|p| *p != 0)
                     .unwrap_or_else(|| self.ns.next_ephemeral_port());
                 let is_loop = addr_is_loop(ep.addr);
-                self.place_tcp_handle(is_loop);
-                let handle = *self.handle.lock();
-                self.ns.with_stack(|s| {
-                    match (is_loop, s.iface.as_mut()) {
-                        (false, Some(iface)) => {
-                            let ctx = iface.context();
-                            let sock = s.sockets.get_mut::<tcp::Socket>(handle);
-                            sock.connect(ctx, ep, local)
-                        }
-                        _ => {
-                            let ctx = s.loop_iface.context();
-                            let sock = s.loop_sockets.get_mut::<tcp::Socket>(handle);
-                            sock.connect(ctx, ep, local)
-                        }
-                    }
-                    .map_err(|_| Errno::INVAL)
-                })?;
+                let res = {
+                    let mut st = self.state.lock();
+                    let cur = match &*st {
+                        SockState::Tcp(r) => *r,
+                        _ => return Err(Errno::INVAL),
+                    };
+                    let (r, res) = self.ns.with_stack(|s| {
+                        let r = if cur.is_loop() != is_loop {
+                            let sock = s.remove_socket(cur);
+                            s.add_socket(is_loop, sock)
+                        } else {
+                            cur
+                        };
+                        let res = s.connect_tcp(r, ep, local);
+                        (r, res)
+                    });
+                    *st = SockState::Tcp(r);
+                    res
+                };
+                res.map_err(|_| Errno::INVAL)?;
                 {
                     let mut bl = self.bound_local.lock();
                     let addr = bl.and_then(|le| le.addr);
@@ -285,9 +256,10 @@ impl InetSocket {
     }
 
     fn tcp_state(&self) -> tcp::State {
-        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-        self.ns
-            .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state())
+        match self.tcp_ref() {
+            Some(r) => self.ns.with_stack(|s| s.tcp(r).state()),
+            None => tcp::State::Closed,
+        }
     }
 
     pub fn tcp_connect(&self, ep: IpEndpoint, nonblock: bool) -> i64 {
@@ -330,10 +302,7 @@ impl InetSocket {
         use crate::vfs::blocking::IoAttempt;
         let r =
             crate::vfs::blocking::block_io::<i64>("inet_connect", &self.wait, false, None, || {
-                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-                let st = self
-                    .ns
-                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state());
+                let st = self.tcp_state();
                 if tcp_established_or_past(st) {
                     self.opts.lock().ever_established = true;
                     IoAttempt::Ready(0)
@@ -364,38 +333,45 @@ impl InetSocket {
                 let mut pool = alloc::vec::Vec::with_capacity(n * realms.len());
                 for _ in 0..n {
                     for &is_loop in realms {
-                        pool.push((Self::new_tcp_listener(&self.ns, local, is_loop)?, is_loop));
+                        pool.push(Self::new_tcp_listener(&self.ns, local, is_loop)?);
                     }
                 }
-                *self.realm.lock() = match local.addr {
-                    None => Realm::Both,
-                    Some(addr) if addr_is_loop(addr) => Realm::Loop,
-                    Some(_) => Realm::Ext,
-                };
-                *self.listeners.lock() = pool;
-                *self.listening.lock() = true;
+                let mut st = self.state.lock();
+                self.ns.with_stack(|s| match &*st {
+                    SockState::Tcp(r) => {
+                        s.remove_socket(*r);
+                    }
+                    SockState::TcpListen(old) => {
+                        for r in old {
+                            s.remove_socket(*r);
+                        }
+                    }
+                    _ => {}
+                });
+                *st = SockState::TcpListen(pool);
                 Ok(())
             }
         }
     }
 
     pub fn try_accept(&self) -> KResult<Arc<Self>> {
-        if self.kind != SockKind::Tcp || !*self.listening.lock() {
+        if self.kind != SockKind::Tcp {
             return Err(Errno::INVAL);
         }
         let local = self.bound_local.lock().ok_or(Errno::INVAL)?;
 
-        let mut pool = self.listeners.lock();
+        let mut st = self.state.lock();
+        let pool = match &mut *st {
+            SockState::TcpListen(pool) => pool,
+            _ => return Err(Errno::INVAL),
+        };
         if pool.is_empty() {
             return Err(Errno::INVAL);
         }
 
         let mut active_idx = None;
-        for (i, &(h, is_loop)) in pool.iter().enumerate() {
-            let active = self.ns.with_stack(|s| {
-                let sock = s.set(is_loop).get::<tcp::Socket>(h);
-                sock.is_active()
-            });
+        for (i, r) in pool.iter().enumerate() {
+            let active = self.ns.with_stack(|s| s.tcp(*r).is_active());
             if active {
                 active_idx = Some(i);
                 break;
@@ -405,32 +381,20 @@ impl InetSocket {
             Some(i) => i,
             None => return Err(Errno::AGAIN),
         };
-        let (accepted_handle, accepted_loop) = pool[idx];
-        let replacement = Self::new_tcp_listener(&self.ns, local, accepted_loop)?;
-        pool[idx] = (replacement, accepted_loop);
-        drop(pool);
+        let accepted = pool[idx];
+        let replacement = Self::new_tcp_listener(&self.ns, local, accepted.is_loop())?;
+        pool[idx] = replacement;
+        drop(st);
 
-        let remote = self.ns.with_stack(|s| {
-            s.set(accepted_loop)
-                .get::<tcp::Socket>(accepted_handle)
-                .remote_endpoint()
-        });
+        let remote = self.ns.with_stack(|s| s.tcp(accepted).remote_endpoint());
 
         Ok(Arc::new(InetSocket {
-            handle: SpinIrq::new(accepted_handle),
-            loop_handle: SpinIrq::new(None),
-            realm: SpinIrq::new(if accepted_loop {
-                Realm::Loop
-            } else {
-                Realm::Ext
-            }),
+            state: SpinIrq::new(SockState::Tcp(accepted)),
             kind: SockKind::Tcp,
             family: self.family,
             ns: self.ns.clone(),
             peer: SpinIrq::new(remote),
             bound_local: SpinIrq::new(Some(local)),
-            listening: SpinIrq::new(false),
-            listeners: SpinIrq::new(alloc::vec::Vec::new()),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts {
                 ever_established: true,
@@ -460,36 +424,37 @@ impl InetSocket {
             };
             self.bind_endpoint(ep)?;
         }
-        let site = match self.kind {
-            SockKind::Udp => "inet_send_udp",
-            SockKind::Tcp => "inet_send_tcp",
-        };
         let dst_loop = addr_is_loop(target.addr);
-        crate::vfs::blocking::block_io(site, &self.wait, nonblock, None, || {
-            self.ns.with_stack(|s| match self.kind {
-                SockKind::Udp => {
-                    let h = self.udp_handle_for(dst_loop);
-                    let sock = s.set(dst_loop).get_mut::<udp::Socket>(h);
-                    match sock.send_slice(buf, target) {
-                        Ok(()) => IoAttempt::Ready(buf.len()),
-                        Err(udp::SendError::BufferFull) => IoAttempt::WouldBlock,
-                        Err(_) => IoAttempt::Err(Errno::IO),
-                    }
-                }
-                SockKind::Tcp => {
-                    let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
-                    if !sock.may_send() {
-                        return IoAttempt::Err(Errno::PIPE);
-                    }
-                    match sock.send_slice(buf) {
-                        Ok(0) if !buf.is_empty() => IoAttempt::WouldBlock,
-                        Ok(n) => IoAttempt::Ready(n),
-                        Err(_) => IoAttempt::Err(Errno::IO),
-                    }
-                }
-            })
-        })
+        match self.kind {
+            SockKind::Udp => {
+                let (ext, lo) = self.udp_refs().ok_or(Errno::INVAL)?;
+                let r = if dst_loop { lo } else { ext };
+                crate::vfs::blocking::block_io("inet_send_udp", &self.wait, nonblock, None, || {
+                    self.ns
+                        .with_stack(|s| match s.udp_mut(r).send_slice(buf, target) {
+                            Ok(()) => IoAttempt::Ready(buf.len()),
+                            Err(udp::SendError::BufferFull) => IoAttempt::WouldBlock,
+                            Err(_) => IoAttempt::Err(Errno::IO),
+                        })
+                })
+            }
+            SockKind::Tcp => {
+                let r = self.tcp_ref().ok_or(Errno::PIPE)?;
+                crate::vfs::blocking::block_io("inet_send_tcp", &self.wait, nonblock, None, || {
+                    self.ns.with_stack(|s| {
+                        let sock = s.tcp_mut(r);
+                        if !sock.may_send() {
+                            return IoAttempt::Err(Errno::PIPE);
+                        }
+                        match sock.send_slice(buf) {
+                            Ok(0) if !buf.is_empty() => IoAttempt::WouldBlock,
+                            Ok(n) => IoAttempt::Ready(n),
+                            Err(_) => IoAttempt::Err(Errno::IO),
+                        }
+                    })
+                })
+            }
+        }
     }
 
     pub fn try_recv_from(&self, buf: &mut [u8]) -> KResult<(usize, Option<IpEndpoint>)> {
@@ -498,10 +463,11 @@ impl InetSocket {
         }
         match self.kind {
             SockKind::Udp => {
-                for (h, is_loop) in self.udp_endpoints() {
+                let (ext, lo) = self.udp_refs().ok_or(Errno::AGAIN)?;
+                for rf in [ext, lo] {
                     let got: KResult<Option<(usize, Option<IpEndpoint>)>> =
                         self.ns.with_stack(|s| {
-                            let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
+                            let sock = s.udp_mut(rf);
                             if !sock.can_recv() {
                                 return Ok(None);
                             }
@@ -516,9 +482,12 @@ impl InetSocket {
             }
             SockKind::Tcp => {
                 let ever_established = self.opts.lock().ever_established;
-                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
+                let r = match self.tcp_ref() {
+                    Some(r) => r,
+                    None => return Err(Errno::AGAIN),
+                };
                 self.ns.with_stack(|s| {
-                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
+                    let sock = s.tcp_mut(r);
                     if !sock.can_recv() {
                         if !sock.may_recv()
                             && (ever_established || tcp_established_or_past(sock.state()))
@@ -558,23 +527,25 @@ impl InetSocket {
         if opts.shut_rd && opts.shut_wr {
             return PollMask::HUP | PollMask::IN;
         }
-        if self.kind == SockKind::Tcp && *self.listening.lock() {
-            let pool = self.listeners.lock().clone();
-            let any_active = self.ns.with_stack(|s| {
-                pool.iter()
-                    .any(|(h, is_loop)| s.set(*is_loop).get::<tcp::Socket>(*h).is_active())
-            });
+        let listen_pool = match &*self.state.lock() {
+            SockState::TcpListen(pool) => Some(pool.clone()),
+            _ => None,
+        };
+        if let Some(pool) = listen_pool {
+            let any_active = self
+                .ns
+                .with_stack(|s| pool.iter().any(|r| s.tcp(*r).is_active()));
             return if any_active {
                 PollMask::IN
             } else {
                 PollMask::empty()
             };
         }
-        if self.kind == SockKind::Udp {
+        if let Some((ext, lo)) = self.udp_refs() {
             let mut m = PollMask::empty();
-            for (h, is_loop) in self.udp_endpoints() {
+            for r in [ext, lo] {
                 self.ns.with_stack(|s| {
-                    let sock = s.set(is_loop).get_mut::<udp::Socket>(h);
+                    let sock = s.udp_mut(r);
                     if sock.can_recv() {
                         m |= PollMask::IN;
                     }
@@ -585,25 +556,22 @@ impl InetSocket {
             }
             return m;
         }
-        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
+        let r = match self.tcp_ref() {
+            Some(r) => r,
+            None => return PollMask::empty(),
+        };
         let (mask, established) = self.ns.with_stack(|s| {
+            let sock = s.tcp_mut(r);
+            let est = tcp_established_or_past(sock.state());
             let mut m = PollMask::empty();
-            let mut est = false;
-            match self.kind {
-                SockKind::Udp => {}
-                SockKind::Tcp => {
-                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
-                    est = tcp_established_or_past(sock.state());
-                    if sock.can_recv() || opts.shut_rd {
-                        m |= PollMask::IN;
-                    }
-                    if sock.can_send() && !opts.shut_wr {
-                        m |= PollMask::OUT;
-                    }
-                    if !sock.is_open() {
-                        m |= PollMask::HUP;
-                    }
-                }
+            if sock.can_recv() || opts.shut_rd {
+                m |= PollMask::IN;
+            }
+            if sock.can_send() && !opts.shut_wr {
+                m |= PollMask::OUT;
+            }
+            if !sock.is_open() {
+                m |= PollMask::HUP;
             }
             (m, est)
         });
@@ -644,24 +612,21 @@ impl InetSocket {
             |le: IpListenEndpoint| IpEndpoint::new(le.addr.unwrap_or(unspec.addr), le.port);
         match self.kind {
             SockKind::Udp => {
-                let h = *self.handle.lock();
                 let le = self
-                    .ns
-                    .with_stack(|s| s.sockets.get::<udp::Socket>(h).endpoint());
-                if le.port != 0 {
-                    le_to_ep(le)
-                } else {
-                    match *self.bound_local.lock() {
+                    .udp_refs()
+                    .map(|(ext, _)| self.ns.with_stack(|s| s.udp(ext).endpoint()));
+                match le {
+                    Some(le) if le.port != 0 => le_to_ep(le),
+                    _ => match *self.bound_local.lock() {
                         Some(le) => le_to_ep(le),
                         None => unspec,
-                    }
+                    },
                 }
             }
             SockKind::Tcp => {
-                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 let smol = self
-                    .ns
-                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).local_endpoint());
+                    .tcp_ref()
+                    .and_then(|r| self.ns.with_stack(|s| s.tcp(r).local_endpoint()));
                 match smol {
                     Some(ep) => ep,
                     None => match *self.bound_local.lock() {
@@ -677,10 +642,9 @@ impl InetSocket {
         match self.kind {
             SockKind::Udp => *self.peer.lock(),
             SockKind::Tcp => {
-                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
                 let remote = self
-                    .ns
-                    .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).remote_endpoint());
+                    .tcp_ref()
+                    .and_then(|r| self.ns.with_stack(|s| s.tcp(r).remote_endpoint()));
                 remote.or_else(|| *self.peer.lock())
             }
         }
@@ -704,7 +668,7 @@ impl InetSocket {
         if self.peer.lock().is_none() {
             return;
         }
-        if *self.listening.lock() {
+        if self.is_listening() {
             return;
         }
         {
@@ -713,10 +677,10 @@ impl InetSocket {
                 return;
             }
         }
-        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-        let st = self
-            .ns
-            .with_stack(|s| s.set(is_loop).get::<tcp::Socket>(h).state());
+        let st = match self.tcp_ref() {
+            Some(r) => self.ns.with_stack(|s| s.tcp(r).state()),
+            None => return,
+        };
         if tcp_established_or_past(st) {
             self.opts.lock().ever_established = true;
         } else if st == tcp::State::Closed {
@@ -734,44 +698,42 @@ impl InetSocket {
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
             return Err(Errno::INVAL);
         }
-        let mut o = self.opts.lock();
-        if how == SHUT_RD || how == SHUT_RDWR {
-            o.shut_rd = true;
-        }
-        if how == SHUT_WR || how == SHUT_RDWR {
-            o.shut_wr = true;
-            if self.kind == SockKind::Tcp {
-                let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-                self.ns.with_stack(|s| {
-                    let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
-                    sock.close();
-                });
+        let close_write = how == SHUT_WR || how == SHUT_RDWR;
+        {
+            let mut o = self.opts.lock();
+            if how == SHUT_RD || how == SHUT_RDWR {
+                o.shut_rd = true;
+            }
+            if close_write {
+                o.shut_wr = true;
             }
         }
-        drop(o);
+        if close_write && self.kind == SockKind::Tcp {
+            if let Some(r) = self.tcp_ref() {
+                self.ns.with_stack(|s| s.tcp_mut(r).close());
+            }
+        }
         self.wait.wake_all();
         Ok(())
     }
 
     pub fn apply_smoltcp_sockopt(&self, kind: SmoltcpOpt, val: u64) {
-        let (h, is_loop) = (*self.handle.lock(), self.primary_loop());
-        self.ns.with_stack(|s| match self.kind {
-            SockKind::Tcp => {
-                let sock = s.set(is_loop).get_mut::<tcp::Socket>(h);
-                match kind {
-                    SmoltcpOpt::TcpNoDelay => sock.set_nagle_enabled(val == 0),
-                    SmoltcpOpt::Keepalive => {
-                        sock.set_keep_alive(if val != 0 {
-                            Some(smoltcp::time::Duration::from_secs(60))
-                        } else {
-                            None
-                        });
-                    }
-                    SmoltcpOpt::HopLimit => sock.set_hop_limit(Some(val as u8)),
+        let r = match self.tcp_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        self.ns.with_stack(|s| {
+            let sock = s.tcp_mut(r);
+            match kind {
+                SmoltcpOpt::TcpNoDelay => sock.set_nagle_enabled(val == 0),
+                SmoltcpOpt::Keepalive => {
+                    sock.set_keep_alive(if val != 0 {
+                        Some(smoltcp::time::Duration::from_secs(60))
+                    } else {
+                        None
+                    });
                 }
-            }
-            SockKind::Udp => {
-                let _ = (kind, val);
+                SmoltcpOpt::HopLimit => sock.set_hop_limit(Some(val as u8)),
             }
         });
     }
@@ -823,26 +785,34 @@ impl Inode for InetSocket {
 
     fn on_close(&self, _flags: OpenFlags) {
         self.ns.unregister_inet(self);
-        let pool: alloc::vec::Vec<(SocketHandle, bool)> = self.listeners.lock().drain(..).collect();
-        let primary = (*self.handle.lock(), self.primary_loop());
-        let loop_udp = *self.loop_handle.lock();
-        self.ns.with_stack(|s| {
-            if self.kind == SockKind::Tcp {
-                s.set(primary.1).get_mut::<tcp::Socket>(primary.0).abort();
-                for (h, is_loop) in &pool {
-                    s.set(*is_loop).get_mut::<tcp::Socket>(*h).abort();
+        let mut st = self.state.lock();
+        self.ns.with_stack(|s| match &*st {
+            SockState::Tcp(r) => {
+                s.tcp_mut(*r).abort();
+            }
+            SockState::TcpListen(pool) => {
+                for r in pool {
+                    s.tcp_mut(*r).abort();
                 }
             }
+            _ => {}
         });
-        self.ns.with_stack(|s| {
-            s.set(primary.1).remove(primary.0);
-            if let Some(h) = loop_udp {
-                s.loop_sockets.remove(h);
+        self.ns.with_stack(|s| match &*st {
+            SockState::Tcp(r) => {
+                s.remove_socket(*r);
             }
-            for (h, is_loop) in pool {
-                s.set(is_loop).remove(h);
+            SockState::TcpListen(pool) => {
+                for r in pool {
+                    s.remove_socket(*r);
+                }
             }
+            SockState::Udp { ext, lo } => {
+                s.remove_socket(*ext);
+                s.remove_socket(*lo);
+            }
+            SockState::Closed => {}
         });
+        *st = SockState::Closed;
     }
 }
 
@@ -854,7 +824,10 @@ impl super::Socket for InetSocket {
         };
         if ep.port != 0
             && ep.port < 1024
-            && !crate::security::capable(crate::process_model::CAP_NET_BIND_SERVICE)
+            && !crate::security::capable_in(
+                crate::process_model::CAP_NET_BIND_SERVICE,
+                crate::core::current_net_ns().owner_user_ns().as_ref(),
+            )
         {
             return crate::errno::EACCES;
         }
@@ -947,10 +920,7 @@ impl super::Socket for InetSocket {
         if let Some((addr, addrlen_ptr)) = peer_out {
             if addr != 0 && addrlen_ptr != 0 {
                 if let Some(ep) = peer {
-                    let mut ab = [0u8; SOCKADDR_MAX];
-                    let len = write_sockaddr_in(&ep, &mut ab);
-                    let _ = frame::user::copy_to_user(addr, &ab[..len]);
-                    let _ = frame::user::copy_to_user(addrlen_ptr, &(len as u32).to_le_bytes());
+                    let _ = copy_sockaddr_to_user(&ep, addr, addrlen_ptr);
                 }
             }
         }
@@ -1257,7 +1227,7 @@ const IPV6_V6ONLY: u64 = 26;
 const IPV6_RECVPKTINFO: u64 = 49;
 const IPV6_TCLASS: u64 = 67;
 
-fn copy_sockaddr_to_user(ep: &IpEndpoint, addr: u64, addrlen_ptr: u64) -> i64 {
+pub(crate) fn copy_sockaddr_to_user(ep: &IpEndpoint, addr: u64, addrlen_ptr: u64) -> i64 {
     if addr == 0 || addrlen_ptr == 0 {
         return crate::errno::EFAULT;
     }

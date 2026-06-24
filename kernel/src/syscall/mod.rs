@@ -2,7 +2,7 @@ use frame::user::TrapFrame;
 
 use crate::core as sched;
 
-use crate::errno::{EBADF, EFAULT, EINVAL, ENOSYS, EOPNOTSUPP, ESRCH};
+use crate::errno::{EBADF, EFAULT, EINVAL, ENOSYS, EOPNOTSUPP, EPERM, ESRCH};
 
 mod numbers;
 use numbers::*;
@@ -849,7 +849,7 @@ pub fn dispatch(tf: &mut TrapFrame) {
                 );
             }
             SYS_ADD_KEY | SYS_REQUEST_KEY => {
-                tf.set_ret((-95i64) as u64);
+                tf.set_ret(EOPNOTSUPP as u64);
             }
             SYS_GETRUSAGE => {
                 tf.set_ret(sys_getrusage(tf.arg(0), tf.arg(1)) as u64);
@@ -1136,35 +1136,35 @@ pub fn dispatch(tf: &mut TrapFrame) {
     sched::deliver_pending_signals(tf);
     sched::syscall_exit_account();
 }
-const LINUX_REBOOT_MAGIC1: u64 = 0xfee1dead;
-const LINUX_REBOOT_MAGIC2: u64 = 0x28121969;
-const LINUX_REBOOT_MAGIC2A: u64 = 0x05121996;
-const LINUX_REBOOT_MAGIC2B: u64 = 0x16041998;
-const LINUX_REBOOT_MAGIC2C: u64 = 0x20112000;
-const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
-const LINUX_REBOOT_CMD_HALT: u32 = 0xCDEF0123;
-const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ABCDEF;
-const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0;
-const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
+const REBOOT_MAGIC1: u64 = 0xfee1dead;
+const REBOOT_MAGIC2: u64 = 0x28121969;
+const REBOOT_MAGIC2A: u64 = 0x05121996;
+const REBOOT_MAGIC2B: u64 = 0x16041998;
+const REBOOT_MAGIC2C: u64 = 0x20112000;
+const REBOOT_CMD_RESTART: u32 = 0x01234567;
+const REBOOT_CMD_HALT: u32 = 0xCDEF0123;
+const REBOOT_CMD_CAD_ON: u32 = 0x89ABCDEF;
+const REBOOT_CMD_CAD_OFF: u32 = 0;
+const REBOOT_CMD_POWER_OFF: u32 = 0x4321FEDC;
 
 fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> i64 {
     if !crate::security::capable(crate::process_model::CAP_SYS_BOOT) {
-        return -1;
+        return EPERM;
     }
-    if (magic1 as u32) as u64 != LINUX_REBOOT_MAGIC1 {
+    if (magic1 as u32) as u64 != REBOOT_MAGIC1 {
         return EINVAL;
     }
     let m2 = magic2 as u32 as u64;
     if !matches!(
         m2,
-        LINUX_REBOOT_MAGIC2 | LINUX_REBOOT_MAGIC2A | LINUX_REBOOT_MAGIC2B | LINUX_REBOOT_MAGIC2C
+        REBOOT_MAGIC2 | REBOOT_MAGIC2A | REBOOT_MAGIC2B | REBOOT_MAGIC2C
     ) {
         return EINVAL;
     }
     let cmd_u32 = cmd as u32;
     match cmd_u32 {
-        LINUX_REBOOT_CMD_CAD_OFF | LINUX_REBOOT_CMD_CAD_ON => 0,
-        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF | LINUX_REBOOT_CMD_RESTART => {
+        REBOOT_CMD_CAD_OFF | REBOOT_CMD_CAD_ON => 0,
+        REBOOT_CMD_HALT | REBOOT_CMD_POWER_OFF | REBOOT_CMD_RESTART => {
             frame::println!(
                 "[reboot] cmd={:#x} requested by pid {}; halting VM",
                 cmd_u32,

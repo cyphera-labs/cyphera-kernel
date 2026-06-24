@@ -1,5 +1,5 @@
 use crate::core as sched;
-use crate::errno::{EFAULT, EINVAL, EPERM, ESRCH};
+use crate::errno::{EBUSY, EFAULT, EINVAL, EPERM, ESRCH};
 use frame::user::TrapFrame;
 
 pub(super) fn sys_rseq(rseq_ptr: u64, rseq_len: u64, flags: u64, sig: u64) -> i64 {
@@ -27,7 +27,7 @@ pub(super) fn sys_rseq(rseq_ptr: u64, rseq_len: u64, flags: u64, sig: u64) -> i6
                 return EINVAL;
             }
             if m.rseq_addr() != rseq_ptr || m.rseq_sig() != sig as u32 {
-                return -1i64;
+                return EPERM;
             }
             m.set_rseq_addr(0);
             m.set_rseq_len(0);
@@ -45,7 +45,7 @@ pub(super) fn sys_rseq(rseq_ptr: u64, rseq_len: u64, flags: u64, sig: u64) -> i6
             {
                 return Some(0i64);
             }
-            return Some(-16i64);
+            return Some(EBUSY);
         }
         m.set_rseq_addr(rseq_ptr);
         m.set_rseq_len(rseq_len as u32);
@@ -105,7 +105,10 @@ pub(super) fn sys_setpriority(which: u64, who: u64, niceval: u64) -> i64 {
         }
     };
     let cur_nice = sched::scheduling::nice(target_host).unwrap_or(0);
-    if clamped < cur_nice && !crate::security::capable(crate::process_model::CAP_SYS_NICE) {
+    let target_user_ns = sched::with_target_creds(target_host, |c| c.user_ns.clone()).flatten();
+    if clamped < cur_nice
+        && !crate::security::capable_in(crate::process_model::CAP_SYS_NICE, target_user_ns.as_ref())
+    {
         return EPERM;
     }
     sched::params::set_nice(target_host, clamped);
@@ -166,9 +169,10 @@ pub(super) fn sys_sched_setscheduler(pid: u64, policy: u64, param: u64) -> i64 {
     };
 
     if matches!(new_class, crate::process_model::SchedClass::Rt { .. }) {
-        let allowed = crate::security::target_capable(
-            sched::current_pid(),
+        let target_user_ns = sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
+        let allowed = crate::security::capable_in(
             crate::process_model::CAP_SYS_NICE,
+            target_user_ns.as_ref(),
         );
         if !allowed {
             return EPERM;
@@ -244,8 +248,9 @@ pub(super) fn sys_sched_setparam(pid: u64, param: u64) -> i64 {
         }
         crate::process_model::SchedClass::Deadline { .. } => return EINVAL,
     };
+    let target_user_ns = sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
     let allowed =
-        crate::security::target_capable(sched::current_pid(), crate::process_model::CAP_SYS_NICE);
+        crate::security::capable_in(crate::process_model::CAP_SYS_NICE, target_user_ns.as_ref());
     if !allowed {
         return EPERM;
     }
@@ -339,9 +344,10 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
         if runtime > deadline || deadline > period {
             return EINVAL;
         }
-        let allowed = crate::security::target_capable(
-            sched::current_pid(),
+        let target_user_ns = sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
+        let allowed = crate::security::capable_in(
             crate::process_model::CAP_SYS_NICE,
+            target_user_ns.as_ref(),
         );
         if !allowed {
             return EPERM;
@@ -359,8 +365,13 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
             if policy == 0 {
                 let clamped = (nice as i8).clamp(-20, 19);
                 let cur_nice = sched::scheduling::nice(target).unwrap_or(0);
+                let target_user_ns =
+                    sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
                 if clamped < cur_nice
-                    && !crate::security::capable(crate::process_model::CAP_SYS_NICE)
+                    && !crate::security::capable_in(
+                        crate::process_model::CAP_SYS_NICE,
+                        target_user_ns.as_ref(),
+                    )
                 {
                     return EPERM;
                 }
@@ -390,9 +401,10 @@ pub(super) fn sys_sched_setattr(pid: u64, attr_ptr: u64, _flags: u64) -> i64 {
     };
 
     if matches!(new_class, crate::process_model::SchedClass::Rt { .. }) {
-        let allowed = crate::security::target_capable(
-            sched::current_pid(),
+        let target_user_ns = sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
+        let allowed = crate::security::capable_in(
             crate::process_model::CAP_SYS_NICE,
+            target_user_ns.as_ref(),
         );
         if !allowed {
             return EPERM;
@@ -528,7 +540,8 @@ pub(super) fn sys_sched_setaffinity(
             Some(u) => u,
             None => return ESRCH,
         };
-        if !crate::security::has_cap(crate::process_model::CAP_SYS_NICE)
+        let target_user_ns = sched::with_target_creds(target, |c| c.user_ns.clone()).flatten();
+        if !crate::security::capable_in(crate::process_model::CAP_SYS_NICE, target_user_ns.as_ref())
             && caller_euid != target_euid
         {
             return EPERM;
@@ -567,14 +580,12 @@ pub(super) fn sys_sched_getaffinity(pid: u64, cpusetsize: u64, mask: u64) -> i64
         Some(m) => m & online,
         None => return ESRCH,
     };
-    let mut buf = alloc::vec![0u8; cpusetsize as usize];
     let bytes = eff.to_le_bytes();
-    let copy = buf.len().min(bytes.len());
-    buf[..copy].copy_from_slice(&bytes[..copy]);
-    if frame::user::copy_to_user(mask, &buf).is_err() {
+    let n = (cpusetsize as usize).min(bytes.len());
+    if frame::user::copy_to_user(mask, &bytes[..n]).is_err() {
         return EFAULT;
     }
-    cpusetsize as i64
+    n as i64
 }
 
 pub(super) fn sys_getcpu(cpu_ptr: u64, node_ptr: u64, _tcache: u64) -> i64 {

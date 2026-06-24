@@ -1,5 +1,7 @@
 use super::*;
 
+const XATTR_SIZE_MAX: usize = 65536;
+
 pub(crate) fn sys_setxattrat(
     dirfd: u64,
     pathname: u64,
@@ -50,7 +52,7 @@ pub(crate) fn sys_setxattr_inner(
     no_follow: bool,
 ) -> i64 {
     let _ = no_follow;
-    let inode = match resolve_path(dirfd, path, true) {
+    let inode = match resolve_path_writable(dirfd, path, true) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -58,6 +60,9 @@ pub(crate) fn sys_setxattr_inner(
         Ok(s) => s,
         Err(e) => return e,
     };
+    if size as usize > XATTR_SIZE_MAX {
+        return crate::errno::E2BIG;
+    }
     let mut buf = alloc::vec![0u8; size as usize];
     if size > 0 && frame::user::copy_from_user(value, &mut buf).is_err() {
         return EFAULT;
@@ -73,10 +78,16 @@ pub(crate) fn sys_fsetxattr(fd: u64, name: u64, value: u64, size: u64, flags: u6
         Some(f) => f,
         None => return EBADF,
     };
+    if fd_mount_is_rdonly(&file) {
+        return crate::errno::EROFS;
+    }
     let n = match copy_xname(name) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    if size as usize > XATTR_SIZE_MAX {
+        return crate::errno::E2BIG;
+    }
     let mut buf = alloc::vec![0u8; size as usize];
     if size > 0 && frame::user::copy_from_user(value, &mut buf).is_err() {
         return EFAULT;
@@ -100,7 +111,7 @@ pub(crate) fn sys_getxattr_inner(dirfd: u64, path: u64, name: u64, value: u64, s
         Ok(s) => s,
         Err(e) => return e,
     };
-    let mut buf = alloc::vec![0u8; size as usize];
+    let mut buf = alloc::vec![0u8; (size as usize).min(XATTR_SIZE_MAX)];
     let got = match inode.get_xattr(&n, &mut buf) {
         Ok(g) => g,
         Err(e) => return e.as_neg_i64(),
@@ -120,7 +131,7 @@ pub(crate) fn sys_fgetxattr(fd: u64, name: u64, value: u64, size: u64) -> i64 {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let mut buf = alloc::vec![0u8; size as usize];
+    let mut buf = alloc::vec![0u8; (size as usize).min(XATTR_SIZE_MAX)];
     let got = match file.inode.get_xattr(&n, &mut buf) {
         Ok(g) => g,
         Err(e) => return e.as_neg_i64(),
@@ -140,7 +151,7 @@ pub(crate) fn sys_listxattr_inner(dirfd: u64, path: u64, list: u64, size: u64) -
         Ok(i) => i,
         Err(e) => return e,
     };
-    let mut buf = alloc::vec![0u8; size as usize];
+    let mut buf = alloc::vec![0u8; (size as usize).min(XATTR_SIZE_MAX)];
     let n = match inode.list_xattr(&mut buf) {
         Ok(n) => n,
         Err(e) => return e.as_neg_i64(),
@@ -156,7 +167,7 @@ pub(crate) fn sys_flistxattr(fd: u64, list: u64, size: u64) -> i64 {
         Some(f) => f,
         None => return EBADF,
     };
-    let mut buf = alloc::vec![0u8; size as usize];
+    let mut buf = alloc::vec![0u8; (size as usize).min(XATTR_SIZE_MAX)];
     let n = match file.inode.list_xattr(&mut buf) {
         Ok(n) => n,
         Err(e) => return e.as_neg_i64(),
@@ -172,7 +183,7 @@ pub(crate) fn sys_removexattr(path: u64, name: u64) -> i64 {
 }
 
 pub(crate) fn sys_removexattr_inner(dirfd: u64, path: u64, name: u64) -> i64 {
-    let inode = match resolve_path(dirfd, path, true) {
+    let inode = match resolve_path_writable(dirfd, path, true) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -191,6 +202,9 @@ pub(crate) fn sys_fremovexattr(fd: u64, name: u64) -> i64 {
         Some(f) => f,
         None => return EBADF,
     };
+    if fd_mount_is_rdonly(&file) {
+        return crate::errno::EROFS;
+    }
     let n = match copy_xname(name) {
         Ok(s) => s,
         Err(e) => return e,

@@ -73,6 +73,7 @@ Commands:
   run                cargo run; boots the kernel in QEMU (Ctrl-A x to exit)
   run-release        cargo run --release
   demo               boot the kernel running a hello-world userland (see demo/)
+  demo-alpine        boot the kernel into an interactive Alpine shell (needs network; see demo/)
   build-userland     build + stage the userland test-driver ELFs (bundles/userland/)
   test [kind]        QEMU integration battery: smoke | subsystem | all (default all)
   fmt                cargo fmt
@@ -89,6 +90,7 @@ case "${1:-}" in
     run)           run_in_container cargo run ;;
     run-release)   run_in_container cargo run --release ;;
     demo)            run_in_container ./demo/run.sh ;;
+    demo-alpine)     run_in_container ./demo/run-alpine.sh ;;
     build-userland)  run_in_container ./tools/build-userland.sh ;;
     test)            run_in_container ./tools/test.sh "${2:-all}" ;;
     fmt)           run_in_container cargo fmt --all ;;

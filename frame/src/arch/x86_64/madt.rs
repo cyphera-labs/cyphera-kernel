@@ -121,7 +121,7 @@ fn parse_madt_lapic_entries(madt: *const u8) -> Vec<u8> {
             // bytes `off + 4 .. off + 8` (the entry's 4-byte flags) are in the
             // table.
             let flags = read_u32(unsafe { madt.add(off + 4) });
-            if flags & (FLAG_ENABLED | FLAG_ONLINE_CAPABLE) != 0 && apic_id != 0 {
+            if flags & (FLAG_ENABLED | FLAG_ONLINE_CAPABLE) != 0 {
                 out.push(apic_id);
             }
         }

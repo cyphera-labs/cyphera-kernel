@@ -151,7 +151,7 @@ pub(crate) fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
         None => return EBADF,
     };
     if !file.flags().is_readable() {
-        return -9;
+        return EBADF;
     }
     let mut tmp = alloc::vec![0u8; n];
     let read = match file.inode.read_at(offset, &mut tmp) {
@@ -174,7 +174,7 @@ pub(crate) fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
         None => return EBADF,
     };
     if !file.flags().is_writable() {
-        return -9;
+        return EBADF;
     }
     let mut buffer = alloc::vec![0u8; n];
     if frame::user::copy_from_user(buf, &mut buffer).is_err() {
@@ -283,7 +283,7 @@ pub(crate) fn sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
 }
 
 pub(crate) fn sys_truncate(pathname: u64, len: u64) -> i64 {
-    let inode = match resolve_path(AT_FDCWD as u64, pathname, true) {
+    let inode = match resolve_path_writable(AT_FDCWD as u64, pathname, true) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -322,6 +322,9 @@ pub(crate) fn sys_fallocate(fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
         Some(f) => f,
         None => return EBADF,
     };
+    if fd_mount_is_rdonly(&file) {
+        return crate::errno::EROFS;
+    }
     let inode = file.inode.clone();
     let cur = inode.stat().size;
 
@@ -508,6 +511,12 @@ pub(crate) fn sys_copy_file_range(
         Some(f) => f,
         None => return EBADF,
     };
+    if !out_file.flags().is_writable() {
+        return EBADF;
+    }
+    if fd_mount_is_rdonly(&out_file) {
+        return crate::errno::EROFS;
+    }
 
     let mut in_off = read_optional_off(off_in_ptr).unwrap_or(0);
     let in_use_off = off_in_ptr != 0;

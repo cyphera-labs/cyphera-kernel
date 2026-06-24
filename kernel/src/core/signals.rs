@@ -122,7 +122,11 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Stopped => {
-                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
+                set_state(
+                    proc,
+                    ProcessState::KilledBySignal { signal: SIGKILL },
+                    "signals",
+                );
                 let home = proc.sched.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -139,7 +143,7 @@ pub fn send_signal_with_info(
             }
             ProcessState::Parked => {
                 proc.signals.raise(1u64 << SIGKILL);
-                proc.state.0 = ProcessState::Runnable;
+                set_state(proc, ProcessState::Runnable, "signals");
                 let home = proc.sched.home_cpu;
                 drop(g);
                 {
@@ -165,14 +169,18 @@ pub fn send_signal_with_info(
             }
             ProcessState::Traced => {
                 proc.signals.raise(1u64 << SIGKILL);
-                proc.state.0 = ProcessState::Runnable;
+                set_state(proc, ProcessState::Runnable, "signals");
                 proc.trace.clear_stop();
                 drop(g);
                 reenqueue_runnable(target);
                 return Ok(());
             }
             ProcessState::CgroupThrottled => {
-                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
+                set_state(
+                    proc,
+                    ProcessState::KilledBySignal { signal: SIGKILL },
+                    "signals",
+                );
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
                         &mut proc.fds,
@@ -195,7 +203,11 @@ pub fn send_signal_with_info(
                     } => (runtime_ns, period_ns),
                     _ => (0, 0),
                 };
-                proc.state.0 = ProcessState::KilledBySignal { signal: SIGKILL };
+                set_state(
+                    proc,
+                    ProcessState::KilledBySignal { signal: SIGKILL },
+                    "signals",
+                );
                 let home = proc.sched.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -271,7 +283,7 @@ pub fn send_signal_with_info(
     let sfd_waiters = proc.wait_sites.signalfd_waiters.drain();
 
     if proc.state.0 == ProcessState::Parked && (blocked & (1u64 << signal)) == 0 {
-        proc.state.0 = ProcessState::Runnable;
+        set_state(proc, ProcessState::Runnable, "signals");
         let home = proc.sched.home_cpu;
         drop(g);
         {

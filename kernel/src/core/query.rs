@@ -14,23 +14,41 @@ pub fn with_target_vmspace(
     g.processes.get(&target).and_then(|p| p.vmspace())
 }
 
-pub fn snapshot_user_regs(target: Pid) -> Option<crate::ptrace::UserRegs> {
-    GLOBAL
-        .lock()
-        .processes
-        .get(&target)
-        .and_then(|p| p.trace.saved_regs())
+pub fn find_stale_scheduled(pid: Pid) -> Option<(&'static str, usize)> {
+    for (cpu, q_lock) in CPU_QUEUES.iter().enumerate() {
+        let q = q_lock.lock();
+        if q.current == Some(pid) {
+            return Some(("current", cpu));
+        }
+        if q.runnable.contains_pid(pid) {
+            return Some(("runqueue", cpu));
+        }
+    }
+    None
 }
 
-pub fn write_user_regs(target: Pid, regs: &crate::ptrace::UserRegs) -> bool {
-    let mut g = GLOBAL.lock();
-    match g.processes.get_mut(&target) {
-        Some(p) => {
-            p.trace.set_saved_regs(*regs);
-            true
+pub fn inode_has_shared_writable_mapping(inode_id: u64) -> bool {
+    use crate::process_model::{VmaBacking, VmaFlags};
+    let spaces: alloc::vec::Vec<_> = {
+        let g = GLOBAL.lock();
+        g.processes
+            .values()
+            .filter_map(|p| p.addr_space.clone())
+            .collect()
+    };
+    for addr_space in spaces {
+        let mmap = addr_space.mmap.lock();
+        for v in &mmap.vmas {
+            if v.flags.contains(VmaFlags::SHARED) && v.prot.contains(frame::mm::vm::Perms::WRITE) {
+                if let VmaBacking::File { inode, .. } = &v.backing {
+                    if inode.inode_id() == inode_id {
+                        return true;
+                    }
+                }
+            }
         }
-        None => false,
     }
+    false
 }
 
 pub fn sched_class_of_pid(pid: Pid) -> Option<crate::process_model::SchedClass> {
@@ -58,19 +76,39 @@ pub fn pi_held_keys(pid: Pid) -> alloc::vec::Vec<cyphera_kapi::WaitKey> {
         .unwrap_or_default()
 }
 
-pub struct PiMut<'a> {
-    pub blocked_on: &'a mut Option<cyphera_kapi::WaitKey>,
-    pub held: &'a mut alloc::vec::Vec<cyphera_kapi::WaitKey>,
+pub fn set_pi_blocked_on(pid: Pid, key: cyphera_kapi::WaitKey) {
+    if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
+        p.pi_blocked_on = Some(key);
+    }
 }
 
-pub fn with_pi_mut<R>(pid: Pid, f: impl FnOnce(PiMut<'_>) -> R) -> Option<R> {
-    let mut g = GLOBAL.lock();
-    g.processes.get_mut(&pid).map(|p| {
-        f(PiMut {
-            blocked_on: &mut p.pi_blocked_on,
-            held: &mut p.pi_held,
-        })
-    })
+pub fn clear_pi_blocked_on(pid: Pid) {
+    if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
+        p.pi_blocked_on = None;
+    }
+}
+
+pub fn add_pi_held(pid: Pid, key: cyphera_kapi::WaitKey) {
+    if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
+        if !p.pi_held.contains(&key) {
+            p.pi_held.push(key);
+        }
+    }
+}
+
+pub fn remove_pi_held(pid: Pid, key: cyphera_kapi::WaitKey) {
+    if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
+        p.pi_held.retain(|k| *k != key);
+    }
+}
+
+pub fn pi_acquired(pid: Pid, key: cyphera_kapi::WaitKey) {
+    if let Some(p) = GLOBAL.lock().processes.get_mut(&pid) {
+        p.pi_blocked_on = None;
+        if !p.pi_held.contains(&key) {
+            p.pi_held.push(key);
+        }
+    }
 }
 
 pub fn process_pid_ns(pid: Pid) -> Option<Arc<crate::process_model::PidNamespace>> {

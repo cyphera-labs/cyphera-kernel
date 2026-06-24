@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::registers::control::Cr3;
 
-const MAX_CPUS: usize = 64;
+use crate::cpu::per_cpu::MAX_CPUS;
 
 #[repr(C, align(64))]
 struct Slot {
@@ -40,19 +40,23 @@ pub fn shootdown_all() {
     if mask.count_ones() <= 1 {
         return;
     }
-    let me = crate::intr::lapic::local_apic_id() as u32;
+    let me = crate::cpu::per_cpu::current_cpu_id();
 
     let mut expected = [0u64; MAX_CPUS];
     for cpu in 0..MAX_CPUS as u32 {
         if mask & (1u64 << cpu) == 0 || cpu == me {
             continue;
         }
+        let apic = match crate::cpu::cpu_registry::apic_for_index(cpu) {
+            Some(a) => a,
+            None => continue,
+        };
         let prev = PER_CPU[cpu as usize]
             .request_seqno
             .fetch_add(1, Ordering::AcqRel);
         expected[cpu as usize] = prev + 1;
         crate::intr::lapic::send_ipi(
-            cpu as u8,
+            apic,
             crate::intr::lapic::TLB_SHOOTDOWN_VECTOR,
             crate::intr::lapic::IpiKind::Fixed,
         );
@@ -108,7 +112,7 @@ fn disable_irqs() {
 pub fn handle_shootdown_ipi() {
     flush_local();
     crate::intr::lapic::eoi();
-    let me = crate::intr::lapic::local_apic_id() as usize;
+    let me = crate::cpu::per_cpu::current_cpu_id() as usize;
     if me >= MAX_CPUS {
         return;
     }

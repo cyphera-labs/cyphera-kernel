@@ -213,6 +213,37 @@ pub extern "C" fn _start() -> ! {
     }
     log("ext4 mkdirat/unlinkat/rmdir OK\n");
 
+    let ra: &[u8] = b"/mnt/r_a\0";
+    let rb: &[u8] = b"/mnt/r_b\0";
+    let fd = sys_openat(AT_FDCWD, ra.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 {
+        log("ext4 rename: create r_a failed\n");
+        sys_exit(1);
+    }
+    sys_write(fd as u64, b"AAA".as_ptr(), 3);
+    sys_close(fd as u64);
+    let fd = sys_openat(AT_FDCWD, rb.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 {
+        log("ext4 rename: create r_b failed\n");
+        sys_exit(1);
+    }
+    sys_write(fd as u64, b"BBB".as_ptr(), 3);
+    sys_close(fd as u64);
+    if sys_renameat2(AT_FDCWD, ra.as_ptr(), AT_FDCWD, rb.as_ptr(), 0) != 0 {
+        log("ext4 rename overwrite failed\n");
+        sys_exit(1);
+    }
+    let mut rob = [0u8; 4];
+    if read_path(rb, &mut rob[..3]) != 3 || &rob[..3] != b"AAA" {
+        log("ext4 rename: dest content not overwritten\n");
+        sys_exit(1);
+    }
+    if sys_openat(AT_FDCWD, ra.as_ptr(), O_RDONLY, 0) != -2 {
+        log("ext4 rename: source still present after move\n");
+        sys_exit(1);
+    }
+    log("ext4 rename overwrites dest (no duplicate entry) OK\n");
+
     let big_path: &[u8; 13] = b"/mnt/grown\0\0\0";
     let fd = sys_openat(
         AT_FDCWD,
@@ -515,6 +546,21 @@ fn sys_openat(dirfd: i64, pathname: *const u8, flags: u64, mode: u64) -> i64 {
             "syscall",
             in("rax") 257u64, in("rdi") dirfd, in("rsi") pathname,
             in("rdx") flags, in("r10") mode,
+            lateout("rax") r, out("rcx") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    r
+}
+
+#[inline(never)]
+fn sys_renameat2(od: i64, op: *const u8, nd: i64, np: *const u8, flags: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") 316u64, in("rdi") od, in("rsi") op,
+            in("rdx") nd, in("r10") np, in("r8") flags,
             lateout("rax") r, out("rcx") _, out("r11") _,
             options(nostack),
         );

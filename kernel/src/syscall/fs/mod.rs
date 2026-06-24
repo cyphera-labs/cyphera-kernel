@@ -5,8 +5,8 @@ use cyphera_kapi::Errno;
 
 use crate::core as sched;
 use crate::errno::{
-    EACCES, EBADF, EBUSY, EFAULT, EINVAL, EIO, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOSYS,
-    ENOTDIR, EPERM, ERANGE,
+    EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EINVAL, EIO, EISDIR, EMFILE, ENAMETOOLONG,
+    ENODEV, ENOENT, ENOSYS, ENOTDIR, EPERM, ERANGE,
 };
 use crate::vfs::blocking::{IoAttempt, block_io};
 use crate::vfs::{self, Inode, InodeKind, OpenFile, OpenFlags, Stat, TimeSpec, Whence};
@@ -95,7 +95,7 @@ fn resolve_at_inode(dirfd: i64, path: &str) -> Result<Arc<dyn Inode>, i64> {
     } else {
         let f = sched::with_current_fds(|t| t.get(dirfd as i32)).ok_or(EBADF)?;
         if f.inode.kind() != InodeKind::Directory {
-            return Err(-20);
+            return Err(ENOTDIR);
         }
         f.inode.clone()
     };
@@ -118,12 +118,15 @@ pub(super) fn resolve_at_parent(
     } else {
         let f = sched::with_current_fds(|t| t.get(dirfd as i32)).ok_or(EBADF)?;
         if f.inode.kind() != InodeKind::Directory {
-            return Err(-20);
+            return Err(ENOTDIR);
         }
         (f.inode.clone(), path)
     };
     let (parent, leaf) =
         vfs::path::resolve_parent(&ctx, &start_inode, search_path).map_err(|e| e.as_neg_i64())?;
+    if ctx.parent_mount_flags(&start_inode, search_path) & vfs::mount::MS_RDONLY != 0 {
+        return Err(crate::errno::EROFS);
+    }
     Ok((parent, leaf.to_string()))
 }
 
@@ -173,6 +176,29 @@ fn resolve_path(dirfd: u64, pathname: u64, follow: bool) -> Result<Arc<dyn Inode
     } else {
         vfs::path::resolve_no_follow(&ctx, &ctx.root, &normalized).map_err(|e| e.as_neg_i64())
     }
+}
+
+pub(super) fn fd_mount_is_rdonly(file: &Arc<vfs::OpenFile>) -> bool {
+    file._mount_guard.as_ref().map(|g| g.flags()).unwrap_or(0) & vfs::mount::MS_RDONLY != 0
+}
+
+fn resolve_path_writable(dirfd: u64, pathname: u64, follow: bool) -> Result<Arc<dyn Inode>, i64> {
+    let mut path_buf = [0u8; PATH_MAX];
+    let len =
+        frame::user::copy_cstr_from_user(pathname, &mut path_buf).map_err(|_| ENAMETOOLONG)?;
+    let path = core::str::from_utf8(&path_buf[..len]).map_err(|_| EINVAL)?;
+    let normalized = resolve_user_path(dirfd as i64, path)?;
+    let ctx = vfs::path::Context::current();
+    let (inode, tag) = if follow {
+        vfs::path::resolve_with_mount(&ctx, &ctx.root, &normalized).map_err(|e| e.as_neg_i64())?
+    } else {
+        vfs::path::resolve_no_follow_with_mount(&ctx, &ctx.root, &normalized)
+            .map_err(|e| e.as_neg_i64())?
+    };
+    if tag.map(|t| t.flags()).unwrap_or(0) & vfs::mount::MS_RDONLY != 0 {
+        return Err(crate::errno::EROFS);
+    }
+    Ok(inode)
 }
 
 fn copy_path(pathname: u64) -> Result<alloc::string::String, i64> {

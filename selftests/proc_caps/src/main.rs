@@ -8,7 +8,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     sys_exit(1);
 }
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+const CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 const CAP_SYS_CHROOT: u32 = 18;
 const CAP_NET_BIND_SERVICE: u32 = 10;
@@ -107,7 +107,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn capget_self() -> (u64, u64, u64) {
-    let mut hdr: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    let mut hdr: [u32; 2] = [CAPABILITY_VERSION_3, 0];
     let mut data: [u32; 6] = [0; 6];
     let r = sys_capget(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64);
     if r != 0 {
@@ -120,7 +120,7 @@ fn capget_self() -> (u64, u64, u64) {
 }
 
 fn capset_self(eff: u64, perm: u64, inh: u64) -> i64 {
-    let mut hdr: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    let mut hdr: [u32; 2] = [CAPABILITY_VERSION_3, 0];
     let data: [u32; 6] = [
         eff as u32,
         perm as u32,

@@ -229,6 +229,11 @@ path = "tests/subsystem/pipe_size.rs"
 harness = false
 
 [[test]]
+name = "remount"
+path = "tests/subsystem/remount.rs"
+harness = false
+
+[[test]]
 name = "argv"
 path = "tests/subsystem/argv.rs"
 harness = false
