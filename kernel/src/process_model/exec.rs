@@ -12,13 +12,14 @@ pub fn exec_current(
     exe_path: &[u8],
     argv: &[&[u8]],
     envp: &[&[u8]],
-    post_euid: u32,
-    post_egid: u32,
-    secure: bool,
+    cred_transition: &crate::security::setid::ExecCredTransition,
     exe_inode: Option<Arc<dyn crate::vfs::Inode>>,
     exe_mnt_flags: u64,
     tf: &mut TrapFrame,
 ) -> cyphera_kapi::KResult<()> {
+    let post_euid = cred_transition.post_euid;
+    let post_egid = cred_transition.post_egid;
+    let secure = cred_transition.secure;
     use frame::mm::VirtAddr;
     use frame::mm::vm::Perms;
 
@@ -111,6 +112,7 @@ pub fn exec_current(
     }
 
     let proc_pid = pid;
+    let closed_cloexec: Vec<Arc<crate::vfs::OpenFile>>;
     {
         let mut g = GLOBAL.lock();
         let Some(proc) = g.processes.get_mut(&proc_pid) else {
@@ -157,7 +159,7 @@ pub fn exec_current(
         proc.sigactions = Arc::new(frame::sync::SpinIrq::new(
             [crate::process_model::SigAction::default(); NSIG],
         ));
-        proc.signals.set_pending(0);
+        proc.signals.reset_for_exec();
         if proc.trace.is_traced() {
             if proc.trace.options() & crate::ptrace::PTRACE_O_TRACEEXEC != 0 {
                 let msg = proc.pid.raw() as u64;
@@ -171,7 +173,6 @@ pub fn exec_current(
         } else {
             proc.trace.clear_pending_event_stop();
         }
-        proc.signals.reset_siginfo();
         proc.signals
             .set_altstack(crate::core::signal::AltStack::disabled());
         proc.memory.set_tls_base(0);
@@ -180,11 +181,24 @@ pub fn exec_current(
         proc.signals.set_itimer_deadline(0);
         let key = (proc.pid.raw() as u64) | (1u64 << 63);
         crate::core::timeout::cancel_callback(key);
+        let timer_ids = proc.timers.ids();
+        proc.timers.clear();
+        crate::syscall::posix_timer::cancel_callbacks(proc.pid, &timer_ids);
         proc.identity.set_cmdline(cmdline);
         proc.identity.set_exe_path(exe_path.to_vec());
         proc.identity.set_exe_inode(exe_inode);
         proc.identity.set_exe_mnt_flags(exe_mnt_flags);
-        proc.fds.close_cloexec();
+        proc.lifecycle.mark_execd();
+
+        {
+            let mut creds = proc.creds.lock();
+            crate::security::setid::apply_exec_transition(&mut creds, cred_transition);
+        }
+        proc.security
+            .set_dumpable(if cred_transition.secure { 0 } else { 1 });
+        proc.security.set_keep_caps(false);
+
+        closed_cloexec = proc.fds.close_cloexec();
 
         *tf = TrapFrame {
             rax: 0,
@@ -208,6 +222,7 @@ pub fn exec_current(
             r11: 0,
         };
     }
+    drop(closed_cloexec);
 
     drain_vfork_done(pid);
 

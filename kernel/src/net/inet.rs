@@ -92,6 +92,7 @@ pub struct InetSocket {
     ns: Arc<crate::net::NetNamespace>,
     peer: SpinIrq<Option<IpEndpoint>>,
     bound_local: SpinIrq<Option<IpListenEndpoint>>,
+    bound_port_key: SpinIrq<Option<crate::net::PortKey>>,
     wait: WaitQueue,
     pub opts: SpinIrq<SockOpts>,
 }
@@ -121,6 +122,7 @@ impl InetSocket {
             ns,
             peer: SpinIrq::new(None),
             bound_local: SpinIrq::new(None),
+            bound_port_key: SpinIrq::new(None),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts::fresh()),
         }))
@@ -139,6 +141,7 @@ impl InetSocket {
             ns,
             peer: SpinIrq::new(None),
             bound_local: SpinIrq::new(None),
+            bound_port_key: SpinIrq::new(None),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts::fresh()),
         }))
@@ -277,13 +280,17 @@ impl InetSocket {
             };
         }
         {
-            let o = self.opts.lock();
-            if o.ever_established {
-                return EISCONN;
-            }
-            if o.connect_initiated {
+            let mut o = self.opts.lock();
+            if o.connect_initiated && !o.so_error_seen {
+                o.connect_initiated = false;
+                o.ever_established = false;
+                o.so_error_seen = true;
                 return ECONNREFUSED;
             }
+            o.connect_initiated = false;
+            o.ever_established = false;
+            o.so_error = 0;
+            o.so_error_seen = false;
         }
         if let Err(e) = self.connect_endpoint(ep) {
             return e.as_neg_i64();
@@ -395,6 +402,7 @@ impl InetSocket {
             ns: self.ns.clone(),
             peer: SpinIrq::new(remote),
             bound_local: SpinIrq::new(Some(local)),
+            bound_port_key: SpinIrq::new(None),
             wait: WaitQueue::new(),
             opts: SpinIrq::new(SockOpts {
                 ever_established: true,
@@ -785,6 +793,9 @@ impl Inode for InetSocket {
 
     fn on_close(&self, _flags: OpenFlags) {
         self.ns.unregister_inet(self);
+        if let Some(k) = self.bound_port_key.lock().take() {
+            self.ns.release_port(k);
+        }
         let mut st = self.state.lock();
         self.ns.with_stack(|s| match &*st {
             SockState::Tcp(r) => {
@@ -839,9 +850,55 @@ impl super::Socket for InetSocket {
             },
             port: ep.port,
         };
+        if listen.port != 0 {
+            let reuse = {
+                let o = self.opts.lock();
+                o.reuseaddr || o.reuseport
+            };
+            let key = crate::net::PortKey {
+                proto: self.proto() as u8,
+                addr: listen.addr,
+                port: listen.port,
+            };
+            if !self.ns.try_reserve_port(key, reuse) {
+                return crate::errno::EADDRINUSE;
+            }
+            let prev = self.bound_port_key.lock().replace(key);
+            if let Some(old) = prev {
+                self.ns.release_port(old);
+            }
+        }
         match self.bind_endpoint(listen) {
-            Ok(()) => 0,
-            Err(e) => e.as_neg_i64(),
+            Ok(()) => {
+                if listen.port == 0 {
+                    let actual = self.bound_local.lock().and_then(|le| {
+                        if le.port != 0 {
+                            Some((le.addr, le.port))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((addr, port)) = actual {
+                        let key = crate::net::PortKey {
+                            proto: self.proto() as u8,
+                            addr,
+                            port,
+                        };
+                        let _ = self.ns.try_reserve_port(key, false);
+                        let prev = self.bound_port_key.lock().replace(key);
+                        if let Some(old) = prev {
+                            self.ns.release_port(old);
+                        }
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                if let Some(k) = self.bound_port_key.lock().take() {
+                    self.ns.release_port(k);
+                }
+                e.as_neg_i64()
+            }
         }
     }
 

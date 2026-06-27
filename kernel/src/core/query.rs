@@ -38,7 +38,7 @@ pub fn inode_has_shared_writable_mapping(inode_id: u64) -> bool {
     };
     for addr_space in spaces {
         let mmap = addr_space.mmap.lock();
-        for v in &mmap.vmas {
+        for v in mmap.vmas() {
             if v.flags.contains(VmaFlags::SHARED) && v.prot.contains(frame::mm::vm::Perms::WRITE) {
                 if let VmaBacking::File { inode, .. } = &v.backing {
                     if inode.inode_id() == inode_id {
@@ -57,6 +57,36 @@ pub fn sched_class_of_pid(pid: Pid) -> Option<crate::process_model::SchedClass> 
         .processes
         .get(&pid)
         .map(|p| p.sched.sched_class)
+}
+
+pub fn futex_wake_priority(pid: Pid) -> u16 {
+    GLOBAL
+        .lock()
+        .processes
+        .get(&pid)
+        .map(|p| p.sched.sched_class.band())
+        .unwrap_or(0)
+}
+
+pub fn pid_is_terminating(pid: Pid) -> bool {
+    let g = GLOBAL.lock();
+    match g.processes.get(&pid) {
+        None => true,
+        Some(p) => {
+            p.lifecycle.pending_exit().is_some()
+                || matches!(
+                    p.state.0,
+                    ProcessState::Zombie(_)
+                        | ProcessState::KilledByFault { .. }
+                        | ProcessState::KilledBySignal { .. }
+                )
+        }
+    }
+}
+
+pub fn park_site_of(pid: Pid) -> Option<&'static str> {
+    let g = GLOBAL.lock();
+    g.processes.get(&pid).and_then(|p| p.park_site)
 }
 
 pub fn pi_blocked_on(pid: Pid) -> Option<cyphera_kapi::WaitKey> {

@@ -1302,6 +1302,7 @@ impl Inode for Ext4Inode {
             gid: raw.gid(),
             inode_id: self.inode_id(),
             dev_id: self.fs.dev_id,
+            rdev: 0,
             blksize: self.fs.block_size,
             blocks: size.div_ceil(512),
             atime: TimeSpec {

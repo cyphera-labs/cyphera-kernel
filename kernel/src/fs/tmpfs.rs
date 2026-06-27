@@ -42,10 +42,6 @@ pub struct TmpfsInode {
     uid: AtomicU32,
     gid: AtomicU32,
     nlink: AtomicU32,
-    fifo_readers: AtomicU32,
-    fifo_writers: AtomicU32,
-    fifo_read_waiters: crate::core::wait::WaitQueue,
-    fifo_write_waiters: crate::core::wait::WaitQueue,
     fifo_open_read_waiters: crate::core::wait::WaitQueue,
     fifo_open_write_waiters: crate::core::wait::WaitQueue,
     rdev: AtomicU64,
@@ -59,12 +55,18 @@ pub struct TmpfsInode {
     seals: AtomicU32,
 }
 
+impl Drop for TmpfsInode {
+    fn drop(&mut self) {
+        crate::fs::pagecache::drop_inode(self.id);
+    }
+}
+
 enum TmpfsData {
     Regular(PagedFile),
     Directory(BTreeMap<String, Arc<dyn Inode>>),
     Symlink(String),
     CharDevice,
-    Fifo(alloc::collections::VecDeque<u8>),
+    Fifo(Arc<crate::vfs::pipe::Pipe>),
 }
 
 const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
@@ -156,8 +158,6 @@ impl Drop for PagedFile {
     }
 }
 
-const DEFAULT_FIFO_CAPACITY: usize = 4096;
-
 fn default_mode_for(kind: InodeKind) -> u16 {
     match kind {
         InodeKind::Directory => 0o755,
@@ -209,7 +209,7 @@ impl TmpfsInode {
     pub fn new_fifo() -> Arc<Self> {
         Self::new_with(
             InodeKind::Pipe,
-            TmpfsData::Fifo(alloc::collections::VecDeque::new()),
+            TmpfsData::Fifo(crate::vfs::pipe::Pipe::new()),
         )
     }
 
@@ -227,10 +227,6 @@ impl TmpfsInode {
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             nlink: AtomicU32::new(default_nlink_for(kind)),
-            fifo_readers: AtomicU32::new(0),
-            fifo_writers: AtomicU32::new(0),
-            fifo_read_waiters: crate::core::wait::WaitQueue::new(),
-            fifo_write_waiters: crate::core::wait::WaitQueue::new(),
             fifo_open_read_waiters: crate::core::wait::WaitQueue::new(),
             fifo_open_write_waiters: crate::core::wait::WaitQueue::new(),
             rdev: AtomicU64::new(0),
@@ -312,7 +308,7 @@ impl Inode for TmpfsInode {
             TmpfsData::Directory(_) => 0,
             TmpfsData::Symlink(s) => s.len() as u64,
             TmpfsData::CharDevice => 0,
-            TmpfsData::Fifo(ring) => ring.len() as u64,
+            TmpfsData::Fifo(pipe) => pipe.buffered() as u64,
         };
         drop(g);
         Stat {
@@ -324,6 +320,7 @@ impl Inode for TmpfsInode {
             gid: self.gid.load(Ordering::Acquire),
             inode_id: self.id,
             dev_id: self.dev_id,
+            rdev: 0,
             blksize: 4096,
             blocks: size.div_ceil(512),
             atime: *self.atime.lock(),
@@ -361,30 +358,16 @@ impl Inode for TmpfsInode {
     }
 
     fn poll(&self) -> PollMask {
-        let g = self.state.lock();
-        let TmpfsData::Fifo(ring) = &*g else {
-            return PollMask::IN | PollMask::OUT;
+        let pipe = match self.fifo_pipe() {
+            Some(p) => p,
+            None => return PollMask::IN | PollMask::OUT,
         };
-        let buffered = !ring.is_empty();
-        let full = ring.len() >= DEFAULT_FIFO_CAPACITY;
-        drop(g);
-        let mut mask = PollMask::empty();
-        if buffered || self.fifo_writers.load(Ordering::Acquire) == 0 {
-            mask |= PollMask::IN;
-        }
-        if !full || self.fifo_readers.load(Ordering::Acquire) == 0 {
-            mask |= PollMask::OUT;
-        }
-        if self.fifo_writers.load(Ordering::Acquire) == 0 && !buffered {
-            mask |= PollMask::HUP;
-        }
-        mask
+        pipe.poll()
     }
 
     fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
-        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
-            f(&self.fifo_read_waiters);
-            f(&self.fifo_write_waiters);
+        if let Some(pipe) = self.fifo_pipe() {
+            pipe.for_each_wait_queue(f);
         }
     }
 
@@ -400,16 +383,21 @@ impl Inode for TmpfsInode {
             TmpfsData::Symlink(_) => Err(Errno::INVAL),
             TmpfsData::Directory(_) => Err(Errno::ISDIR),
             TmpfsData::CharDevice => Err(Errno::NOSYS),
-            TmpfsData::Fifo(_) => {
+            TmpfsData::Fifo(pipe) => {
+                let pipe = pipe.clone();
                 drop(g);
-                self.fifo_read(buf, false)
+                let n = pipe.read_at(offset, buf)?;
+                self.touch_atime();
+                Ok(n)
             }
         }
     }
 
     fn read_at_with_flags(&self, offset: u64, buf: &mut [u8], flags: OpenFlags) -> KResult<usize> {
-        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
-            return self.fifo_read(buf, flags.contains(OpenFlags::NONBLOCK));
+        if let Some(pipe) = self.fifo_pipe() {
+            let n = pipe.read_at_with_flags(offset, buf, flags)?;
+            self.touch_atime();
+            return Ok(n);
         }
         self.read_at(offset, buf)
     }
@@ -436,9 +424,12 @@ impl Inode for TmpfsInode {
                 crate::fs::pagecache::write_through(self.id, offset, &buf[..written]);
                 Ok(written)
             }
-            TmpfsData::Fifo(_) => {
+            TmpfsData::Fifo(pipe) => {
+                let pipe = pipe.clone();
                 drop(g);
-                self.fifo_write(buf, false)
+                let n = pipe.write_at(offset, buf)?;
+                self.touch_mtime();
+                Ok(n)
             }
             TmpfsData::Symlink(_) | TmpfsData::Directory(_) | TmpfsData::CharDevice => {
                 Err(Errno::ISDIR)
@@ -447,8 +438,10 @@ impl Inode for TmpfsInode {
     }
 
     fn write_at_with_flags(&self, offset: u64, buf: &[u8], flags: OpenFlags) -> KResult<usize> {
-        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
-            return self.fifo_write(buf, flags.contains(OpenFlags::NONBLOCK));
+        if let Some(pipe) = self.fifo_pipe() {
+            let n = pipe.write_at_with_flags(offset, buf, flags)?;
+            self.touch_mtime();
+            return Ok(n);
         }
         self.write_at(offset, buf)
     }
@@ -914,18 +907,29 @@ impl Inode for TmpfsInode {
         Ok(())
     }
 
-    fn on_open(&self, flags: OpenFlags) {
-        if !matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
-            return;
+    fn check_open(&self, flags: OpenFlags) -> KResult<()> {
+        let pipe = match self.fifo_pipe() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if flags.is_writable()
+            && !flags.is_readable()
+            && flags.contains(OpenFlags::NONBLOCK)
+            && pipe.readers() == 0
+        {
+            return Err(Errno::NXIO);
         }
+        Ok(())
+    }
+
+    fn on_open(&self, flags: OpenFlags) {
+        let pipe = match self.fifo_pipe() {
+            Some(p) => p,
+            None => return,
+        };
         let readable = flags.is_readable();
         let writable = flags.is_writable();
-        if writable {
-            self.fifo_writers.fetch_add(1, Ordering::AcqRel);
-        }
-        if readable {
-            self.fifo_readers.fetch_add(1, Ordering::AcqRel);
-        }
+        pipe.bump_open(readable, writable);
         if writable {
             self.fifo_open_read_waiters.wake_all();
         }
@@ -939,7 +943,7 @@ impl Inode for TmpfsInode {
         if readable {
             loop {
                 self.fifo_open_read_waiters.enqueue(cur);
-                if self.fifo_writers.load(Ordering::Acquire) > 0 {
+                if pipe.writers() > 0 {
                     self.fifo_open_read_waiters.dequeue(cur);
                     return;
                 }
@@ -954,7 +958,7 @@ impl Inode for TmpfsInode {
         } else if writable {
             loop {
                 self.fifo_open_write_waiters.enqueue(cur);
-                if self.fifo_readers.load(Ordering::Acquire) > 0 {
+                if pipe.readers() > 0 {
                     self.fifo_open_write_waiters.dequeue(cur);
                     return;
                 }
@@ -970,15 +974,8 @@ impl Inode for TmpfsInode {
     }
 
     fn on_close(&self, flags: OpenFlags) {
-        if matches!(*self.state.lock(), TmpfsData::Fifo(_)) {
-            if flags.is_writable() {
-                self.fifo_writers.fetch_sub(1, Ordering::AcqRel);
-                self.fifo_read_waiters.wake_all();
-            }
-            if flags.is_readable() {
-                self.fifo_readers.fetch_sub(1, Ordering::AcqRel);
-                self.fifo_write_waiters.wake_all();
-            }
+        if let Some(pipe) = self.fifo_pipe() {
+            pipe.on_close(flags);
         }
     }
 
@@ -1049,57 +1046,10 @@ impl Inode for TmpfsInode {
 }
 
 impl TmpfsInode {
-    fn fifo_read(&self, buf: &mut [u8], nonblock: bool) -> KResult<usize> {
-        use crate::vfs::blocking::IoAttempt;
-        crate::vfs::blocking::block_io("fifo_read", &self.fifo_read_waiters, nonblock, None, || {
-            let mut g = self.state.lock();
-            let TmpfsData::Fifo(ring) = &mut *g else {
-                return IoAttempt::Err(Errno::NOSYS);
-            };
-            if !ring.is_empty() {
-                let n = buf.len().min(ring.len());
-                for slot in &mut buf[..n] {
-                    *slot = ring.pop_front().unwrap();
-                }
-                drop(g);
-                self.fifo_write_waiters.wake_all();
-                self.touch_atime();
-                IoAttempt::Ready(n)
-            } else if self.fifo_writers.load(Ordering::Acquire) == 0 {
-                IoAttempt::Ready(0)
-            } else {
-                IoAttempt::WouldBlock
-            }
-        })
-    }
-
-    fn fifo_write(&self, buf: &[u8], nonblock: bool) -> KResult<usize> {
-        use crate::vfs::blocking::IoAttempt;
-        crate::vfs::blocking::block_io(
-            "fifo_write",
-            &self.fifo_write_waiters,
-            nonblock,
-            None,
-            || {
-                let mut g = self.state.lock();
-                let TmpfsData::Fifo(ring) = &mut *g else {
-                    return IoAttempt::Err(Errno::NOSYS);
-                };
-                if self.fifo_readers.load(Ordering::Acquire) == 0 {
-                    return IoAttempt::Err(Errno::PIPE);
-                }
-                let room = DEFAULT_FIFO_CAPACITY.saturating_sub(ring.len());
-                if room > 0 {
-                    let n = buf.len().min(room);
-                    ring.extend(buf[..n].iter().copied());
-                    drop(g);
-                    self.fifo_read_waiters.wake_all();
-                    self.touch_mtime();
-                    IoAttempt::Ready(n)
-                } else {
-                    IoAttempt::WouldBlock
-                }
-            },
-        )
+    fn fifo_pipe(&self) -> Option<Arc<crate::vfs::pipe::Pipe>> {
+        match &*self.state.lock() {
+            TmpfsData::Fifo(pipe) => Some(pipe.clone()),
+            _ => None,
+        }
     }
 }

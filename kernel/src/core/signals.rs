@@ -56,6 +56,212 @@ pub fn send_signal(target: Pid, signal: u32) -> cyphera_kapi::KResult<()> {
     send_signal_with_info(target, signal, info)
 }
 
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_DUMPED: i32 = 3;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
+
+pub(crate) fn notify_parent_status_change(child_tgid: Pid, code: i32, status: i32) {
+    let (parent, tracer) = {
+        let g = GLOBAL.lock();
+        match g.processes.get(&child_tgid) {
+            Some(p) => (p.parent, p.trace.tracer_pid()),
+            None => return,
+        }
+    };
+    let local_pid = process_pid_ns(child_tgid)
+        .map(|ns| ns.host_to_local_in(child_tgid))
+        .unwrap_or(child_tgid.0);
+    let info = crate::core::signal::SigInfo::for_child(local_pid, status, code);
+    let mut recipients: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    if let Some(ppid) = parent {
+        recipients.push(ppid);
+    }
+    if let Some(tracer) = tracer {
+        if Some(tracer) != parent {
+            recipients.push(tracer);
+        }
+    }
+    for rpid in recipients {
+        let waiters = {
+            let mut g = GLOBAL.lock();
+            if let Some(pp) = g.processes.get_mut(&rpid) {
+                pp.signals
+                    .enqueue_signal(SIGCHLD, info, rt_sigpending_limit(pp));
+                pp.wait_sites.child_exit.drain()
+            } else {
+                Vec::new()
+            }
+        };
+        for w in waiters {
+            let _ = wake_pid(w);
+        }
+        let _ = wake_pid(rpid);
+    }
+}
+
+fn live_group_members(tgid: Pid) -> alloc::vec::Vec<Pid> {
+    let g = GLOBAL.lock();
+    g.processes
+        .iter()
+        .filter(|(_, p)| {
+            p.tgid == tgid
+                && !matches!(
+                    p.state.0,
+                    ProcessState::Zombie(_)
+                        | ProcessState::KilledByFault { .. }
+                        | ProcessState::KilledBySignal { .. }
+                )
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+pub fn send_group_signal(
+    tgid: Pid,
+    signal: u32,
+    info: crate::core::signal::PendingSigInfo,
+) -> cyphera_kapi::KResult<()> {
+    if signal == 0 || signal as usize >= NSIG {
+        return Err(cyphera_kapi::Errno::INVAL);
+    }
+    let members = live_group_members(tgid);
+    if members.is_empty() {
+        return Err(cyphera_kapi::Errno::SRCH);
+    }
+
+    if signal == SIGKILL {
+        for m in members {
+            let _ = send_signal_with_info(m, SIGKILL, info);
+        }
+        return Ok(());
+    }
+
+    if (1u64 << signal) & STOP_SIGNAL_MASK != 0 {
+        return initiate_group_stop(tgid, signal, info, &members);
+    }
+
+    if signal == SIGCONT {
+        return continue_group(tgid, info, &members);
+    }
+
+    let chosen = pick_group_target(&members, signal).unwrap_or(members[0]);
+    send_signal_with_info(chosen, signal, info)
+}
+
+fn pick_group_target(members: &[Pid], signal: u32) -> Option<Pid> {
+    let bit = 1u64 << signal;
+    let g = GLOBAL.lock();
+    let mut fallback = None;
+    for m in members {
+        if let Some(p) = g.processes.get(m) {
+            if fallback.is_none() {
+                fallback = Some(*m);
+            }
+            if p.signals.blocked() & bit == 0 {
+                return Some(*m);
+            }
+        }
+    }
+    fallback
+}
+
+fn initiate_group_stop(
+    tgid: Pid,
+    signal: u32,
+    info: crate::core::signal::PendingSigInfo,
+    members: &[Pid],
+) -> cyphera_kapi::KResult<()> {
+    let mut to_wake: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    let mut expected = 0u32;
+    {
+        let mut g = GLOBAL.lock();
+        for m in members {
+            if let Some(p) = g.processes.get_mut(m) {
+                if p.state.0 == ProcessState::Stopped {
+                    continue;
+                }
+                p.signals
+                    .enqueue_with_annihilation(signal, info, usize::MAX);
+                expected += 1;
+                if p.state.0 == ProcessState::Parked || p.sched.home_cpu != this_cpu() {
+                    to_wake.push(*m);
+                }
+            }
+        }
+        if let Some(leader) = g.processes.get_mut(&tgid) {
+            leader.signals.clear_group_stop();
+            leader.signals.arm_group_stop(expected);
+        }
+    }
+    if expected == 0 {
+        let last = {
+            let mut g = GLOBAL.lock();
+            g.processes
+                .get_mut(&tgid)
+                .map(|leader| leader.signals.group_stop_arrive())
+                .unwrap_or(false)
+        };
+        if last {
+            notify_parent_status_change(tgid, CLD_STOPPED, SIGSTOP as i32);
+        }
+        return Ok(());
+    }
+    for pid in to_wake {
+        if !wake_pid(pid) {
+            let home = {
+                let g = GLOBAL.lock();
+                g.processes.get(&pid).map(|p| p.sched.home_cpu)
+            };
+            if let Some(home) = home {
+                if home != this_cpu() {
+                    send_resched_ipi(home);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn continue_group(
+    tgid: Pid,
+    info: crate::core::signal::PendingSigInfo,
+    members: &[Pid],
+) -> cyphera_kapi::KResult<()> {
+    let mut any_resumed = false;
+    {
+        let mut g = GLOBAL.lock();
+        if let Some(leader) = g.processes.get_mut(&tgid) {
+            leader.signals.clear_group_stop();
+        }
+        for m in members {
+            if let Some(p) = g.processes.get_mut(m) {
+                p.signals.discard_stop_signals();
+                if p.state.0 != ProcessState::Stopped {
+                    p.signals
+                        .enqueue_with_annihilation(SIGCONT, info, usize::MAX);
+                }
+            }
+        }
+    }
+    for m in members {
+        if request_continue(*m, ContinueReason::JobControl) {
+            any_resumed = true;
+        }
+    }
+    if any_resumed {
+        {
+            let mut g = GLOBAL.lock();
+            if let Some(leader) = g.processes.get_mut(&tgid) {
+                leader.signals.set_continued_latch();
+            }
+        }
+        notify_parent_status_change(tgid, CLD_CONTINUED, SIGCONT as i32);
+    }
+    Ok(())
+}
+
 pub(crate) fn rt_sigpending_limit(p: &Process) -> usize {
     p.rlimits
         .get(RLIMIT_SIGPENDING as usize)
@@ -102,9 +308,14 @@ pub fn send_signal_with_info(
         let mut dying_fds: Option<Arc<crate::vfs::fd::FdTable>> = None;
         let killed_as = proc.addr_space.clone();
         let killed_ipc = proc.namespaces.ipc();
+        let terminal = proc
+            .lifecycle
+            .pending_exit()
+            .cloned()
+            .unwrap_or(ProcessState::KilledBySignal { signal: SIGKILL });
         match proc.state.0 {
             ProcessState::Running => {
-                proc.signals.raise(1u64 << SIGKILL);
+                proc.signals.enqueue_signal(SIGKILL, info, usize::MAX);
                 let home = proc.sched.home_cpu;
                 drop(g);
                 if home != this_cpu() {
@@ -113,7 +324,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Runnable => {
-                proc.signals.raise(1u64 << SIGKILL);
+                proc.signals.enqueue_signal(SIGKILL, info, usize::MAX);
                 let home = proc.sched.home_cpu;
                 drop(g);
                 if home != this_cpu() {
@@ -122,11 +333,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Stopped => {
-                set_state(
-                    proc,
-                    ProcessState::KilledBySignal { signal: SIGKILL },
-                    "signals",
-                );
+                set_state(proc, terminal.clone(), "signals");
                 let home = proc.sched.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -142,7 +349,7 @@ pub fn send_signal_with_info(
                 zombified = true;
             }
             ProcessState::Parked => {
-                proc.signals.raise(1u64 << SIGKILL);
+                proc.signals.enqueue_signal(SIGKILL, info, usize::MAX);
                 set_state(proc, ProcessState::Runnable, "signals");
                 let home = proc.sched.home_cpu;
                 drop(g);
@@ -168,7 +375,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::Traced => {
-                proc.signals.raise(1u64 << SIGKILL);
+                proc.signals.enqueue_signal(SIGKILL, info, usize::MAX);
                 set_state(proc, ProcessState::Runnable, "signals");
                 proc.trace.clear_stop();
                 drop(g);
@@ -176,11 +383,7 @@ pub fn send_signal_with_info(
                 return Ok(());
             }
             ProcessState::CgroupThrottled => {
-                set_state(
-                    proc,
-                    ProcessState::KilledBySignal { signal: SIGKILL },
-                    "signals",
-                );
+                set_state(proc, terminal.clone(), "signals");
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
                         &mut proc.fds,
@@ -203,11 +406,7 @@ pub fn send_signal_with_info(
                     } => (runtime_ns, period_ns),
                     _ => (0, 0),
                 };
-                set_state(
-                    proc,
-                    ProcessState::KilledBySignal { signal: SIGKILL },
-                    "signals",
-                );
+                set_state(proc, terminal.clone(), "signals");
                 let home = proc.sched.home_cpu;
                 if Arc::strong_count(&proc.fds) == 1 {
                     dying_fds = Some(core::mem::replace(
@@ -244,38 +443,33 @@ pub fn send_signal_with_info(
             drain_vfork_done(target);
         }
         if zombified {
-            let parent = {
-                let g = GLOBAL.lock();
-                g.processes.get(&target).and_then(|p| p.parent)
+            let (code, status) = match terminal {
+                ProcessState::Zombie(c) => (CLD_EXITED, c),
+                _ => (CLD_KILLED, SIGKILL as i32),
             };
-            if let Some(ppid) = parent {
-                const CLD_KILLED: i32 = 2;
-                let info_chld =
-                    crate::core::signal::SigInfo::for_child(target.0, SIGKILL as i32, CLD_KILLED);
-                let waiters = {
-                    let mut g = GLOBAL.lock();
-                    if let Some(pp) = g.processes.get_mut(&ppid) {
-                        pp.signals.raise(1u64 << SIGCHLD);
-                        pp.signals.set_siginfo(SIGCHLD as usize, info_chld);
-                        pp.wait_sites.child_exit.drain()
-                    } else {
-                        Vec::new()
-                    }
-                };
-                for w in waiters {
-                    let _ = wake_pid(w);
-                }
-                let _ = wake_pid(ppid);
-            }
+            notify_parent_status_change(target, code, status);
         }
         return Ok(());
     }
 
-    proc.signals.enqueue_signal(signal, info, usize::MAX);
+    proc.signals
+        .enqueue_with_annihilation(signal, info, usize::MAX);
 
-    if signal == SIGCONT && proc.state.0 == ProcessState::Stopped {
+    if signal == SIGCONT {
+        let was_stopped = proc.state.0 == ProcessState::Stopped;
+        let tgid = proc.tgid;
         drop(g);
-        request_continue(target, ContinueReason::JobControl);
+        if was_stopped {
+            request_continue(target, ContinueReason::JobControl);
+            {
+                let mut g = GLOBAL.lock();
+                if let Some(leader) = g.processes.get_mut(&tgid) {
+                    leader.signals.clear_group_stop();
+                    leader.signals.set_continued_latch();
+                }
+            }
+            notify_parent_status_change(tgid, CLD_CONTINUED, SIGCONT as i32);
+        }
         return Ok(());
     }
 
@@ -307,6 +501,7 @@ pub fn send_signal_with_info(
     for w in sfd_waiters {
         let _ = wake_pid(w);
     }
+    crate::ipc::fdtypes::wake_signalfd_poll_waiters();
     Ok(())
 }
 
@@ -361,6 +556,33 @@ pub fn consume_pending_signal(signum: u32) -> (i32, u64) {
     };
     let bit = 1u64 << signum;
     if proc.signals.pending() & bit == 0 {
+        return (0, 0);
+    }
+    let pinfo = proc.signals.dequeue_signal(signum);
+    (pinfo.si_code, pinfo.aux)
+}
+
+pub fn current_signalfd_ready(mask: u64) -> u64 {
+    let pid = current_pid();
+    let g = GLOBAL.lock();
+    g.processes
+        .get(&pid)
+        .map(|p| p.signals.pending() & p.signals.blocked() & mask)
+        .unwrap_or(0)
+}
+
+pub fn consume_signalfd_signal(mask: u64, signum: u32) -> (i32, u64) {
+    if signum == 0 || (signum as usize) >= NSIG {
+        return (0, 0);
+    }
+    let pid = current_pid();
+    let mut g = GLOBAL.lock();
+    let proc = match g.processes.get_mut(&pid) {
+        Some(p) => p,
+        None => return (0, 0),
+    };
+    let bit = 1u64 << signum;
+    if proc.signals.pending() & proc.signals.blocked() & mask & bit == 0 {
         return (0, 0);
     }
     let pinfo = proc.signals.dequeue_signal(signum);

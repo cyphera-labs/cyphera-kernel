@@ -76,11 +76,6 @@ pub fn set_current_brk(addr: u64) -> u64 {
     new
 }
 
-pub fn alloc_current_mmap(len: u64) -> Option<u64> {
-    let len = (len + 0xfff) & !0xfff;
-    current_addr_space().mmap.lock().find_gap(len)
-}
-
 pub fn with_current_mmap_mut<R>(f: impl FnOnce(&mut MmapState) -> R) -> R {
     let pid = current_pid();
     let (addr_space, is_vfork_borrower) = {
@@ -142,8 +137,11 @@ pub fn process_maps(pid: Pid) -> Option<MapsSnapshot> {
     let addr_space = proc.addr_space.as_ref()?;
     let m = addr_space.mmap.lock();
     let brk = *addr_space.brk.lock();
-    let mut vmas = alloc::vec::Vec::with_capacity(m.vmas.len());
-    for v in &m.vmas {
+    let mut vmas = alloc::vec::Vec::with_capacity(m.vmas().len());
+    for v in m.vmas() {
+        if v.flags.contains(crate::process_model::VmaFlags::RESERVED) {
+            continue;
+        }
         let label = match &v.backing {
             crate::process_model::VmaBacking::File { .. } => MapVmaLabel::File,
             crate::process_model::VmaBacking::Shm { .. }

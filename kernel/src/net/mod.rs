@@ -76,6 +76,12 @@ pub trait Socket {
         let _ = (addr_out, len_out);
         crate::errno::EOPNOTSUPP
     }
+    fn recv_creds(&self) -> Option<(i32, u32, u32)> {
+        None
+    }
+    fn recv_src_addr(&self) -> Option<alloc::vec::Vec<u8>> {
+        None
+    }
 }
 
 pub struct NetStack {
@@ -199,11 +205,26 @@ impl NetStack {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PortKey {
+    pub proto: u8,
+    pub addr: Option<IpAddress>,
+    pub port: u16,
+}
+
+#[derive(Copy, Clone)]
+pub struct PortOwner {
+    pub reuse: bool,
+    pub count: u32,
+}
+
 pub struct NetNamespace {
     stack: SpinIrq<NetStack>,
     inet_registry: SpinIrq<BTreeMap<usize, Arc<inet::InetSocket>>>,
     icmp_registry: SpinIrq<BTreeMap<usize, Arc<icmp::IcmpSocket>>>,
     abstract_bound: SpinIrq<BTreeMap<String, Weak<unix::UnixSocket>>>,
+    fs_bound: SpinIrq<BTreeMap<String, Weak<unix::UnixSocket>>>,
+    bound_ports: SpinIrq<BTreeMap<PortKey, PortOwner>>,
     ephemeral_next: AtomicU16,
     owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
 }
@@ -218,6 +239,8 @@ impl NetNamespace {
             inet_registry: SpinIrq::new(BTreeMap::new()),
             icmp_registry: SpinIrq::new(BTreeMap::new()),
             abstract_bound: SpinIrq::new(BTreeMap::new()),
+            fs_bound: SpinIrq::new(BTreeMap::new()),
+            bound_ports: SpinIrq::new(BTreeMap::new()),
             ephemeral_next: AtomicU16::new(32768),
             owner_user_ns,
         })
@@ -305,6 +328,51 @@ impl NetNamespace {
 
     pub fn unbind_abstract(&self, name: &str) {
         self.abstract_bound.lock().remove(name);
+    }
+
+    pub fn try_bind_fs(&self, name: String, sock: Weak<unix::UnixSocket>) -> bool {
+        let mut t = self.fs_bound.lock();
+        if t.get(&name).and_then(|w| w.upgrade()).is_some() {
+            return false;
+        }
+        t.insert(name, sock);
+        true
+    }
+
+    pub fn lookup_fs(&self, name: &str) -> Option<Arc<unix::UnixSocket>> {
+        self.fs_bound.lock().get(name).and_then(|w| w.upgrade())
+    }
+
+    pub fn unbind_fs(&self, name: &str) {
+        self.fs_bound.lock().remove(name);
+    }
+
+    pub fn try_reserve_port(&self, key: PortKey, reuse: bool) -> bool {
+        let mut t = self.bound_ports.lock();
+        match t.get_mut(&key) {
+            Some(owner) => {
+                if owner.reuse && reuse {
+                    owner.count = owner.count.saturating_add(1);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                t.insert(key, PortOwner { reuse, count: 1 });
+                true
+            }
+        }
+    }
+
+    pub fn release_port(&self, key: PortKey) {
+        let mut t = self.bound_ports.lock();
+        if let Some(owner) = t.get_mut(&key) {
+            owner.count = owner.count.saturating_sub(1);
+            if owner.count == 0 {
+                t.remove(&key);
+            }
+        }
     }
 
     pub fn next_ephemeral_port(&self) -> u16 {

@@ -30,14 +30,14 @@ jobs:
     env:
       REF_NAME: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # actions-rust-lang/setup-rust-toolchain respects rust-toolchain.toml,
       # so the channel is whatever's pinned there (currently
       # nightly-2026-03-01). That pin is load-bearing for build
       # reproducibility — see docs/REPRODUCIBLE-BUILDS.md.
       - name: Set up Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           # Don't let the action inject RUSTFLAGS into the env — an env
           # RUSTFLAGS overrides the kernel's .cargo/config.toml
@@ -65,7 +65,7 @@ jobs:
       # with: `gh attestation verify <file> --owner cyphera-labs`.
       - name: Attest kernel ELF build provenance
         id: attest
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v3.0.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v3.0.0
         with:
           subject-path: dist/cyphera-kernel-*.elf
 

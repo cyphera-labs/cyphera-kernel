@@ -14,7 +14,14 @@ pub(crate) fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
         None => return EBADF,
     };
     match file.write(&buffer) {
-        Ok(w) => w as i64,
+        Ok(w) => {
+            if crate::fsnotify::watching()
+                && matches!(file.inode.kind(), crate::vfs::InodeKind::Regular)
+            {
+                crate::fsnotify::self_event(file.inode.as_ref(), crate::fsnotify::IN_MODIFY);
+            }
+            w as i64
+        }
         Err(e) => write_err_to_errno(e),
     }
 }
@@ -120,10 +127,13 @@ pub(crate) fn sys_dup(fd: u64) -> i64 {
 }
 
 pub(crate) fn sys_dup2(oldfd: u64, newfd: u64) -> i64 {
-    sched::with_current_fds(|t| match t.dup_to(oldfd as i32, newfd as i32, 0) {
-        Ok(fd) => fd as i64,
-        Err(e) => e as i64,
-    })
+    let (ret, displaced) =
+        sched::with_current_fds(|t| match t.dup_to(oldfd as i32, newfd as i32, 0) {
+            Ok((fd, displaced)) => (fd as i64, displaced),
+            Err(e) => (e as i64, None),
+        });
+    drop(displaced);
+    ret
 }
 
 pub(crate) fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> i64 {
@@ -135,10 +145,13 @@ pub(crate) fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> i64 {
     } else {
         0
     };
-    sched::with_current_fds(|t| match t.dup_to(oldfd as i32, newfd as i32, cloexec) {
-        Ok(fd) => fd as i64,
-        Err(e) => e as i64,
-    })
+    let (ret, displaced) =
+        sched::with_current_fds(|t| match t.dup_to(oldfd as i32, newfd as i32, cloexec) {
+            Ok((fd, displaced)) => (fd as i64, displaced),
+            Err(e) => (e as i64, None),
+        });
+    drop(displaced);
+    ret
 }
 
 pub(crate) fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
@@ -181,7 +194,14 @@ pub(crate) fn sys_pwrite64(fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
         return EFAULT;
     }
     match file.inode.write_at(offset, &buffer) {
-        Ok(w) => w as i64,
+        Ok(w) => {
+            if crate::fsnotify::watching()
+                && matches!(file.inode.kind(), crate::vfs::InodeKind::Regular)
+            {
+                crate::fsnotify::self_event(file.inode.as_ref(), crate::fsnotify::IN_MODIFY);
+            }
+            w as i64
+        }
         Err(e) => write_err_to_errno(e),
     }
 }
@@ -261,7 +281,8 @@ pub(crate) fn sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
     let wfd = match wfd {
         Ok(f) => f,
         Err(e) => {
-            sched::with_current_fds(|t| t.remove(rfd));
+            let removed = sched::with_current_fds(|t| t.remove(rfd));
+            drop(removed);
             return e as i64;
         }
     };
@@ -273,10 +294,12 @@ pub(crate) fn sys_pipe2(fds_ptr: u64, flags: u64) -> i64 {
         b
     };
     if frame::user::copy_to_user(fds_ptr, &buf).is_err() {
-        sched::with_current_fds(|t| {
-            t.remove(rfd);
-            t.remove(wfd);
+        let removed = sched::with_current_fds(|t| {
+            let r = t.remove(rfd);
+            let w = t.remove(wfd);
+            (r, w)
         });
+        drop(removed);
         return EFAULT;
     }
     0

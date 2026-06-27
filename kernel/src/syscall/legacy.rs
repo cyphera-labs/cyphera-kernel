@@ -37,5 +37,8 @@ fn sys_vhangup() -> i64 {
     if euid != 0 {
         return EPERM;
     }
+    if let Some(tty) = sched::tty::ctty_for(sched::current_pid()) {
+        sched::tty::hangup(tty);
+    }
     0
 }

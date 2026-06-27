@@ -204,13 +204,22 @@ pub(crate) fn sys_mount(source: u64, target: u64, fs_type: u64, flags: u64, _dat
         if src_owned != "/dev/vda" {
             return ENODEV;
         }
+        if crate::fs::devfs::vda_mount_claim().is_err() {
+            return EBUSY;
+        }
         let dev = match crate::fs::ext4::VirtioBlockDevice::new() {
             Some(d) => d,
-            None => return ENODEV,
+            None => {
+                crate::fs::devfs::vda_mount_release();
+                return ENODEV;
+            }
         };
         match crate::fs::ext4::Ext4Fs::mount(dev) {
             Ok(fs) => fs.root_inode(),
-            Err(_) => return EINVAL,
+            Err(_) => {
+                crate::fs::devfs::vda_mount_release();
+                return EINVAL;
+            }
         }
     } else if fst == "proc" {
         crate::fs::procfs::root()
@@ -289,7 +298,6 @@ pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     }
 
     let ctx = vfs::path::Context::current();
-    let old_root = ctx.root.clone();
 
     let new_root_norm = match resolve_mount_path(AT_FDCWD, &new_root_path) {
         Ok(p) => p,
@@ -299,36 +307,18 @@ pub(crate) fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let install_path = if put_old_norm == new_root_norm {
-        alloc::string::String::from("/")
-    } else if let Some(rest) = put_old_norm.strip_prefix(&new_root_norm) {
-        if rest.starts_with('/') {
-            alloc::string::String::from(rest)
-        } else {
-            return EINVAL;
-        }
-    } else {
-        return EINVAL;
-    };
-    let (old_source, old_fstype, old_flags) = ctx
-        .lookup_mount_full("/")
-        .map(|e| (e.source, e.fstype, e.in_use.flags()))
-        .unwrap_or_else(|| {
-            (
-                alloc::string::String::from("rootfs"),
-                alloc::string::String::from("tmpfs"),
-                0,
-            )
-        });
-    ctx.install_mount(
-        &install_path,
-        put_old.inode_id(),
-        old_root,
-        vfs::MountPropagation::Private,
-        &old_source,
-        &old_fstype,
-        old_flags,
-    );
+    let _ = put_old;
+
+    let new_root_real = ctx
+        .mount_path_for_root_inode(new_root.inode_id())
+        .unwrap_or(new_root_norm);
+    let put_old_real = ctx
+        .mount_path_for_root_inode(put_old.inode_id())
+        .unwrap_or(put_old_norm);
+
+    if let Err(e) = ctx.pivot_root(&new_root_real, &put_old_real) {
+        return e.as_neg_i64();
+    }
     sched::set_current_fs_root(new_root.clone());
     sched::set_current_cwd(new_root, alloc::string::String::from("/"));
     0

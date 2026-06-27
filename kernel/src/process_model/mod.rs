@@ -91,6 +91,7 @@ pub struct Process {
     pub cgroup_charged_bytes: u64,
     pub security: SecurityContext,
     pub signals: SignalContext,
+    pub timers: TimerContext,
     pub sigactions: Arc<frame::sync::SpinIrq<[SigAction; NSIG]>>,
     pub task: crate::core::SchedCell<Task>,
     pub first_launch: Option<FirstLaunch>,
@@ -107,6 +108,7 @@ pub struct Process {
     pub pi_held: alloc::vec::Vec<cyphera_kapi::WaitKey>,
     pub cpu_times: CpuTimes,
     pub(crate) trace: TraceContext,
+    pub park_site: Option<&'static str>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -150,6 +152,7 @@ impl Process {
             parent: None,
             state: crate::core::SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::User,
+            park_site: None,
             saved: SavedRegs::fresh(entry, user_stack_top),
             addr_space: None,
             memory: MemoryContext::default(),
@@ -160,6 +163,7 @@ impl Process {
             cgroup_charged_bytes: 0,
             security: SecurityContext::new(),
             signals: SignalContext::new(),
+            timers: TimerContext::default(),
             sigactions: Arc::new(frame::sync::SpinIrq::new(
                 [SigAction {
                     handler: 0,
@@ -213,6 +217,7 @@ impl Process {
             parent: None,
             state: crate::core::SchedCell::new(ProcessState::Runnable),
             kind: ProcessKind::Kernel,
+            park_site: None,
             saved: SavedRegs::fresh(0, 0),
             addr_space: None,
             memory: MemoryContext::default(),
@@ -223,6 +228,7 @@ impl Process {
             cgroup_charged_bytes: 0,
             security: SecurityContext::new(),
             signals: SignalContext::new(),
+            timers: TimerContext::default(),
             sigactions: Arc::new(frame::sync::SpinIrq::new(
                 [SigAction {
                     handler: 0,

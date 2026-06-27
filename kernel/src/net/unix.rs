@@ -1,9 +1,10 @@
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use frame::sync::SpinIrq;
 
@@ -13,6 +14,12 @@ use crate::core::wait::WaitQueue;
 use crate::vfs::{Inode, InodeKind, OpenFile, OpenFlags, Stat};
 
 const UNIX_CAPACITY: usize = 64 * 1024;
+
+fn current_ucred() -> (i32, u32, u32) {
+    let pid = crate::core::current_tgid().raw() as i32;
+    let (uid, gid) = crate::core::with_current_creds(|c| (c.euid, c.egid));
+    (pid, uid, gid)
+}
 
 type FdBatch = (usize, alloc::vec::Vec<Arc<OpenFile>>);
 
@@ -24,6 +31,7 @@ struct Ring {
     read: usize,
     fds: VecDeque<FdBatch>,
     bounds: VecDeque<usize>,
+    writer_creds: Option<(i32, u32, u32)>,
 }
 
 struct Channel {
@@ -31,6 +39,7 @@ struct Channel {
     read_waiters: WaitQueue,
     write_waiters: WaitQueue,
     framed: bool,
+    rd_closed: AtomicBool,
 }
 
 impl Ring {
@@ -74,6 +83,7 @@ impl Ring {
             self.buf.extend(buf.iter().copied());
             self.bounds.push_back(buf.len());
             self.written += buf.len();
+            self.writer_creds = Some(current_ucred());
             Some(buf.len())
         } else {
             if room == 0 {
@@ -82,6 +92,7 @@ impl Ring {
             let n = buf.len().min(room);
             self.buf.extend(buf[..n].iter().copied());
             self.written += n;
+            self.writer_creds = Some(current_ucred());
             Some(n)
         }
     }
@@ -98,6 +109,7 @@ impl Ring {
 pub struct UnixEnd {
     inbox: Arc<Channel>,
     peer_inbox: Arc<Channel>,
+    passcred: AtomicBool,
 }
 
 impl UnixEnd {
@@ -111,10 +123,12 @@ impl UnixEnd {
                 read: 0,
                 fds: VecDeque::new(),
                 bounds: VecDeque::new(),
+                writer_creds: None,
             }),
             read_waiters: WaitQueue::new(),
             write_waiters: WaitQueue::new(),
             framed,
+            rd_closed: AtomicBool::new(false),
         });
         let b_chan = Arc::new(Channel {
             ring: SpinIrq::new(Ring {
@@ -125,18 +139,22 @@ impl UnixEnd {
                 read: 0,
                 fds: VecDeque::new(),
                 bounds: VecDeque::new(),
+                writer_creds: None,
             }),
             read_waiters: WaitQueue::new(),
             write_waiters: WaitQueue::new(),
             framed,
+            rd_closed: AtomicBool::new(false),
         });
         let a = Arc::new(Self {
             inbox: a_chan.clone(),
             peer_inbox: b_chan.clone(),
+            passcred: AtomicBool::new(false),
         });
         let b = Arc::new(Self {
             inbox: b_chan,
             peer_inbox: a_chan,
+            passcred: AtomicBool::new(false),
         });
         (a, b)
     }
@@ -162,6 +180,9 @@ impl Inode for UnixEnd {
             nonblock,
             None,
             || {
+                if self.inbox.rd_closed.load(Ordering::Relaxed) {
+                    return crate::vfs::blocking::IoAttempt::Ready(0);
+                }
                 let mut s = self.inbox.ring.lock();
                 let framed = self.inbox.framed;
                 if s.has_unit(framed) {
@@ -194,6 +215,9 @@ impl Inode for UnixEnd {
             nonblock,
             None,
             || {
+                if self.peer_inbox.rd_closed.load(Ordering::Relaxed) {
+                    return IoAttempt::Err(Errno::PIPE);
+                }
                 let mut s = self.peer_inbox.ring.lock();
                 if s.readers == 0 {
                     return IoAttempt::Err(Errno::PIPE);
@@ -224,6 +248,9 @@ impl Inode for UnixEnd {
             nonblock,
             None,
             || {
+                if self.peer_inbox.rd_closed.load(Ordering::Relaxed) {
+                    return IoAttempt::Err(Errno::PIPE);
+                }
                 let mut s = self.peer_inbox.ring.lock();
                 if s.readers == 0 {
                     return IoAttempt::Err(Errno::PIPE);
@@ -257,6 +284,9 @@ impl Inode for UnixEnd {
             nonblock,
             None,
             || {
+                if self.inbox.rd_closed.load(Ordering::Relaxed) {
+                    return IoAttempt::Ready((0, Vec::new()));
+                }
                 let mut s = self.inbox.ring.lock();
                 let framed = self.inbox.framed;
                 if s.has_unit(framed) {
@@ -283,11 +313,13 @@ impl Inode for UnixEnd {
         use crate::vfs::PollMask;
         let inbox = self.inbox.ring.lock();
         let peer = self.peer_inbox.ring.lock();
+        let rd_closed = self.inbox.rd_closed.load(Ordering::Relaxed);
+        let wr_closed = self.peer_inbox.rd_closed.load(Ordering::Relaxed);
         let mut m = PollMask::empty();
-        if inbox.has_unit(self.inbox.framed) || inbox.writers == 0 {
+        if rd_closed || inbox.has_unit(self.inbox.framed) || inbox.writers == 0 {
             m |= PollMask::IN;
         }
-        if peer.buf.len() < UNIX_CAPACITY || peer.readers == 0 {
+        if wr_closed || peer.buf.len() < UNIX_CAPACITY || peer.readers == 0 {
             m |= PollMask::OUT;
         }
         if inbox.writers == 0 && inbox.buf.is_empty() {
@@ -299,6 +331,10 @@ impl Inode for UnixEnd {
     fn for_each_wait_queue(&self, f: &mut dyn FnMut(&WaitQueue)) {
         f(&self.inbox.read_waiters);
         f(&self.peer_inbox.write_waiters);
+    }
+
+    fn as_socket(&self) -> Option<&dyn super::Socket> {
+        Some(self)
     }
 
     fn on_open(&self, flags: OpenFlags) {
@@ -331,7 +367,49 @@ impl Inode for UnixEnd {
     }
 }
 
-static BOUND: SpinIrq<BTreeMap<String, Weak<UnixSocket>>> = SpinIrq::new(BTreeMap::new());
+impl UnixEnd {
+    fn shutdown_dirs(&self, how: i32) -> i64 {
+        const SHUT_RD: i32 = 0;
+        const SHUT_WR: i32 = 1;
+        const SHUT_RDWR: i32 = 2;
+        if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
+            return crate::errno::EINVAL;
+        }
+        if how == SHUT_RD || how == SHUT_RDWR {
+            self.inbox.rd_closed.store(true, Ordering::Relaxed);
+            self.inbox.read_waiters.wake_all();
+        }
+        if how == SHUT_WR || how == SHUT_RDWR {
+            self.peer_inbox.rd_closed.store(true, Ordering::Relaxed);
+            self.peer_inbox.read_waiters.wake_all();
+            self.inbox.write_waiters.wake_all();
+        }
+        0
+    }
+}
+
+impl super::Socket for UnixEnd {
+    fn shutdown(&self, how: i32) -> i64 {
+        self.shutdown_dirs(how)
+    }
+
+    fn setsockopt(&self, level: i32, opt: i32, _optval: u64, _optlen: u64) -> i64 {
+        const SOL_SOCKET: i32 = 1;
+        const SO_PASSCRED: i32 = 16;
+        if level == SOL_SOCKET && opt == SO_PASSCRED {
+            self.passcred.store(true, Ordering::Relaxed);
+        }
+        0
+    }
+
+    fn recv_creds(&self) -> Option<(i32, u32, u32)> {
+        if self.passcred.load(Ordering::Relaxed) {
+            self.inbox.ring.lock().writer_creds
+        } else {
+            None
+        }
+    }
+}
 
 const AF_UNIX: u32 = 1;
 
@@ -396,6 +474,7 @@ enum SockState {
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum UnixKind {
     Stream,
+    Seqpacket,
     Dgram,
 }
 
@@ -414,6 +493,7 @@ pub struct UnixSocket {
     dgram_bytes: SpinIrq<usize>,
     dgram_waiters: WaitQueue,
     dgram_peer: SpinIrq<Option<String>>,
+    passcred: AtomicBool,
 }
 
 impl UnixSocket {
@@ -430,6 +510,7 @@ impl UnixSocket {
             dgram_bytes: SpinIrq::new(0),
             dgram_waiters: WaitQueue::new(),
             dgram_peer: SpinIrq::new(None),
+            passcred: AtomicBool::new(false),
         })
     }
 
@@ -437,21 +518,23 @@ impl UnixSocket {
         Self::new(UnixKind::Stream)
     }
 
+    pub fn new_seqpacket() -> Arc<Self> {
+        Self::new(UnixKind::Seqpacket)
+    }
+
     pub fn new_dgram() -> Arc<Self> {
         Self::new(UnixKind::Dgram)
+    }
+
+    fn is_stream_like(&self) -> bool {
+        matches!(self.kind, UnixKind::Stream | UnixKind::Seqpacket)
     }
 
     fn rendezvous_insert(&self, path: &str) -> Result<(), i64> {
         let taken = if path.starts_with('\0') {
             !self.ns.try_bind_abstract(path.into(), self.me.clone())
         } else {
-            let mut bound = BOUND.lock();
-            if bound.get(path).and_then(|w| w.upgrade()).is_some() {
-                true
-            } else {
-                bound.insert(path.into(), self.me.clone());
-                false
-            }
+            !self.ns.try_bind_fs(path.into(), self.me.clone())
         };
         if taken {
             Err(crate::errno::EADDRINUSE)
@@ -464,7 +547,7 @@ impl UnixSocket {
         if path.starts_with('\0') {
             self.ns.lookup_abstract(path)
         } else {
-            BOUND.lock().get(path).and_then(|w| w.upgrade())
+            self.ns.lookup_fs(path)
         }
     }
 
@@ -472,7 +555,7 @@ impl UnixSocket {
         if path.starts_with('\0') {
             self.ns.unbind_abstract(path);
         } else {
-            BOUND.lock().remove(path);
+            self.ns.unbind_fs(path);
         }
     }
 
@@ -568,16 +651,24 @@ impl UnixSocket {
     }
 
     fn connect_path(&self, path: &str) -> Result<(), i64> {
-        if matches!(&*self.state.lock(), SockState::Connected(_)) {
-            return Err(crate::errno::EINVAL);
-        }
         let listener = match self.rendezvous_lookup(path) {
             Some(l) => l,
             None => return Err(crate::errno::ECONNREFUSED),
         };
-        let (server, client) = UnixEnd::pair(false);
+        if core::ptr::eq(self as *const _, Arc::as_ptr(&listener)) {
+            return Err(crate::errno::ECONNREFUSED);
+        }
+        let framed = self.kind == UnixKind::Seqpacket;
+        let (server, client) = UnixEnd::pair(framed);
         client.on_open(OpenFlags::RDWR);
         server.on_open(OpenFlags::RDWR);
+        let mut st = self.state.lock();
+        if matches!(&*st, SockState::Connected(_)) {
+            drop(st);
+            client.on_close(OpenFlags::RDWR);
+            server.on_close(OpenFlags::RDWR);
+            return Err(crate::errno::EISCONN);
+        }
         {
             let mut lst = listener.state.lock();
             let refused = match &mut *lst {
@@ -589,12 +680,17 @@ impl UnixSocket {
             };
             if refused {
                 drop(lst);
+                drop(st);
                 client.on_close(OpenFlags::RDWR);
                 server.on_close(OpenFlags::RDWR);
                 return Err(crate::errno::ECONNREFUSED);
             }
         }
-        *self.state.lock() = SockState::Connected(client);
+        if self.passcred.load(Ordering::Relaxed) {
+            client.passcred.store(true, Ordering::Relaxed);
+        }
+        *st = SockState::Connected(client);
+        drop(st);
         listener.accept_waiters.wake_one();
         Ok(())
     }
@@ -766,8 +862,27 @@ impl super::Socket for UnixSocket {
         }
     }
 
+    fn setsockopt(&self, level: i32, opt: i32, _optval: u64, _optlen: u64) -> i64 {
+        const SOL_SOCKET: i32 = 1;
+        const SO_PASSCRED: i32 = 16;
+        if level == SOL_SOCKET && opt == SO_PASSCRED {
+            self.passcred.store(true, Ordering::Relaxed);
+            if let Some(end) = self.connected_end() {
+                end.passcred.store(true, Ordering::Relaxed);
+            }
+        }
+        0
+    }
+
+    fn recv_creds(&self) -> Option<(i32, u32, u32)> {
+        if !self.passcred.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.connected_end().and_then(|e| e.recv_creds())
+    }
+
     fn listen(&self, backlog: i32) -> i64 {
-        if self.kind != UnixKind::Stream {
+        if !self.is_stream_like() {
             return crate::errno::EOPNOTSUPP;
         }
         match self.do_listen(backlog) {
@@ -776,8 +891,15 @@ impl super::Socket for UnixSocket {
         }
     }
 
+    fn shutdown(&self, how: i32) -> i64 {
+        match self.connected_end() {
+            Some(end) => end.shutdown_dirs(how),
+            None => crate::errno::ENOTCONN,
+        }
+    }
+
     fn accept(&self, peer_out: Option<(u64, u64)>, nonblock: bool) -> Result<Arc<dyn Inode>, i64> {
-        if self.kind != UnixKind::Stream {
+        if !self.is_stream_like() {
             return Err(crate::errno::EOPNOTSUPP);
         }
         let end = crate::vfs::blocking::block_io::<Arc<UnixEnd>>(
@@ -813,7 +935,7 @@ impl super::Socket for UnixSocket {
             Err(e) => return e,
         };
         match self.kind {
-            UnixKind::Stream => match self.connect_path(&path) {
+            UnixKind::Stream | UnixKind::Seqpacket => match self.connect_path(&path) {
                 Ok(()) => 0,
                 Err(e) => e,
             },

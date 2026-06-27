@@ -69,7 +69,77 @@ pub(crate) fn state_is_terminal(s: &ProcessState) -> bool {
 }
 
 pub(crate) fn state_transition_ok(cur: &ProcessState, new: &ProcessState) -> bool {
-    !state_is_terminal(cur) || state_is_terminal(new)
+    use ProcessState::*;
+
+    if state_is_terminal(new) {
+        return true;
+    }
+    if state_is_terminal(cur) {
+        return false;
+    }
+
+    match (cur, new) {
+        (Running, Runnable) => true,
+        (Runnable, Running) => true,
+
+        (Running, Parked) => true,
+        (Parked, Runnable) => true,
+
+        (Running, Stopped) => true,
+        (Stopped, Runnable) => true,
+
+        (Running, Traced) => true,
+        (Stopped, Traced) => true,
+        (Traced, Runnable) => true,
+
+        (Running, CgroupThrottled) => true,
+        (Runnable, CgroupThrottled) => true,
+        (CgroupThrottled, Runnable) => true,
+
+        (Running, DlThrottled) => true,
+        (DlThrottled, Runnable) => true,
+
+        (a, b) if a == b => true,
+
+        _ => false,
+    }
+}
+
+pub(crate) fn state_owner_consistent(state: &ProcessState, owner: SchedOwner) -> bool {
+    use ProcessState as S;
+
+    if state_is_terminal(state) {
+        return true;
+    }
+    if matches!(owner, SchedOwner::Zombie | SchedOwner::Reaping) {
+        return true;
+    }
+
+    matches!(
+        (state, owner),
+        (S::Runnable, SchedOwner::Runnable { .. })
+            | (S::Runnable, SchedOwner::None)
+            | (S::Running, SchedOwner::Running { .. })
+            | (S::Running, SchedOwner::Runnable { .. })
+            | (S::Runnable, SchedOwner::Running { .. })
+            | (S::Parked, SchedOwner::Parked { .. })
+            | (S::Stopped, SchedOwner::Stopped)
+            | (S::Traced, SchedOwner::Traced)
+            | (
+                S::DlThrottled | S::CgroupThrottled,
+                SchedOwner::Parked { .. }
+                    | SchedOwner::Running { .. }
+                    | SchedOwner::Runnable { .. }
+            )
+            | (
+                S::Parked | S::Stopped | S::Traced,
+                SchedOwner::Running { .. }
+            )
+            | (S::Runnable, SchedOwner::Parked { .. })
+            | (S::Runnable, SchedOwner::Stopped)
+            | (S::Runnable, SchedOwner::Traced)
+            | (S::Traced, SchedOwner::Stopped)
+    )
 }
 
 #[cfg(test)]
@@ -157,6 +227,138 @@ mod transition_tests {
         assert!(!state_transition_ok(
             &ProcessState::KilledBySignal { signal: 9 },
             &ProcessState::Runnable
+        ));
+    }
+
+    #[test]
+    fn state_legal_nonterminal_edges_pass() {
+        assert!(state_transition_ok(
+            &ProcessState::Running,
+            &ProcessState::Runnable
+        ));
+        assert!(state_transition_ok(
+            &ProcessState::Running,
+            &ProcessState::Parked
+        ));
+        assert!(state_transition_ok(
+            &ProcessState::Parked,
+            &ProcessState::Runnable
+        ));
+        assert!(state_transition_ok(
+            &ProcessState::Stopped,
+            &ProcessState::Traced
+        ));
+        assert!(state_transition_ok(
+            &ProcessState::Runnable,
+            &ProcessState::CgroupThrottled
+        ));
+        assert!(state_transition_ok(
+            &ProcessState::DlThrottled,
+            &ProcessState::Runnable
+        ));
+    }
+
+    #[test]
+    fn state_illegal_nonterminal_edges_fail() {
+        assert!(!state_transition_ok(
+            &ProcessState::Parked,
+            &ProcessState::Stopped
+        ));
+        assert!(!state_transition_ok(
+            &ProcessState::Parked,
+            &ProcessState::Running
+        ));
+        assert!(!state_transition_ok(
+            &ProcessState::Stopped,
+            &ProcessState::Parked
+        ));
+        assert!(!state_transition_ok(
+            &ProcessState::DlThrottled,
+            &ProcessState::CgroupThrottled
+        ));
+    }
+
+    #[test]
+    fn state_owner_rest_pairs_consistent() {
+        assert!(state_owner_consistent(
+            &ProcessState::Running,
+            SchedOwner::Running { cpu: 0 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Runnable,
+            SchedOwner::Runnable { cpu: 0 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Parked,
+            SchedOwner::Parked { waitq_addr: 7 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Stopped,
+            SchedOwner::Stopped
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Traced,
+            SchedOwner::Traced
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::DlThrottled,
+            SchedOwner::Parked { waitq_addr: 0 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::CgroupThrottled,
+            SchedOwner::Parked { waitq_addr: 0 }
+        ));
+    }
+
+    #[test]
+    fn state_owner_blessed_transients_consistent() {
+        assert!(state_owner_consistent(
+            &ProcessState::Runnable,
+            SchedOwner::Parked { waitq_addr: 9 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Runnable,
+            SchedOwner::Traced
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Traced,
+            SchedOwner::Stopped
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Parked,
+            SchedOwner::Running { cpu: 1 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Running,
+            SchedOwner::Runnable { cpu: 1 }
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Zombie(0),
+            SchedOwner::Stopped
+        ));
+        assert!(state_owner_consistent(
+            &ProcessState::Runnable,
+            SchedOwner::Zombie
+        ));
+    }
+
+    #[test]
+    fn state_owner_divergence_rejected() {
+        assert!(!state_owner_consistent(
+            &ProcessState::Parked,
+            SchedOwner::Stopped
+        ));
+        assert!(!state_owner_consistent(
+            &ProcessState::Stopped,
+            SchedOwner::Parked { waitq_addr: 0 }
+        ));
+        assert!(!state_owner_consistent(
+            &ProcessState::Running,
+            SchedOwner::Parked { waitq_addr: 0 }
+        ));
+        assert!(!state_owner_consistent(
+            &ProcessState::Traced,
+            SchedOwner::Runnable { cpu: 0 }
         ));
     }
 }

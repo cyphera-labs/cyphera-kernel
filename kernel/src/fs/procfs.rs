@@ -103,6 +103,7 @@ impl Inode for PidDir {
             "fd" => Ok(Arc::new(PidFdDir { pid: self.pid })),
             "status" => Ok(Arc::new(PidStatusFile { pid: self.pid })),
             "comm" => Ok(Arc::new(PidCommFile { pid: self.pid })),
+            "wchan" => Ok(Arc::new(PidWchanFile { pid: self.pid })),
             "cgroup" => Ok(Arc::new(PidCgroupFile { pid: self.pid })),
             "uid_map" => Ok(Arc::new(IdMapFile {
                 kind: IdMapKind::Uid,
@@ -1328,6 +1329,25 @@ impl Inode for PidCommFile {
         let name = crate::core::process_name(self.pid);
         let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         let mut body = alloc::string::String::from(core::str::from_utf8(&name[..n]).unwrap_or(""));
+        body.push('\n');
+        slice_into(body.as_bytes(), offset, buf)
+    }
+}
+
+struct PidWchanFile {
+    pid: Pid,
+}
+
+impl Inode for PidWchanFile {
+    fn kind(&self) -> InodeKind {
+        InodeKind::Regular
+    }
+    fn stat(&self) -> Stat {
+        Stat::fresh(InodeKind::Regular, 0, 0o644)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        let site = crate::core::park_site_of(self.pid).unwrap_or("0");
+        let mut body = alloc::string::String::from(site);
         body.push('\n');
         slice_into(body.as_bytes(), offset, buf)
     }

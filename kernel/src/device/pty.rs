@@ -8,7 +8,6 @@ use frame::sync::SpinIrq;
 use cyphera_kapi::KResult;
 
 use crate::core::wait::WaitQueue;
-use crate::process_model::Pid;
 use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
 
 const RING_CAPACITY: usize = 4096;
@@ -58,7 +57,6 @@ pub struct Pty {
     m_to_app: SpinIrq<Ring>,
     line: SpinIrq<Vec<u8>>,
     eof_pending_slave: SpinIrq<bool>,
-    slave_reader: SpinIrq<Option<Pid>>,
     s_readers: WaitQueue,
     m_readers: WaitQueue,
     opens: AtomicUsize,
@@ -72,7 +70,6 @@ impl Pty {
             m_to_app: SpinIrq::new(Ring::new()),
             line: SpinIrq::new(Vec::new()),
             eof_pending_slave: SpinIrq::new(false),
-            slave_reader: SpinIrq::new(None),
             s_readers: WaitQueue::new(),
             m_readers: WaitQueue::new(),
             opens: AtomicUsize::new(0),
@@ -106,6 +103,33 @@ fn open_pair(pty: &Pty) {
 fn close_pair(pty: &Pty) {
     if pty.opens.fetch_sub(1, Ordering::AcqRel) == 1 {
         PAIRS.lock().remove(&pty.n);
+        crate::core::tty::release(crate::core::tty::TtyId::Pty(pty.n));
+    }
+}
+
+fn master_hangup(pty: &Pty) {
+    crate::core::tty::hangup(crate::core::tty::TtyId::Pty(pty.n));
+    pty.s_readers.wake_all();
+    pty.m_readers.wake_all();
+}
+
+pub fn flush_input(n: u32) {
+    if let Some(pty) = lookup(n) {
+        pty.line.lock().clear();
+        let mut r = pty.s_to_app.lock();
+        r.head = 0;
+        r.tail = 0;
+        r.len = 0;
+        *pty.eof_pending_slave.lock() = false;
+    }
+}
+
+pub fn flush_output(n: u32) {
+    if let Some(pty) = lookup(n) {
+        let mut r = pty.m_to_app.lock();
+        r.head = 0;
+        r.tail = 0;
+        r.len = 0;
     }
 }
 
@@ -118,11 +142,23 @@ const ICANON: u32 = 0x0002;
 const ECHO_F: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
 const ECHOK: u32 = 0x0020;
+const OPOST: u32 = 0x0001;
+const ONLCR: u32 = 0x0004;
+
+fn push_opost(m: &mut Ring, b: u8, t: &[u8; 36]) -> bool {
+    let oflag = flag_word(t, 4);
+    if (oflag & OPOST) != 0 && (oflag & ONLCR) != 0 && b == b'\n' && !m.push(b'\r') {
+        return false;
+    }
+    m.push(b)
+}
 
 const VINTR: usize = 0;
+const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
+const VSUSP: usize = 10;
 
 fn flag_word(t: &[u8; 36], offset: usize) -> u32 {
     u32::from_le_bytes([t[offset], t[offset + 1], t[offset + 2], t[offset + 3]])
@@ -143,6 +179,8 @@ fn discipline_input(b: u8, t: &[u8; 36], pty: &Pty) {
     };
 
     let intr = cc(t, VINTR);
+    let quit = cc(t, VQUIT);
+    let susp = cc(t, VSUSP);
     let erase = cc(t, VERASE);
     let kill = cc(t, VKILL);
     let eof = cc(t, VEOF);
@@ -151,18 +189,25 @@ fn discipline_input(b: u8, t: &[u8; 36], pty: &Pty) {
     let canon = (lflag & ICANON) != 0;
     let isig = (lflag & ISIG) != 0;
 
+    let tty = crate::core::tty::TtyId::Pty(pty.n);
+
     if isig && intr != 0 && b == intr {
-        if let Some(pid) = *pty.slave_reader.lock() {
-            const SIGINT: u32 = 2;
-            let info = crate::core::signal::SigInfo::for_fault(SIGINT, 0);
-            let _ = crate::core::send_signal_with_info(pid, SIGINT, info);
-        }
+        crate::core::tty::deliver_input_signal(tty, 0);
         pty.line.lock().clear();
         if echo_on {
             for &c in b"^C\n" {
                 let _ = pty.m_to_app.lock().push(c);
             }
         }
+        return;
+    }
+    if isig && quit != 0 && b == quit {
+        crate::core::tty::deliver_input_signal(tty, 1);
+        pty.line.lock().clear();
+        return;
+    }
+    if isig && susp != 0 && b == susp {
+        crate::core::tty::deliver_input_signal(tty, 2);
         return;
     }
 
@@ -251,6 +296,7 @@ impl Inode for MasterInode {
     }
 
     fn on_close(&self, _flags: OpenFlags) {
+        master_hangup(&self.0);
         close_pair(&self.0);
     }
 
@@ -308,8 +354,12 @@ impl Inode for SlaveInode {
         pty_termios_id(&self.0)
     }
 
-    fn on_open(&self, _flags: OpenFlags) {
+    fn on_open(&self, flags: OpenFlags) {
         open_pair(&self.0);
+        crate::core::tty::maybe_acquire_on_open(
+            crate::core::tty::TtyId::Pty(self.0.n),
+            flags.contains(OpenFlags::NOCTTY),
+        );
     }
 
     fn on_close(&self, _flags: OpenFlags) {
@@ -324,12 +374,12 @@ impl Inode for SlaveInode {
         if buf.is_empty() {
             return Ok(0);
         }
+        crate::core::tty::background_read_guard(self.inode_id())?;
         use crate::vfs::blocking::IoAttempt;
         let nonblock = flags.contains(OpenFlags::NONBLOCK);
         crate::vfs::blocking::block_io("pty_slave_read", &self.0.s_readers, nonblock, None, || {
             let mut r = self.0.s_to_app.lock();
             if r.len > 0 {
-                *self.0.slave_reader.lock() = Some(crate::core::current_pid());
                 return IoAttempt::Ready(r.pop_into(buf));
             }
             {
@@ -340,16 +390,17 @@ impl Inode for SlaveInode {
                 }
             }
             drop(r);
-            *self.0.slave_reader.lock() = Some(crate::core::current_pid());
             IoAttempt::WouldBlock
         })
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        crate::core::tty::background_write_guard(self.inode_id())?;
+        let t = pty_termios(&self.0);
         {
             let mut m = self.0.m_to_app.lock();
             for &b in buf {
-                if !m.push(b) {
+                if !push_opost(&mut m, b, &t) {
                     break;
                 }
             }

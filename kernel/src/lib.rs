@@ -51,6 +51,8 @@ pub mod device;
 #[cfg(not(host_test))]
 pub mod fs;
 #[cfg(not(host_test))]
+pub mod fsnotify;
+#[cfg(not(host_test))]
 pub mod io;
 #[cfg(not(host_test))]
 pub mod ipc;
@@ -81,6 +83,7 @@ fn task_exit_cleanup(
     ipc::futex::clear_child_tid(vmspace_id, clear_child_tid);
     ipc::futex::exit_robust_list(vmspace_id, robust_list);
     ipc::futex::pi_owner_died(vmspace_id, pid);
+    ipc::futex::thread_death_scrub(vmspace_id, pid);
 }
 
 #[cfg(not(host_test))]
@@ -141,11 +144,25 @@ fn init_vfs() {
         dri_dir
             .attach("card0", device::drm::card0())
             .expect("attach card0");
+        dri_dir
+            .attach("renderD128", device::virtgpu::render_d128())
+            .expect("attach renderD128");
         let dri_dyn: Arc<dyn Inode> = dri_dir;
         dev.attach("dri", dri_dyn).expect("attach /dev/dri");
     }
     console::install_screen_sink();
     dev.attach("dsp", fs::devfs::dsp()).expect("attach dsp");
+    {
+        let snd_dir = fs::tmpfs::TmpfsInode::new_dir();
+        snd_dir
+            .attach("controlC0", fs::devfs::alsa_control())
+            .expect("attach controlC0");
+        snd_dir
+            .attach("pcmC0D0p", fs::devfs::alsa_pcm_playback())
+            .expect("attach pcmC0D0p");
+        let snd_dyn: Arc<dyn Inode> = snd_dir;
+        dev.attach("snd", snd_dyn).expect("attach /dev/snd");
+    }
     if virtio::block_capacity_sectors().is_some() {
         dev.attach("vda", fs::devfs::vda()).expect("attach vda");
     }

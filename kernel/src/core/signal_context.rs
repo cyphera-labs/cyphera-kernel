@@ -19,6 +19,17 @@ pub fn with_signal_mut<R>(
         .map(|p| f(&mut p.signals))
 }
 
+pub fn with_timers_mut<R>(
+    pid: Pid,
+    f: impl FnOnce(&mut crate::process_model::TimerContext) -> R,
+) -> Option<R> {
+    GLOBAL
+        .lock()
+        .processes
+        .get_mut(&pid)
+        .map(|p| f(&mut p.timers))
+}
+
 pub fn current_altstack() -> crate::core::signal::AltStack {
     let pid = current_pid();
     GLOBAL

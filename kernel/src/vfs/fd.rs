@@ -115,7 +115,12 @@ impl FdTable {
         slot.file.take()
     }
 
-    pub fn dup_to(&self, src: i32, dst: i32, fd_flags: u8) -> Result<i32, i32> {
+    pub fn dup_to(
+        &self,
+        src: i32,
+        dst: i32,
+        fd_flags: u8,
+    ) -> Result<(i32, Option<Arc<OpenFile>>), i32> {
         let cap = self.soft_cap.load(Ordering::Acquire);
         if src < 0 || (src as usize) >= cap || dst < 0 || (dst as usize) >= cap {
             return Err(crate::errno::EBADF as i32);
@@ -125,12 +130,13 @@ impl FdTable {
             .get(src as usize)
             .and_then(|s| s.file.clone())
             .ok_or(crate::errno::EBADF as i32)?;
+        let mut displaced = None;
         if src != dst {
             Self::ensure_len(&mut t, dst as usize + 1);
-            t[dst as usize].file = Some(entry);
+            displaced = t[dst as usize].file.replace(entry);
             t[dst as usize].fd_flags = fd_flags;
         }
-        Ok(dst)
+        Ok((dst, displaced))
     }
 
     pub fn fd_flags(&self, fd: i32) -> Option<u8> {
@@ -160,14 +166,19 @@ impl FdTable {
         Ok(())
     }
 
-    pub fn close_cloexec(&self) {
+    #[must_use]
+    pub fn close_cloexec(&self) -> Vec<Arc<OpenFile>> {
+        let mut taken = Vec::new();
         let mut t = self.inner.lock();
         for slot in t.iter_mut() {
-            if slot.file.is_some() && (slot.fd_flags & FD_CLOEXEC) != 0 {
-                slot.file = None;
+            if (slot.fd_flags & FD_CLOEXEC) != 0 {
+                if let Some(f) = slot.file.take() {
+                    taken.push(f);
+                }
                 slot.fd_flags = 0;
             }
         }
+        taken
     }
 
     pub fn close_all(&self) {

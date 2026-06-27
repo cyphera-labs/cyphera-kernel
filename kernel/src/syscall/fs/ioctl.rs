@@ -9,12 +9,13 @@ const TCSETSF: u64 = 0x5404;
 const TIOCGPGRP: u64 = 0x540F;
 const TIOCSPGRP: u64 = 0x5410;
 const TIOCSCTTY: u64 = 0x540E;
+const TIOCNOTTY: u64 = 0x5422;
+const TIOCGSID: u64 = 0x5429;
 
-static FG_PGRP: frame::sync::SpinIrq<(u32, u32)> = frame::sync::SpinIrq::new((0, 0));
+const TCFLSH: u64 = 0x540B;
+const TCXONC: u64 = 0x540A;
+const TCSBRK: u64 = 0x5409;
 
-pub fn console_fg_pgrp() -> u32 {
-    FG_PGRP.lock().1
-}
 const TIOCGPTN: u64 = 0x80045430;
 const TIOCSPTLCK: u64 = 0x40045431;
 const FBIOGET_VSCREENINFO: u64 = 0x4600;
@@ -61,44 +62,24 @@ pub(crate) const DEFAULT_TERMIOS: [u8; 36] = {
     t
 };
 
-static TERMIOS_STATE: frame::sync::SpinIrq<alloc::collections::BTreeMap<u64, [u8; 36]>> =
-    frame::sync::SpinIrq::new(alloc::collections::BTreeMap::new());
-
 fn termios_get(inode_id: u64) -> [u8; 36] {
-    TERMIOS_STATE
-        .lock()
-        .get(&inode_id)
-        .copied()
-        .unwrap_or(DEFAULT_TERMIOS)
+    crate::core::tty::termios_get(inode_id)
 }
 
 fn termios_set(inode_id: u64, t: [u8; 36]) {
-    TERMIOS_STATE.lock().insert(inode_id, t);
+    crate::core::tty::termios_set(inode_id, t);
 }
 
 pub fn termios_get_pub(inode_id: u64) -> [u8; 36] {
     termios_get(inode_id)
 }
 
-const DEFAULT_WINSIZE: [u8; 8] = [24, 0, 80, 0, 0, 0, 0, 0];
-
-static WINSIZE_STATE: frame::sync::SpinIrq<alloc::collections::BTreeMap<u64, [u8; 8]>> =
-    frame::sync::SpinIrq::new(alloc::collections::BTreeMap::new());
-
-fn winsize_key(inode_id: u64) -> u64 {
-    inode_id & !(0b11u64 << 62)
-}
-
 fn winsize_get(inode_id: u64) -> [u8; 8] {
-    WINSIZE_STATE
-        .lock()
-        .get(&winsize_key(inode_id))
-        .copied()
-        .unwrap_or(DEFAULT_WINSIZE)
+    crate::core::tty::winsize_get(inode_id)
 }
 
 fn winsize_set(inode_id: u64, w: [u8; 8]) {
-    WINSIZE_STATE.lock().insert(winsize_key(inode_id), w);
+    crate::core::tty::winsize_set(inode_id, w);
 }
 
 pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
@@ -110,6 +91,15 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
     let cmd = cmd & 0xFFFF_FFFF;
     if file.inode.is_drm_card() && (cmd >> 8) & 0xff == 0x64 {
         return crate::device::drm::ioctl(cmd as u32, arg);
+    }
+    if file.inode.is_drm_render() && (cmd >> 8) & 0xff == 0x64 {
+        return crate::device::virtgpu::ioctl(cmd as u32, arg);
+    }
+    if let Some(kind) = file.inode.alsa_kind() {
+        return crate::device::snd::ioctl(kind, cmd as u32, arg);
+    }
+    if let Some(idx) = file.inode.evdev_idx() {
+        return crate::device::input::evdev_ioctl(idx, cmd as u32, arg);
     }
     match cmd {
         TIOCGWINSZ => {
@@ -151,6 +141,12 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             if frame::user::copy_from_user(arg, &mut buf).is_err() {
                 return EFAULT;
             }
+            if let Err(e) = crate::core::tty::background_write_guard(file.inode.inode_id()) {
+                return e.as_neg_i64();
+            }
+            if cmd == TCSETSF {
+                flush_tty_input(file.inode.inode_id());
+            }
             termios_set(file.inode.inode_id(), buf);
             0
         }
@@ -158,14 +154,9 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             if !is_tty {
                 return ENOTTY;
             }
-            let my_sid = sched::current_sid().raw();
-            let my_pgid_host = sched::current_pgid();
-            let (sid, fg_host) = *FG_PGRP.lock();
-            let host_pgid = if fg_host != 0 && sid == my_sid {
-                crate::process_model::Pid(fg_host)
-            } else {
-                my_pgid_host
-            };
+            let tty = crate::core::tty::tty_id_for_inode(file.inode.inode_id());
+            let fg = crate::core::tty::foreground_pgrp(tty);
+            let host_pgid = if fg.0 != 0 { fg } else { sched::current_pgid() };
             let pgid = sched::host_to_caller_local(host_pgid);
             if frame::user::copy_to_user(arg, &pgid.to_le_bytes()).is_err() {
                 return EFAULT;
@@ -180,17 +171,61 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             if frame::user::copy_from_user(arg, &mut buf).is_err() {
                 return EFAULT;
             }
+            if let Err(e) = crate::core::tty::background_write_guard(file.inode.inode_id()) {
+                return e.as_neg_i64();
+            }
             let pgrp_local = u32::from_le_bytes(buf);
             let pgrp_host = sched::caller_local_to_host(pgrp_local)
                 .map(|p| p.0)
                 .unwrap_or(pgrp_local);
-            let my_sid = sched::current_sid().raw();
-            *FG_PGRP.lock() = (my_sid, pgrp_host);
-            0
+            let tty = crate::core::tty::tty_id_for_inode(file.inode.inode_id());
+            let my_sid = sched::current_sid();
+            match crate::core::tty::set_foreground(
+                tty,
+                my_sid,
+                crate::process_model::Pid(pgrp_host),
+            ) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
         }
         TIOCSCTTY => {
             if !is_tty {
                 return ENOTTY;
+            }
+            let pid = sched::current_pid();
+            let my_sid = sched::current_sid();
+            if my_sid != pid {
+                return EPERM;
+            }
+            let tty = crate::core::tty::tty_id_for_inode(file.inode.inode_id());
+            match crate::core::tty::acquire(tty, my_sid, sched::current_pgid()) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        TIOCNOTTY => {
+            if !is_tty {
+                return ENOTTY;
+            }
+            let tty = crate::core::tty::tty_id_for_inode(file.inode.inode_id());
+            if crate::core::tty::session(tty) == sched::current_sid() {
+                crate::core::tty::drop_session(tty);
+            }
+            0
+        }
+        TIOCGSID => {
+            if !is_tty {
+                return ENOTTY;
+            }
+            let tty = crate::core::tty::tty_id_for_inode(file.inode.inode_id());
+            let sid = crate::core::tty::session(tty);
+            if sid.0 == 0 {
+                return ENOTTY;
+            }
+            let local = sched::host_to_caller_local(sid);
+            if frame::user::copy_to_user(arg, &local.to_le_bytes()).is_err() {
+                return EFAULT;
             }
             0
         }
@@ -210,6 +245,33 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             0
         }
         TIOCSPTLCK => {
+            if !is_tty {
+                return ENOTTY;
+            }
+            0
+        }
+        TCFLSH => {
+            if !is_tty {
+                return ENOTTY;
+            }
+            const TCIFLUSH: u64 = 0;
+            const TCOFLUSH: u64 = 1;
+            const TCIOFLUSH: u64 = 2;
+            if arg == TCIFLUSH || arg == TCIOFLUSH {
+                flush_tty_input(file.inode.inode_id());
+            }
+            if arg == TCOFLUSH || arg == TCIOFLUSH {
+                flush_tty_output(file.inode.inode_id());
+            }
+            0
+        }
+        TCXONC => {
+            if !is_tty {
+                return ENOTTY;
+            }
+            0
+        }
+        TCSBRK => {
             if !is_tty {
                 return ENOTTY;
             }
@@ -300,6 +362,20 @@ pub(crate) fn sys_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
             do_dsp_ioctl(cmd, arg)
         }
         _ => ENOTTY,
+    }
+}
+
+fn flush_tty_input(inode_id: u64) {
+    match crate::core::tty::tty_id_for_inode(inode_id) {
+        crate::core::tty::TtyId::Pty(n) => crate::device::pty::flush_input(n),
+        crate::core::tty::TtyId::Console => crate::console::flush_input(),
+    }
+}
+
+fn flush_tty_output(inode_id: u64) {
+    match crate::core::tty::tty_id_for_inode(inode_id) {
+        crate::core::tty::TtyId::Pty(n) => crate::device::pty::flush_output(n),
+        crate::core::tty::TtyId::Console => crate::console::flush_output(),
     }
 }
 

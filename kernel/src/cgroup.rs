@@ -191,6 +191,39 @@ impl IoController {
     }
 }
 
+pub const CTRL_CPU: u8 = 1 << 0;
+pub const CTRL_IO: u8 = 1 << 1;
+pub const CTRL_MEMORY: u8 = 1 << 2;
+pub const CTRL_PIDS: u8 = 1 << 3;
+pub const CTRL_ALL: u8 = CTRL_CPU | CTRL_IO | CTRL_MEMORY | CTRL_PIDS;
+
+pub fn controller_bit(name: &str) -> Option<u8> {
+    match name {
+        "cpu" => Some(CTRL_CPU),
+        "io" => Some(CTRL_IO),
+        "memory" => Some(CTRL_MEMORY),
+        "pids" => Some(CTRL_PIDS),
+        _ => None,
+    }
+}
+
+pub fn controllers_string(mask: u8) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if mask & CTRL_CPU != 0 {
+        parts.push("cpu");
+    }
+    if mask & CTRL_IO != 0 {
+        parts.push("io");
+    }
+    if mask & CTRL_MEMORY != 0 {
+        parts.push("memory");
+    }
+    if mask & CTRL_PIDS != 0 {
+        parts.push("pids");
+    }
+    parts.join(" ")
+}
+
 pub struct Cgroup {
     pub name: String,
     pub parent: Option<Weak<Cgroup>>,
@@ -200,6 +233,7 @@ pub struct Cgroup {
     pub pids_ctl: SpinIrq<PidsController>,
     pub cpu: SpinIrq<CpuController>,
     pub io: SpinIrq<IoController>,
+    pub subtree_control: SpinIrq<u8>,
 }
 
 impl Cgroup {
@@ -213,6 +247,7 @@ impl Cgroup {
             pids_ctl: SpinIrq::new(PidsController::default()),
             cpu: SpinIrq::new(CpuController::default()),
             io: SpinIrq::new(IoController::default()),
+            subtree_control: SpinIrq::new(0),
         })
     }
 
@@ -226,7 +261,54 @@ impl Cgroup {
             pids_ctl: SpinIrq::new(PidsController::default()),
             cpu: SpinIrq::new(CpuController::default()),
             io: SpinIrq::new(IoController::default()),
+            subtree_control: SpinIrq::new(0),
         })
+    }
+
+    pub fn available_controllers(self: &Arc<Self>) -> u8 {
+        match self.parent.as_ref().and_then(|w| w.upgrade()) {
+            Some(p) => *p.subtree_control.lock(),
+            None => CTRL_ALL,
+        }
+    }
+
+    pub fn has_member_processes(self: &Arc<Self>) -> bool {
+        !self.pids.lock().is_empty()
+    }
+
+    pub fn has_children(self: &Arc<Self>) -> bool {
+        !self.children.lock().is_empty()
+    }
+
+    pub fn set_subtree_control(self: &Arc<Self>, text: &str) -> KResult<()> {
+        let available = self.available_controllers();
+        let mut add: u8 = 0;
+        let mut remove: u8 = 0;
+        for tok in text.split_ascii_whitespace() {
+            let (sign, name) = match tok.split_at(1) {
+                ("+", n) => (true, n),
+                ("-", n) => (false, n),
+                _ => return Err(Errno::INVAL),
+            };
+            let bit = controller_bit(name).ok_or(Errno::INVAL)?;
+            if sign {
+                add |= bit;
+            } else {
+                remove |= bit;
+            }
+        }
+        if add & remove != 0 {
+            return Err(Errno::INVAL);
+        }
+        if add & !available != 0 {
+            return Err(Errno::INVAL);
+        }
+        if add != 0 && self.has_member_processes() {
+            return Err(Errno::BUSY);
+        }
+        let mut cur = self.subtree_control.lock();
+        *cur = (*cur | add) & !remove;
+        Ok(())
     }
 
     pub fn create_child(parent: &Arc<Self>, name: &str) -> KResult<Arc<Self>> {

@@ -55,6 +55,7 @@ members = [
     "proc_pidfd",
     "proc_pidns",
     "proc_pi_futex",
+    "proc_posix_timer",
     "proc_process_vm",
     "proc_procfs",
     "proc_sigsuspend_race",
@@ -107,6 +108,7 @@ members = [
     "proc_cow_threads",
     "proc_cow_forkrace",
     "proc_cow_fork_mmrace",
+    "proc_pollable_fd_wake",
 ]
 
 [workspace.package]

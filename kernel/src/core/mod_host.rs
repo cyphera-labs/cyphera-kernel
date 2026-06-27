@@ -120,6 +120,10 @@ pub fn current_signal_pending() -> bool {
     false
 }
 
+pub fn futex_wake_priority(_pid: Pid) -> u16 {
+    0
+}
+
 #[allow(dead_code)]
 pub fn reset_for_test() {
     park_table().lock().unwrap().clear();

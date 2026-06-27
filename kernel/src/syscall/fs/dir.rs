@@ -192,6 +192,14 @@ pub(crate) fn sys_mkdirat(dirfd: u64, pathname: u64, mode: u64) -> i64 {
         Ok(i) => {
             apply_create_owner(&i);
             apply_create_mode(&i, mode as u16);
+            if crate::fsnotify::watching() {
+                crate::fsnotify::dir_event(
+                    parent.as_ref(),
+                    &leaf,
+                    true,
+                    crate::fsnotify::IN_CREATE,
+                );
+            }
             0
         }
         Err(e) => e.as_neg_i64(),

@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use frame::sync::SpinIrq;
 
 use crate::core::wait::WaitQueue;
-use crate::process_model::Pid;
 
 mod fb;
 mod font;
@@ -66,7 +65,6 @@ struct State {
     cooked: Ring,
     line: Vec<u8>,
     eof_pending: bool,
-    last_reader: Option<Pid>,
     kbd_shift: bool,
     kbd_ctrl: bool,
     kbd_caps: bool,
@@ -79,7 +77,6 @@ impl State {
             cooked: Ring::new(),
             line: Vec::new(),
             eof_pending: false,
-            last_reader: None,
             kbd_shift: false,
             kbd_ctrl: false,
             kbd_caps: false,
@@ -111,9 +108,11 @@ const ECHOE: u32 = 0x0010;
 const ECHOK: u32 = 0x0020;
 
 const VINTR: usize = 0;
+const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
+const VSUSP: usize = 10;
 
 fn live_termios() -> [u8; 36] {
     let ctx = crate::vfs::path::Context::global();
@@ -159,19 +158,24 @@ fn process_input(b: u8, t: &[u8; 36], st: &mut State) {
     let canon = (lflag & ICANON) != 0;
     let isig = (lflag & ISIG) != 0;
 
+    let quit = cc(t, VQUIT);
+    let susp = cc(t, VSUSP);
+
     if isig && intr != 0 && b == intr {
-        const SIGINT: u32 = 2;
-        let fg = crate::syscall::console_fg_pgrp();
-        if fg != 0 {
-            crate::core::signal_pgrp(Pid(fg), SIGINT);
-        } else if let Some(pid) = st.last_reader {
-            let info = crate::core::signal::SigInfo::for_fault(SIGINT, 0);
-            let _ = crate::core::send_signal_with_info(pid, SIGINT, info);
-        }
+        crate::core::tty::deliver_input_signal(crate::core::tty::TtyId::Console, 0);
         st.line.clear();
         if echo_on {
             echo_str(b"^C\n");
         }
+        return;
+    }
+    if isig && quit != 0 && b == quit {
+        crate::core::tty::deliver_input_signal(crate::core::tty::TtyId::Console, 1);
+        st.line.clear();
+        return;
+    }
+    if isig && susp != 0 && b == susp {
+        crate::core::tty::deliver_input_signal(crate::core::tty::TtyId::Console, 2);
         return;
     }
 
@@ -386,10 +390,10 @@ pub fn read(out: &mut [u8], nonblock: bool) -> cyphera_kapi::KResult<usize> {
     if kbd_mode_get() == K_MEDIUMRAW {
         return read_kbd(out, nonblock);
     }
+    crate::core::tty::background_read_guard(crate::core::tty::CONSOLE_INODE_ID)?;
     use crate::vfs::blocking::IoAttempt;
     crate::vfs::blocking::block_io("console_read", &READERS, nonblock, None, || {
         let mut st = STATE.lock();
-        st.last_reader = Some(crate::core::current_pid());
         if !st.cooked.is_empty() {
             IoAttempt::Ready(st.cooked.pop_into(out))
         } else if st.eof_pending {
@@ -400,6 +404,20 @@ pub fn read(out: &mut [u8], nonblock: bool) -> cyphera_kapi::KResult<usize> {
         }
     })
 }
+
+pub fn flush_input() {
+    let mut st = STATE.lock();
+    st.line.clear();
+    st.cooked.head = 0;
+    st.cooked.tail = 0;
+    st.cooked.len = 0;
+    st.raw.head = 0;
+    st.raw.tail = 0;
+    st.raw.len = 0;
+    st.eof_pending = false;
+}
+
+pub fn flush_output() {}
 
 fn read_kbd(out: &mut [u8], nonblock: bool) -> cyphera_kapi::KResult<usize> {
     let ev = crate::device::input::read_kbd_event_blocking(nonblock)?;

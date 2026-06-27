@@ -80,6 +80,18 @@ pub fn set_current_time_ns(ns: Option<Arc<crate::process_model::TimeNamespace>>)
     with_current_ns_mut(|n| n.set_time(ns));
 }
 
+pub fn current_time_ns_offsets() -> (i64, i64) {
+    let pid = current_pid();
+    let ns = {
+        let g = GLOBAL.lock();
+        g.processes.get(&pid).and_then(|p| p.namespaces.time())
+    };
+    match ns {
+        Some(n) => (n.monotonic_offset_ns, n.boottime_offset_ns),
+        None => (0, 0),
+    }
+}
+
 pub fn current_cgroup_ns_root() -> Arc<crate::cgroup::Cgroup> {
     let pid = current_pid();
     let ns = {
@@ -107,6 +119,65 @@ pub fn set_current_net(ns: Option<Arc<crate::net::NetNamespace>>) {
 
 pub fn set_current_pending_net_ns(ns: Option<Arc<crate::net::NetNamespace>>) {
     with_current_ns_mut(|n| n.set_pending_net(ns));
+}
+
+pub fn set_current_pending_uts_ns(ns: Option<Arc<crate::process_model::UtsNamespace>>) {
+    with_current_ns_mut(|n| n.set_pending_uts(ns));
+}
+
+pub fn set_current_pending_cgroup_ns(ns: Option<Arc<crate::process_model::CgroupNamespace>>) {
+    with_current_ns_mut(|n| n.set_pending_cgroup(ns));
+}
+
+pub fn set_current_pending_time_ns(ns: Option<Arc<crate::process_model::TimeNamespace>>) {
+    with_current_ns_mut(|n| n.set_pending_time(ns));
+}
+
+pub fn set_current_pending_mount_table(table: Option<Arc<crate::vfs::MountTable>>) {
+    with_current_ns_mut(|n| n.set_pending_mount(table));
+}
+
+pub fn clear_current_pending_ns() {
+    with_current_ns_mut(|n| n.clear_pending());
+}
+
+#[derive(Default)]
+pub struct StagedNamespaces {
+    pub uts: Option<Arc<crate::process_model::UtsNamespace>>,
+    pub ipc: Option<Arc<crate::process_model::IpcNamespace>>,
+    pub net: Option<Arc<crate::net::NetNamespace>>,
+    pub pending_pid: Option<Arc<crate::process_model::PidNamespace>>,
+    pub cgroup: Option<Arc<crate::process_model::CgroupNamespace>>,
+    pub time: Option<Arc<crate::process_model::TimeNamespace>>,
+    pub mount_table: Option<Arc<crate::vfs::MountTable>>,
+}
+
+pub fn commit_current_ns_set(staged: StagedNamespaces) {
+    let pid = current_pid();
+    let mut g = GLOBAL.lock();
+    if let Some(p) = g.processes.get_mut(&pid) {
+        if let Some(uts) = staged.uts {
+            p.namespaces.set_uts(Some(uts));
+        }
+        if let Some(ipc) = staged.ipc {
+            p.namespaces.set_ipc(Some(ipc));
+        }
+        if let Some(net) = staged.net {
+            p.namespaces.set_net(Some(net));
+        }
+        if let Some(pid_ns) = staged.pending_pid {
+            p.namespaces.set_pending_pid(Some(pid_ns));
+        }
+        if let Some(cgroup) = staged.cgroup {
+            p.namespaces.set_cgroup(Some(cgroup));
+        }
+        if let Some(time) = staged.time {
+            p.namespaces.set_time(Some(time));
+        }
+        if let Some(mount_table) = staged.mount_table {
+            p.files.set_mount_table(Some(mount_table));
+        }
+    }
 }
 
 pub fn ns_handle_for(

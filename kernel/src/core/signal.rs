@@ -59,6 +59,7 @@ pub struct SigInfo {
 }
 
 pub const SI_KERNEL: i32 = 0x80;
+pub const SI_TIMER: i32 = -2;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const FPE_INTDIV: i32 = 1;
@@ -91,6 +92,10 @@ impl PendingSigInfo {
             info.sifields[8..12].copy_from_slice(&(self.sival as u32).to_le_bytes());
             info.sifields[12..16]
                 .copy_from_slice(&crate::security::seccomp::AUDIT_ARCH_X86_64.to_le_bytes());
+        } else if self.si_code == SI_TIMER {
+            info.sifields[0..4].copy_from_slice(&(self.aux as u32).to_le_bytes());
+            info.sifields[4..8].copy_from_slice(&self._pad.to_le_bytes());
+            info.sifields[8..16].copy_from_slice(&self.sival.to_le_bytes());
         } else {
             let pid = self.aux as u32;
             info.sifields[0..4].copy_from_slice(&(pid as i32).to_le_bytes());
@@ -137,6 +142,15 @@ impl SigInfo {
             _pad: 0,
             aux: sender_pid as u64,
             sival: 0,
+        }
+    }
+
+    pub fn for_timer(timer_id: i32, overrun: i32, sival: u64) -> PendingSigInfo {
+        PendingSigInfo {
+            si_code: SI_TIMER,
+            _pad: overrun as u32,
+            aux: timer_id as u32 as u64,
+            sival,
         }
     }
 

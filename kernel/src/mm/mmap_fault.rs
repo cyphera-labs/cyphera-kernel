@@ -23,24 +23,18 @@ pub fn detach_shared_file_current() {
 pub fn detach_shared_file_for(addr_space: &crate::process_model::AddressSpace) {
     let detached: Vec<(u64, u64, Arc<dyn Inode>, u64)> = {
         let mut m = addr_space.mmap.lock();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < m.vmas.len() {
-            let v = &m.vmas[i];
-            if v.flags.contains(VmaFlags::SHARED) {
-                if let VmaBacking::File {
-                    inode,
-                    file_offset_base,
-                } = &v.backing
-                {
-                    out.push((v.start, v.end, inode.clone(), *file_offset_base));
-                    m.vmas.remove(i);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        out
+        m.drain_vmas_where(|v| {
+            v.flags.contains(VmaFlags::SHARED) && matches!(v.backing, VmaBacking::File { .. })
+        })
+        .into_iter()
+        .filter_map(|v| match v.backing {
+            VmaBacking::File {
+                inode,
+                file_offset_base,
+            } => Some((v.start, v.end, inode, file_offset_base)),
+            _ => None,
+        })
+        .collect()
     };
 
     if detached.is_empty() {

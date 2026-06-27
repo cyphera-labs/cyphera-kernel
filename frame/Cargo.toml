@@ -18,7 +18,7 @@ bench = false
 doctest = false
 
 [dependencies]
-spin = { version = "0.9", default-features = false, features = ["lazy", "once"] }
+spin = { version = "0.12", default-features = false, features = ["lazy", "once"] }
 
 # x86_64: typed wrappers for descriptor tables, page-table entries, control
 # registers, MSRs. `abi_x86_interrupt` enables `set_handler_fn` impls that
@@ -32,6 +32,6 @@ linked_list_allocator = { version = "0.10", default-features = false }
 
 # Buddy allocator for physical frames. The `FrameAllocator` type sits
 # behind the `alloc` feature.
-buddy_system_allocator = { version = "0.10", default-features = false, features = ["alloc"] }
+buddy_system_allocator = { version = "0.13", default-features = false, features = ["alloc"] }
 
 bitflags = { version = "2.12", default-features = false }

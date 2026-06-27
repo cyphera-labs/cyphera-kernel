@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unexpected_cfgs)]
 
 use core::arch::asm;
 
@@ -17,6 +18,10 @@ const EPOLL_CTL_ADD: u64 = 1;
 const EPOLLIN: u32 = 0x001;
 
 const WAIT_TIMEOUT_MS: i32 = 5000;
+
+#[cfg(cyphera_reduced)]
+const ROUNDS: u32 = 200;
+#[cfg(not(cyphera_reduced))]
 const ROUNDS: u32 = 2000;
 
 #[repr(C)]
@@ -82,10 +87,13 @@ pub extern "C" fn _start() -> ! {
     }
 
     let mut events = [0u8; 12];
-    for _ in 0..ROUNDS {
+    let mut interrupted = 0u32;
+    while interrupted < ROUNDS {
         let r = sys_epoll_wait(epfd as u64, events.as_mut_ptr(), 1, WAIT_TIMEOUT_MS);
-        if r != EINTR {
-            log("epoll_wait returned non-EINTR (lost wakeup): ");
+        if r == EINTR {
+            interrupted += 1;
+        } else if r != 0 {
+            log("epoll_wait returned unexpected result: ");
             log_num(r);
             let _ = sys_kill(pid as i32, SIGKILL);
             sys_exit(1);

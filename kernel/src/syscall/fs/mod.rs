@@ -16,6 +16,7 @@ use super::{AT_FDCWD, PATH_MAX};
 
 mod dir;
 mod file_io;
+mod inotify;
 mod ioctl;
 mod link;
 mod locks;
@@ -34,16 +35,19 @@ pub(crate) use file_io::{
     sys_pwritev, sys_read, sys_readahead, sys_readv, sys_sendfile, sys_splice, sys_sync_file_range,
     sys_tee, sys_truncate, sys_vmsplice, sys_write, sys_writev,
 };
+pub(crate) use inotify::{
+    sys_inotify_add_watch, sys_inotify_init, sys_inotify_init1, sys_inotify_rm_watch,
+};
 pub(crate) use ioctl::DEFAULT_TERMIOS;
 pub(crate) use ioctl::sys_ioctl;
-pub use ioctl::{console_fg_pgrp, termios_get_pub};
+pub use ioctl::termios_get_pub;
 pub(crate) use link::{
     sys_linkat, sys_readlinkat, sys_renameat, sys_renameat2, sys_symlinkat, sys_unlinkat,
 };
 pub(crate) use locks::{sys_fcntl, sys_flock};
 pub(crate) use meta::{
-    sys_faccessat, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fstat, sys_newfstatat,
-    sys_stat, sys_statfs, sys_statx, sys_utimensat,
+    sys_faccessat, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fstat, sys_futimesat,
+    sys_newfstatat, sys_stat, sys_statfs, sys_statx, sys_utimensat, sys_utimes,
 };
 pub(crate) use mount::{sys_mount, sys_pivot_root, sys_umount2};
 pub(crate) use open::{sys_close, sys_close_range, sys_memfd_create, sys_openat, sys_openat2};

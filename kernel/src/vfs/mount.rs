@@ -83,26 +83,56 @@ pub fn change_propagation(ctx: &super::path::Context, t_norm: &str, flags: u64) 
 }
 
 pub fn move_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str) -> i64 {
-    let entry = match ctx.lookup_mount_full(s_norm) {
-        Some(e) => e,
-        None => return EINVAL,
-    };
+    if ctx.lookup_mount_full(s_norm).is_none() {
+        return EINVAL;
+    }
     let tgt_inode = match super::path::resolve(ctx, &ctx.root, t_norm) {
         Ok(i) => i,
         Err(e) => return e.as_neg_i64(),
     };
-    ctx.remove_mount(s_norm);
-    let moved_flags = entry.in_use.flags();
-    ctx.install_mount(
-        t_norm,
-        tgt_inode.inode_id(),
-        entry.root,
-        entry.propagation,
-        &entry.source,
-        &entry.fstype,
-        moved_flags,
-    );
+
+    let mut subtree = ctx.collect_subtree(s_norm);
+    subtree.sort_by_key(|e| e.0.len());
+
+    for (suffix, _) in subtree.iter().rev() {
+        let old_path = join_subtree(s_norm, suffix);
+        ctx.remove_mount(&old_path);
+    }
+
+    for (suffix, entry) in subtree.into_iter() {
+        let new_path = join_subtree(t_norm, &suffix);
+        let new_target_inode_id = if suffix.is_empty() {
+            tgt_inode.inode_id()
+        } else {
+            match super::path::resolve(ctx, &ctx.root, &new_path) {
+                Ok(i) => i.inode_id(),
+                Err(_) => entry.target_inode_id,
+            }
+        };
+        let moved_flags = entry.in_use.flags();
+        ctx.install_mount(
+            &new_path,
+            new_target_inode_id,
+            entry.root,
+            entry.propagation,
+            &entry.source,
+            &entry.fstype,
+            moved_flags,
+        );
+    }
     0
+}
+
+fn join_subtree(prefix: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return String::from(prefix);
+    }
+    if prefix == "/" {
+        return String::from(suffix);
+    }
+    let mut s = String::from(prefix);
+    s.push_str(suffix);
+    s
 }
 
 pub fn bind_mount(ctx: &super::path::Context, s_norm: &str, t_norm: &str, flags: u64) -> i64 {
@@ -203,6 +233,11 @@ pub fn do_umount(ctx: &super::path::Context, normalized: &str, flags: u64) -> i6
         }
     }
 
+    if ctx.lookup_mount_full(normalized).is_none() {
+        return EINVAL;
+    }
+
+    let detach = (flags & MNT_DETACH) != 0;
     let skip_busy_check = (flags & (MNT_DETACH | MNT_FORCE)) != 0;
     if !skip_busy_check {
         if let Some(entry) = ctx.lookup_mount_full(normalized) {
@@ -210,10 +245,36 @@ pub fn do_umount(ctx: &super::path::Context, normalized: &str, flags: u64) -> i6
                 return EBUSY;
             }
         }
+        if ctx.has_child_mount(normalized) {
+            return EBUSY;
+        }
     }
 
+    if detach {
+        if ctx.is_stacked(normalized) {
+            ctx.remove_mount_propagating(normalized);
+            return 0;
+        }
+        if normalized == "/" {
+            return EINVAL;
+        }
+        let mut subtree = ctx.collect_subtree(normalized);
+        subtree.sort_by_key(|e| core::cmp::Reverse(e.0.len()));
+        for (suffix, _) in subtree.iter() {
+            let path = join_subtree(normalized, suffix);
+            ctx.remove_mount_propagating(&path);
+        }
+        return 0;
+    }
+
+    let unmounted_vda = ctx
+        .lookup_mount_full(normalized)
+        .is_some_and(|e| e.source == "/dev/vda");
     if ctx.remove_mount_propagating(normalized).is_none() {
         return EINVAL;
+    }
+    if unmounted_vda {
+        crate::fs::devfs::vda_mount_release();
     }
     0
 }

@@ -1,6 +1,6 @@
 # Security
 
-Cyphera Kernel is a memory-safe, Rust-based OS kernel for virtual machines and confidential-computing environments. It runs ring-3 Linux-ABI ELF binaries against a real but still-incomplete syscall surface (270 of 385 implemented, 90 missing); this first release ships a hello-world ring-3 demo plus the in-tree selftest suite. It is not a server you deploy; it is a kernel binary
+Cyphera Kernel is a memory-safe, Rust-based OS kernel for virtual machines and confidential-computing environments. It runs ring-3 Linux-ABI ELF binaries against a real but still-incomplete syscall surface (283 of 385 implemented, 73 missing); this first release ships a hello-world ring-3 demo plus the in-tree selftest suite. It is not a server you deploy; it is a kernel binary
 that boots inside QEMU / KVM / cloud-CC enclaves. Threat model
 concerns are mostly about *what runs inside the kernel*, not about
 reachable network surface.

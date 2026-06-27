@@ -147,7 +147,7 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> cyphera_kapi:
                     .ok_or(cyphera_kapi::Errno::INVAL)?
                     .mmap
                     .lock();
-                m.vmas
+                m.vmas()
                     .iter()
                     .filter(|v| v.flags.contains(crate::process_model::VmaFlags::SHARED))
                     .filter_map(|v| match &v.backing {
@@ -283,9 +283,11 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> cyphera_kapi:
             cgroup_charged_bytes: 0,
             security: crate::process_model::SecurityContext::inherit(&parent.security),
             signals: crate::process_model::SignalContext::inherit(&parent.signals),
+            timers: crate::process_model::TimerContext::default(),
             sigactions: Arc::new(frame::sync::SpinIrq::new(sigactions_snapshot)),
             task,
             first_launch: Some(FirstLaunch::Fork { tf: child_tf }),
+            park_site: None,
             sched: SchedEntity {
                 home_cpu,
                 cpu_affinity: parent.sched.cpu_affinity,
@@ -337,6 +339,18 @@ pub fn fork_current(parent_tf: &TrapFrame, share_vmspace: bool) -> cyphera_kapi:
             }
             if let Some(staged) = p.namespaces.take_pending_net() {
                 child_box.namespaces.set_net(Some(staged));
+            }
+            if let Some(staged) = p.namespaces.take_pending_uts() {
+                child_box.namespaces.set_uts(Some(staged));
+            }
+            if let Some(staged) = p.namespaces.take_pending_cgroup() {
+                child_box.namespaces.set_cgroup(Some(staged));
+            }
+            if let Some(staged) = p.namespaces.take_pending_time() {
+                child_box.namespaces.set_time(Some(staged));
+            }
+            if let Some(staged) = p.namespaces.take_pending_mount() {
+                child_box.files.set_mount_table(Some(staged));
             }
         }
         let (event_opt_bit, fork_event) = if share_vmspace {
@@ -462,9 +476,11 @@ pub fn clone_thread_current(parent_tf: &TrapFrame, child_stack: u64) -> cyphera_
             cgroup_charged_bytes: 0,
             security: crate::process_model::SecurityContext::inherit(&parent.security),
             signals: crate::process_model::SignalContext::inherit(&parent.signals),
+            timers: crate::process_model::TimerContext::default(),
             sigactions: parent.sigactions.clone(),
             task,
             first_launch: Some(FirstLaunch::Fork { tf: child_tf }),
+            park_site: None,
             sched: SchedEntity {
                 home_cpu,
                 cpu_affinity: parent.sched.cpu_affinity,

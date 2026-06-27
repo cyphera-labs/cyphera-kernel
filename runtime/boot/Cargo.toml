@@ -224,6 +224,11 @@ path = "tests/subsystem/select.rs"
 harness = false
 
 [[test]]
+name = "pollable_fd_wake"
+path = "tests/subsystem/pollable_fd_wake.rs"
+harness = false
+
+[[test]]
 name = "pipe_size"
 path = "tests/subsystem/pipe_size.rs"
 harness = false
@@ -291,6 +296,11 @@ harness = false
 [[test]]
 name = "itimer"
 path = "tests/subsystem/itimer.rs"
+harness = false
+
+[[test]]
+name = "posix_timer"
+path = "tests/subsystem/posix_timer.rs"
 harness = false
 
 [[test]]
@@ -416,11 +426,6 @@ harness = false
 [[test]]
 name = "dl"
 path = "tests/subsystem/dl.rs"
-harness = false
-
-[[test]]
-name = "io_sched"
-path = "tests/subsystem/io_sched.rs"
 harness = false
 
 [[test]]

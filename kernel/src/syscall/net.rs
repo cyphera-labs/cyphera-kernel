@@ -63,8 +63,9 @@ pub(super) fn sys_socket(domain: u64, kind: u64, protocol: u64) -> i64 {
             s
         }
         (AF_UNIX, crate::net::inet::SOCK_STREAM) => crate::net::unix::UnixSocket::new_unbound(),
+        (AF_UNIX, SOCK_SEQPACKET) => crate::net::unix::UnixSocket::new_seqpacket(),
         (AF_UNIX, crate::net::inet::SOCK_DGRAM) => crate::net::unix::UnixSocket::new_dgram(),
-        (AF_NETLINK, _) => crate::net::netlink::NetlinkSocket::new(),
+        (AF_NETLINK, _) => crate::net::netlink::NetlinkSocket::new(proto as i32),
         _ => return EAFNOSUPPORT,
     };
     let mut flags = OpenFlags::RDWR;
@@ -305,6 +306,8 @@ const SCM_SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: u32 = 8;
 const MSG_DONTWAIT: u64 = 0x40;
+const SCM_CREDENTIALS: i32 = 2;
+const UCRED_LEN: usize = 12;
 
 fn parse_scm_rights(control: u64, controllen: u64) -> Result<alloc::vec::Vec<Arc<OpenFile>>, i64> {
     let mut out = alloc::vec::Vec::new();
@@ -341,37 +344,76 @@ fn parse_scm_rights(control: u64, controllen: u64) -> Result<alloc::vec::Vec<Arc
     Ok(out)
 }
 
-fn deliver_scm_rights(
+fn cmsg_align(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+fn push_cmsg(cbuf: &mut alloc::vec::Vec<u8>, ctype: i32, payload: &[u8]) {
+    let pad = cmsg_align(cbuf.len());
+    cbuf.resize(pad, 0);
+    let cmsg_len = CMSG_HDR_LEN + payload.len();
+    cbuf.extend_from_slice(&(cmsg_len as u64).to_le_bytes());
+    cbuf.extend_from_slice(&SCM_SOL_SOCKET.to_le_bytes());
+    cbuf.extend_from_slice(&ctype.to_le_bytes());
+    cbuf.extend_from_slice(payload);
+}
+
+fn deliver_control(
     fds: alloc::vec::Vec<Arc<OpenFile>>,
+    creds: Option<(i32, u32, u32)>,
     control: u64,
     controllen: u64,
 ) -> (u64, bool) {
-    if fds.is_empty() {
+    if fds.is_empty() && creds.is_none() {
         return (0, false);
     }
-    let needed = CMSG_HDR_LEN + fds.len() * 4;
-    if control == 0 || (controllen as usize) < needed {
+    if control == 0 {
         return (0, true);
     }
-    let mut ints: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
-    for of in fds {
-        match sched::with_current_fds(|t| t.install(of)) {
-            Ok(fd) => ints.push(fd),
-            Err(_) => break,
+    let cap = controllen as usize;
+    let mut cbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut truncated = false;
+
+    if !fds.is_empty() {
+        let need = cmsg_align(cbuf.len()) + CMSG_HDR_LEN + fds.len() * 4;
+        if need > cap {
+            truncated = true;
+        } else {
+            let mut ints: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+            for of in fds {
+                match sched::with_current_fds(|t| t.install(of)) {
+                    Ok(fd) => ints.push(fd),
+                    Err(_) => break,
+                }
+            }
+            let mut payload: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(ints.len() * 4);
+            for fd in &ints {
+                payload.extend_from_slice(&fd.to_le_bytes());
+            }
+            push_cmsg(&mut cbuf, SCM_RIGHTS, &payload);
         }
     }
-    let cmsg_len = CMSG_HDR_LEN + ints.len() * 4;
-    let mut cbuf = alloc::vec![0u8; cmsg_len];
-    cbuf[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-    cbuf[8..12].copy_from_slice(&SCM_SOL_SOCKET.to_le_bytes());
-    cbuf[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
-    for (i, fd) in ints.iter().enumerate() {
-        cbuf[CMSG_HDR_LEN + i * 4..CMSG_HDR_LEN + i * 4 + 4].copy_from_slice(&fd.to_le_bytes());
+
+    if let Some((pid, uid, gid)) = creds {
+        let mut payload = [0u8; UCRED_LEN];
+        payload[0..4].copy_from_slice(&pid.to_le_bytes());
+        payload[4..8].copy_from_slice(&uid.to_le_bytes());
+        payload[8..12].copy_from_slice(&gid.to_le_bytes());
+        let need = cmsg_align(cbuf.len()) + CMSG_HDR_LEN + UCRED_LEN;
+        if need > cap {
+            truncated = true;
+        } else {
+            push_cmsg(&mut cbuf, SCM_CREDENTIALS, &payload);
+        }
+    }
+
+    if cbuf.is_empty() {
+        return (0, truncated);
     }
     if frame::user::copy_to_user(control, &cbuf).is_err() {
         return (0, true);
     }
-    (cmsg_len as u64, false)
+    (cbuf.len() as u64, truncated)
 }
 
 pub(super) fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
@@ -415,8 +457,24 @@ pub(super) fn sys_recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     }
     let control = u64::from_le_bytes(hdr[MH_CONTROL..MH_CONTROL + 8].try_into().unwrap());
     let controllen = u64::from_le_bytes(hdr[MH_CONTROL + 8..MH_CONTROL + 16].try_into().unwrap());
-    let (ctrl_len, ctrunc) = deliver_scm_rights(fds, control, controllen);
-    let _ = frame::user::copy_to_user(msg + MH_NAMELEN, &0u32.to_le_bytes());
+    let creds = file.inode.as_socket().and_then(|s| s.recv_creds());
+    let src = file.inode.as_socket().and_then(|s| s.recv_src_addr());
+    let (ctrl_len, ctrunc) = deliver_control(fds, creds, control, controllen);
+    let name_ptr = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+    let name_cap = u32::from_le_bytes(
+        hdr[MH_NAMELEN as usize..MH_NAMELEN as usize + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let namelen = match &src {
+        Some(a) if name_ptr != 0 && name_cap > 0 => {
+            let n = a.len().min(name_cap as usize);
+            let _ = frame::user::copy_to_user(name_ptr, &a[..n]);
+            a.len() as u32
+        }
+        _ => 0u32,
+    };
+    let _ = frame::user::copy_to_user(msg + MH_NAMELEN, &namelen.to_le_bytes());
     let _ = frame::user::copy_to_user(msg + MH_CONTROLLEN, &ctrl_len.to_le_bytes());
     let flags = if ctrunc { MSG_CTRUNC } else { 0 };
     let _ = frame::user::copy_to_user(msg + MH_FLAGS, &flags.to_le_bytes());

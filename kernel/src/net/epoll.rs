@@ -211,7 +211,10 @@ impl Inode for EpollInstance {
         Stat::fresh(InodeKind::Pipe, 0, 0o600)
     }
     fn on_open(&self, _flags: OpenFlags) {}
-    fn on_close(&self, _flags: OpenFlags) {}
+    fn on_close(&self, _flags: OpenFlags) {
+        let key = self as *const EpollInstance as *const () as usize;
+        crate::syscall::event::unregister_epoll(key);
+    }
     fn poll(&self) -> PollMask {
         PollMask::empty()
     }

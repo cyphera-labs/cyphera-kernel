@@ -15,7 +15,7 @@ use frame::user::{TrapFrame, start_user_process};
 
 use crate::process_model::{
     NICE_0_LOAD, NSIG, Pid, Process, ProcessKind, ProcessState, SIGCHLD, SIGCONT, SIGKILL, SIGSEGV,
-    SIGSTOP, SchedClass, SchedOwner, nice_to_weight,
+    SIGSTOP, STOP_SIGNAL_MASK, SchedClass, SchedOwner, nice_to_weight,
 };
 pub use runqueue::{
     CfsPlace, DL_BW_MAX, DL_BW_SCALE, EnqueueData, RT_PRIO_COUNT, RT_PRIO_MAX, RT_PRIO_MIN,
@@ -25,6 +25,7 @@ pub use runqueue::{
 pub mod runqueue;
 pub mod signal;
 pub mod timeout;
+pub mod tty;
 pub mod wait;
 
 mod accounting;
@@ -247,12 +248,24 @@ pub(in crate::core) fn set_sched_owner(proc: &mut Process, new: SchedOwner, site
             new,
         );
     }
+    let state = &proc.state.0;
+    if !crate::sched_state::state_owner_consistent(state, new) {
+        panic!(
+            "[sched-invariant] state/owner divergence at {site}: pid {} state {:?} vs owner {} -> {}",
+            pid.0,
+            state,
+            fmt_owner(cur),
+            fmt_owner(new),
+        );
+    }
     match new {
         SchedOwner::Stopped | SchedOwner::Traced | SchedOwner::Parked { .. } => {
             proc.sched.parking_unsaved = true;
+            proc.park_site = Some(site);
         }
         SchedOwner::Running { .. } => {
             proc.sched.parking_unsaved = false;
+            proc.park_site = None;
         }
         _ => {}
     }
@@ -266,8 +279,17 @@ pub(in crate::core) fn set_state(
 ) {
     if !crate::sched_state::state_transition_ok(&proc.state.0, &new) {
         panic!(
-            "[sched-invariant] dead-task resurrection at {site}: pid {} {:?} -> {:?}",
+            "[sched-invariant] BAD STATE TRANSITION at {site}: pid {} {:?} -> {:?}",
             proc.pid.0, proc.state.0, new
+        );
+    }
+    if !crate::sched_state::state_owner_consistent(&new, proc.sched_owner.0) {
+        panic!(
+            "[sched-invariant] state/owner divergence at {site}: pid {} state {:?} -> {:?} vs owner {}",
+            proc.pid.0,
+            proc.state.0,
+            new,
+            fmt_owner(proc.sched_owner.0),
         );
     }
     proc.state.0 = new;

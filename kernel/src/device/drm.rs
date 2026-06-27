@@ -10,6 +10,7 @@ use frame::sync::SpinIrq;
 use cyphera_kapi::{Errno, KResult};
 
 use crate::core::wait::WaitQueue;
+use crate::errno::*;
 use crate::ipc::shm::ShmSegment;
 use crate::vfs::blocking::{IoAttempt, block_io};
 use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
@@ -17,6 +18,7 @@ use crate::vfs::{Inode, InodeKind, OpenFlags, PollMask, Stat};
 static DRM_WAIT: WaitQueue = WaitQueue::new();
 
 const NR_VERSION: u32 = 0x00;
+const NR_GEM_CLOSE: u32 = 0x09;
 const NR_SET_MASTER: u32 = 0x1e;
 const NR_DROP_MASTER: u32 = 0x1f;
 const NR_GET_CAP: u32 = 0x0c;
@@ -35,6 +37,9 @@ const NR_MAP_DUMB: u32 = 0xb3;
 const NR_DESTROY_DUMB: u32 = 0xb4;
 const NR_ADDFB2: u32 = 0xb8;
 const NR_OBJ_GETPROPERTIES: u32 = 0xb9;
+const NR_GET_MAGIC: u32 = 0x02;
+const NR_AUTH_MAGIC: u32 = 0x11;
+const NR_CURSOR: u32 = 0xa3;
 
 const CONNECTOR_ID: u32 = 1;
 const ENCODER_ID: u32 = 1;
@@ -48,13 +53,6 @@ const MAX_QUEUED_EVENTS: usize = 64;
 const CAP_DUMB_BUFFER: u64 = 0x1;
 const CLIENT_CAP_STEREO_3D: u64 = 1;
 const CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
-
-const EFAULT: i64 = -14;
-const EINVAL: i64 = -22;
-const ENOENT: i64 = -2;
-const ENOMEM: i64 = -12;
-const ENOTTY: i64 = -25;
-const EOPNOTSUPP: i64 = -95;
 
 fn rd32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -85,6 +83,7 @@ struct Dumb {
 struct Fb {
     pitch: u32,
     handle: u32,
+    virgl: bool,
 }
 
 struct DrmState {
@@ -168,30 +167,69 @@ fn seg_read(seg: &ShmSegment, off: usize, buf: &mut [u8]) -> usize {
     done
 }
 
-fn present(st: &DrmState, fb_id: u32) -> i64 {
+enum PresentPlan {
+    Virgl {
+        handle: u32,
+    },
+    Dumb {
+        seg: Arc<ShmSegment>,
+        src_pitch: usize,
+        height: u32,
+    },
+}
+
+fn resolve_present(st: &DrmState, fb_id: u32) -> Result<PresentPlan, i64> {
     let fb = match st.fbs.get(&fb_id) {
         Some(f) => f,
-        None => return ENOENT,
+        None => return Err(ENOENT),
     };
+    if fb.virgl {
+        return Ok(PresentPlan::Virgl { handle: fb.handle });
+    }
     let dumb = match st.dumbs.get(&fb.handle) {
         Some(d) => d,
-        None => return ENOENT,
-    };
-    let (sw, sh) = match ::virtio::framebuffer_info() {
-        Some((_, _, w, h)) => (w, h),
-        None => return ENOTTY,
+        None => return Err(ENOENT),
     };
     let src_pitch = if fb.pitch != 0 { fb.pitch } else { dumb.pitch } as usize;
-    let dst_pitch = (sw as usize) * 4;
-    let rows = (dumb.height as usize).min(sh as usize);
-    let rowbytes = src_pitch.min(dst_pitch).min(MAX_ROW);
-    let mut row = [0u8; MAX_ROW];
-    for y in 0..rows {
-        let got = seg_read(&dumb.seg, y * src_pitch, &mut row[..rowbytes]);
-        ::virtio::fb_write(y * dst_pitch, &row[..got]);
+    Ok(PresentPlan::Dumb {
+        seg: dumb.seg.clone(),
+        src_pitch,
+        height: dumb.height,
+    })
+}
+
+fn present(plan: &PresentPlan) -> i64 {
+    match plan {
+        PresentPlan::Virgl { handle } => {
+            let (w, h) = scanout_dims();
+            if crate::device::virtgpu::scanout_present(*handle, w, h) {
+                0
+            } else {
+                EINVAL
+            }
+        }
+        PresentPlan::Dumb {
+            seg,
+            src_pitch,
+            height,
+        } => {
+            let src_pitch = *src_pitch;
+            let (sw, sh) = match ::virtio::framebuffer_info() {
+                Some((_, _, w, h)) => (w, h),
+                None => return ENOTTY,
+            };
+            let dst_pitch = (sw as usize) * 4;
+            let rows = (*height as usize).min(sh as usize);
+            let rowbytes = src_pitch.min(dst_pitch).min(MAX_ROW);
+            let mut row = [0u8; MAX_ROW];
+            for y in 0..rows {
+                let got = seg_read(seg, y * src_pitch, &mut row[..rowbytes]);
+                ::virtio::fb_write(y * dst_pitch, &row[..got]);
+            }
+            let _ = ::virtio::gpu_flush();
+            0
+        }
     }
-    let _ = ::virtio::gpu_flush();
-    0
 }
 
 const MAX_ROW: usize = 8192;
@@ -226,6 +264,7 @@ pub fn ioctl(cmd: u32, arg: u64) -> i64 {
     let nr = cmd & 0xff;
     match nr {
         NR_VERSION => ioctl_version(arg),
+        NR_GEM_CLOSE => ioctl_gem_close(arg),
         NR_GET_CAP => ioctl_get_cap(arg),
         NR_SET_CLIENT_CAP => ioctl_set_client_cap(arg),
         NR_SET_MASTER => {
@@ -250,8 +289,20 @@ pub fn ioctl(cmd: u32, arg: u64) -> i64 {
         NR_PAGE_FLIP => ioctl_page_flip(arg),
         NR_OBJ_GETPROPERTIES => ioctl_obj_getproperties(arg),
         NR_GETPLANERESOURCES => ioctl_getplaneresources(arg),
+        NR_GET_MAGIC => ioctl_get_magic(arg),
+        NR_AUTH_MAGIC => 0,
+        NR_CURSOR => 0,
+        0x40..=0x5f => crate::device::virtgpu::ioctl(cmd, arg),
         _ => ENOTTY,
     }
+}
+
+fn ioctl_get_magic(arg: u64) -> i64 {
+    let magic: u32 = 1;
+    if frame::user::copy_to_user(arg, &magic.to_le_bytes()).is_err() {
+        return EFAULT;
+    }
+    0
 }
 
 fn ioctl_obj_getproperties(arg: u64) -> i64 {
@@ -283,13 +334,13 @@ fn ioctl_version(arg: u64) -> i64 {
     if frame::user::copy_from_user(arg, &mut b).is_err() {
         return EFAULT;
     }
-    wr32(&mut b, 0, 1);
-    wr32(&mut b, 4, 0);
+    wr32(&mut b, 0, 0);
+    wr32(&mut b, 4, 1);
     wr32(&mut b, 8, 0);
     let fields: [(usize, usize, &[u8]); 3] = [
-        (16, 24, b"cyphera"),
-        (32, 40, b"20260606"),
-        (48, 56, b"cyphera virtio-gpu kms"),
+        (16, 24, b"virtio_gpu"),
+        (32, 40, b"0"),
+        (48, 56, b"virtio gpu"),
     ];
     for (len_off, ptr_off, s) in fields {
         let cap = rd64(&b, len_off) as usize;
@@ -476,9 +527,15 @@ fn ioctl_setcrtc(arg: u64) -> i64 {
         st.mode.copy_from_slice(&b[36..104]);
         st.mode_valid = true;
     }
-    let rc = present(&st, fb_id);
+    let plan = match resolve_present(&st, fb_id) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    drop(st);
+
+    let rc = present(&plan);
     if rc == 0 {
-        st.scanout_fb = fb_id;
+        DRM.lock().scanout_fb = fb_id;
         crate::console::suspend_fb_sink(true);
     }
     rc
@@ -559,13 +616,7 @@ fn ioctl_map_dumb(arg: u64) -> i64 {
     0
 }
 
-fn ioctl_destroy_dumb(arg: u64) -> i64 {
-    let mut b = [0u8; 4];
-    if frame::user::copy_from_user(arg, &mut b).is_err() {
-        return EFAULT;
-    }
-    let handle = rd32(&b, 0);
-    let mut st = DRM.lock();
+fn remove_dumb_locked(st: &mut DrmState, handle: u32) {
     let dead: alloc::vec::Vec<u32> = st
         .fbs
         .iter()
@@ -579,6 +630,31 @@ fn ioctl_destroy_dumb(arg: u64) -> i64 {
         }
     }
     st.dumbs.remove(&handle);
+}
+
+fn ioctl_destroy_dumb(arg: u64) -> i64 {
+    let mut b = [0u8; 4];
+    if frame::user::copy_from_user(arg, &mut b).is_err() {
+        return EFAULT;
+    }
+    let handle = rd32(&b, 0);
+    let mut st = DRM.lock();
+    remove_dumb_locked(&mut st, handle);
+    0
+}
+
+fn ioctl_gem_close(arg: u64) -> i64 {
+    let mut b = [0u8; 8];
+    if frame::user::copy_from_user(arg, &mut b).is_err() {
+        return EFAULT;
+    }
+    let handle = rd32(&b, 0);
+    if crate::device::virtgpu::is_resource(handle) {
+        crate::device::virtgpu::free_resource(handle);
+    } else {
+        let mut st = DRM.lock();
+        remove_dumb_locked(&mut st, handle);
+    }
     0
 }
 
@@ -590,12 +666,20 @@ fn ioctl_addfb(arg: u64) -> i64 {
     let pitch = rd32(&b, 12);
     let handle = rd32(&b, 24);
     let mut st = DRM.lock();
-    if !st.dumbs.contains_key(&handle) {
+    let virgl = !st.dumbs.contains_key(&handle);
+    if virgl && !crate::device::virtgpu::is_resource(handle) {
         return EINVAL;
     }
     let fb_id = st.next_fb;
     st.next_fb += 1;
-    st.fbs.insert(fb_id, Fb { pitch, handle });
+    st.fbs.insert(
+        fb_id,
+        Fb {
+            pitch,
+            handle,
+            virgl,
+        },
+    );
     drop(st);
     wr32(&mut b, 0, fb_id);
     if frame::user::copy_to_user(arg, &b).is_err() {
@@ -612,12 +696,20 @@ fn ioctl_addfb2(arg: u64) -> i64 {
     let handle = rd32(&b, 20);
     let pitch = rd32(&b, 36);
     let mut st = DRM.lock();
-    if !st.dumbs.contains_key(&handle) {
+    let virgl = !st.dumbs.contains_key(&handle);
+    if virgl && !crate::device::virtgpu::is_resource(handle) {
         return EINVAL;
     }
     let fb_id = st.next_fb;
     st.next_fb += 1;
-    st.fbs.insert(fb_id, Fb { pitch, handle });
+    st.fbs.insert(
+        fb_id,
+        Fb {
+            pitch,
+            handle,
+            virgl,
+        },
+    );
     drop(st);
     wr32(&mut b, 0, fb_id);
     if frame::user::copy_to_user(arg, &b).is_err() {
@@ -650,14 +742,22 @@ fn ioctl_page_flip(arg: u64) -> i64 {
     let flags = rd32(&b, 8);
     let user_data = rd64(&b, 16);
 
-    let mut st = DRM.lock();
+    let st = DRM.lock();
     if !st.fbs.contains_key(&fb_id) {
         return EINVAL;
     }
-    let rc = present(&st, fb_id);
+    let plan = match resolve_present(&st, fb_id) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    drop(st);
+
+    let rc = present(&plan);
     if rc != 0 {
         return rc;
     }
+
+    let mut st = DRM.lock();
     st.scanout_fb = fb_id;
     crate::console::suspend_fb_sink(true);
 
@@ -709,16 +809,20 @@ impl Inode for Card {
         InodeKind::CharDevice
     }
     fn stat(&self) -> Stat {
-        Stat::fresh(InodeKind::CharDevice, 0, 0o666)
+        let mut s = Stat::fresh(InodeKind::CharDevice, 0, 0o666);
+        s.rdev = crate::vfs::makedev(226, 0);
+        s
     }
     fn is_drm_card(&self) -> bool {
         true
     }
     fn on_open(&self, _flags: crate::vfs::OpenFlags) {
         on_open();
+        crate::device::virtgpu::on_open();
     }
     fn on_close(&self, _flags: crate::vfs::OpenFlags) {
         on_close();
+        crate::device::virtgpu::on_close();
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         self.read_at_with_flags(offset, buf, OpenFlags::empty())

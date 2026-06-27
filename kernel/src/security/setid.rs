@@ -36,6 +36,7 @@ fn map_setgid_in(c: &crate::process_model::Credentials, id: u32) -> Option<u32> 
 }
 
 pub(crate) fn sys_setresuid(new_ruid: u32, new_euid: u32, new_suid: u32) -> i64 {
+    let keep_caps = sched::current_keep_caps();
     sched::with_current_creds_mut(|c| {
         let (k_ruid, k_euid, k_suid) = match (
             map_setuid_in(c, new_ruid),
@@ -63,7 +64,7 @@ pub(crate) fn sys_setresuid(new_ruid: u32, new_euid: u32, new_suid: u32) -> i64 
         if k_suid != SETID_KEEP {
             c.suid = k_suid;
         }
-        c.apply_uid_change_caps(or, oe, os, of);
+        c.apply_uid_change_caps(or, oe, os, of, keep_caps);
         0
     })
 }
@@ -100,6 +101,7 @@ pub(crate) fn sys_setresgid(new_rgid: u32, new_egid: u32, new_sgid: u32) -> i64 
 }
 
 pub(crate) fn sys_setuid(uid: u32) -> i64 {
+    let keep_caps = sched::current_keep_caps();
     sched::with_current_creds_mut(|c| {
         let ku = match c.uid_into_kernel(uid) {
             Some(k) => k,
@@ -111,13 +113,13 @@ pub(crate) fn sys_setuid(uid: u32) -> i64 {
             c.euid = ku;
             c.suid = ku;
             c.fsuid = ku;
-            c.apply_uid_change_caps(or, oe, os, of);
+            c.apply_uid_change_caps(or, oe, os, of, keep_caps);
             return 0;
         }
         if ku == c.ruid || ku == c.euid || ku == c.suid {
             c.euid = ku;
             c.fsuid = ku;
-            c.apply_uid_change_caps(or, oe, os, of);
+            c.apply_uid_change_caps(or, oe, os, of, keep_caps);
             return 0;
         }
         EPERM
@@ -147,6 +149,7 @@ pub(crate) fn sys_setgid(gid: u32) -> i64 {
 }
 
 pub(crate) fn sys_setreuid(new_ruid: u32, new_euid: u32) -> i64 {
+    let keep_caps = sched::current_keep_caps();
     sched::with_current_creds_mut(|c| {
         let (k_ruid, k_euid) = match (map_setuid_in(c, new_ruid), map_setuid_in(c, new_euid)) {
             (Some(r), Some(e)) => (r, e),
@@ -171,7 +174,7 @@ pub(crate) fn sys_setreuid(new_ruid: u32, new_euid: u32) -> i64 {
         if ruid_changing || (euid_changing && k_euid != c.suid) {
             c.suid = c.euid;
         }
-        c.apply_uid_change_caps(or, oe, os, of);
+        c.apply_uid_change_caps(or, oe, os, of, keep_caps);
         0
     })
 }
@@ -260,13 +263,15 @@ pub fn exec_transition(
     rgid: u32,
     pre_egid: u32,
     nosuid: bool,
+    no_new_privs: bool,
 ) -> ExecCredTransition {
-    let suid_owner = if !nosuid && file_mode & 0o4000 != 0 {
+    let grant_setid = !nosuid && !no_new_privs;
+    let suid_owner = if grant_setid && file_mode & 0o4000 != 0 {
         Some(file_uid)
     } else {
         None
     };
-    let sgid_owner = if !nosuid && file_mode & 0o2000 != 0 {
+    let sgid_owner = if grant_setid && file_mode & 0o2000 != 0 {
         Some(file_gid)
     } else {
         None

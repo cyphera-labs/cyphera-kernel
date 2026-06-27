@@ -36,6 +36,7 @@ pub struct Stat {
     pub gid: u32,
     pub inode_id: u64,
     pub dev_id: u64,
+    pub rdev: u64,
     pub blksize: u32,
     pub blocks: u64,
     pub atime: TimeSpec,
@@ -54,6 +55,7 @@ impl Stat {
             gid: 0,
             inode_id: 0,
             dev_id: 0,
+            rdev: 0,
             blksize: 4096,
             blocks: 0,
             atime: TimeSpec { sec: 0, nsec: 0 },
@@ -61,6 +63,12 @@ impl Stat {
             ctime: TimeSpec { sec: 0, nsec: 0 },
         }
     }
+}
+
+pub const fn makedev(major: u32, minor: u32) -> u64 {
+    let major = major as u64;
+    let minor = minor as u64;
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
 #[derive(Debug, Clone)]
@@ -195,11 +203,27 @@ pub trait Inode: Send + Sync {
         0
     }
 
+    fn check_open(&self, _flags: OpenFlags) -> KResult<()> {
+        Ok(())
+    }
+
     fn on_open(&self, _flags: OpenFlags) {}
     fn on_close(&self, _flags: OpenFlags) {}
 
     fn is_drm_card(&self) -> bool {
         false
+    }
+
+    fn is_drm_render(&self) -> bool {
+        false
+    }
+
+    fn alsa_kind(&self) -> Option<u8> {
+        None
+    }
+
+    fn evdev_idx(&self) -> Option<usize> {
+        None
     }
 
     fn set_mode(&self, _mode: u16) -> KResult<()> {
@@ -392,7 +416,16 @@ impl Drop for OpenFile {
     fn drop(&mut self) {
         let ofd_key = self as *const OpenFile as usize as u64;
         crate::vfs::locks::bsd::drop_ofd(ofd_key);
-        self.inode.on_close(self.flags());
+        let flags = self.flags();
+        self.inode.on_close(flags);
+        if crate::fsnotify::watching() && matches!(self.inode.kind(), InodeKind::Regular) {
+            let mask = if flags.is_writable() {
+                crate::fsnotify::IN_CLOSE_WRITE
+            } else {
+                crate::fsnotify::IN_CLOSE_NOWRITE
+            };
+            crate::fsnotify::self_event(self.inode.as_ref(), mask);
+        }
     }
 }
 
@@ -605,15 +638,163 @@ pub struct MountEntry {
     pub fstype: String,
 }
 
+#[derive(Clone)]
+struct NodeData {
+    target_inode_id: u64,
+    root: Arc<dyn Inode>,
+    propagation: MountPropagation,
+    in_use: Arc<MountInUseTag>,
+    source: String,
+    fstype: String,
+}
+
+impl NodeData {
+    fn to_entry(&self) -> MountEntry {
+        MountEntry {
+            target_inode_id: self.target_inode_id,
+            root: self.root.clone(),
+            propagation: self.propagation.clone(),
+            in_use: self.in_use.clone(),
+            source: self.source.clone(),
+            fstype: self.fstype.clone(),
+        }
+    }
+}
+
+pub struct MountNode {
+    mountpoint: VfsSpinIrq<String>,
+    data: VfsSpinIrq<NodeData>,
+    parent: VfsSpinIrq<alloc::sync::Weak<MountNode>>,
+    children: VfsSpinIrq<Vec<Arc<MountNode>>>,
+    shadowed: VfsSpinIrq<Vec<NodeData>>,
+}
+
+impl MountNode {
+    fn new(mountpoint: String, data: NodeData) -> Arc<Self> {
+        Arc::new(Self {
+            mountpoint: VfsSpinIrq::new(mountpoint),
+            data: VfsSpinIrq::new(data),
+            parent: VfsSpinIrq::new(alloc::sync::Weak::new()),
+            children: VfsSpinIrq::new(Vec::new()),
+            shadowed: VfsSpinIrq::new(Vec::new()),
+        })
+    }
+
+    fn mountpoint(&self) -> String {
+        self.mountpoint.lock().clone()
+    }
+
+    fn entry(&self) -> MountEntry {
+        self.data.lock().to_entry()
+    }
+
+    fn collect_descendants(self: &Arc<Self>, out: &mut Vec<Arc<MountNode>>) {
+        for child in self.children.lock().iter() {
+            out.push(child.clone());
+            child.collect_descendants(out);
+        }
+    }
+}
+
 struct MountTableInner {
-    mounts: BTreeMap<String, MountEntry>,
+    roots: Vec<Arc<MountNode>>,
+    by_path: BTreeMap<String, Arc<MountNode>>,
 }
 
 impl MountTableInner {
     const fn new() -> Self {
         Self {
-            mounts: BTreeMap::new(),
+            roots: Vec::new(),
+            by_path: BTreeMap::new(),
         }
+    }
+
+    fn is_descendant_path(child: &str, ancestor: &str) -> bool {
+        if ancestor == "/" {
+            return child != "/";
+        }
+        child.starts_with(ancestor) && child.as_bytes().get(ancestor.len()) == Some(&b'/')
+    }
+
+    fn deepest_existing_ancestor(&self, path: &str) -> Option<Arc<MountNode>> {
+        let mut best: Option<&Arc<MountNode>> = None;
+        for (k, v) in self.by_path.iter() {
+            if Self::is_descendant_path(path, k) {
+                match best {
+                    None => best = Some(v),
+                    Some(b) if k.len() > b.mountpoint.lock().len() => best = Some(v),
+                    _ => {}
+                }
+            }
+        }
+        best.cloned()
+    }
+
+    fn link_into_tree(&mut self, node: &Arc<MountNode>) {
+        let path = node.mountpoint();
+        let parent = self.deepest_existing_ancestor(&path);
+        let reparent: Vec<Arc<MountNode>> = match &parent {
+            Some(p) => {
+                let mut moved = Vec::new();
+                p.children.lock().retain(|c| {
+                    if Self::is_descendant_path(&c.mountpoint(), &path) {
+                        moved.push(c.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                moved
+            }
+            None => {
+                let mut moved = Vec::new();
+                self.roots.retain(|c| {
+                    if Self::is_descendant_path(&c.mountpoint(), &path) {
+                        moved.push(c.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                moved
+            }
+        };
+        for c in reparent.iter() {
+            *c.parent.lock() = Arc::downgrade(node);
+            node.children.lock().push(c.clone());
+        }
+        match &parent {
+            Some(p) => {
+                *node.parent.lock() = Arc::downgrade(p);
+                p.children.lock().push(node.clone());
+            }
+            None => {
+                *node.parent.lock() = alloc::sync::Weak::new();
+                self.roots.push(node.clone());
+            }
+        }
+    }
+
+    fn unlink_from_tree(&mut self, node: &Arc<MountNode>) {
+        let parent = node.parent.lock().upgrade();
+        let promoted: Vec<Arc<MountNode>> = node.children.lock().drain(..).collect();
+        match &parent {
+            Some(p) => {
+                p.children.lock().retain(|c| !Arc::ptr_eq(c, node));
+                for c in promoted.iter() {
+                    *c.parent.lock() = Arc::downgrade(p);
+                    p.children.lock().push(c.clone());
+                }
+            }
+            None => {
+                self.roots.retain(|c| !Arc::ptr_eq(c, node));
+                for c in promoted.iter() {
+                    *c.parent.lock() = alloc::sync::Weak::new();
+                    self.roots.push(c.clone());
+                }
+            }
+        }
+        *node.parent.lock() = alloc::sync::Weak::new();
     }
 }
 
@@ -669,6 +850,7 @@ impl MountTable {
             source,
             fstype,
             mount_flags,
+            false,
         );
     }
 
@@ -683,14 +865,8 @@ impl MountTable {
         source: &str,
         fstype: &str,
         mount_flags: u64,
+        preserve_tag: bool,
     ) {
-        if let Some(prev) = g.mounts.get(target_path) {
-            match &prev.propagation {
-                MountPropagation::Shared(pg) => pg.remove_member(self_weak, target_path),
-                MountPropagation::Slave(pg) => pg.remove_slave(self_weak, target_path),
-                _ => {}
-            }
-        }
         match &propagation {
             MountPropagation::Shared(pg) => {
                 pg.add_member(self_weak.clone(), String::from(target_path));
@@ -700,38 +876,57 @@ impl MountTable {
             }
             _ => {}
         }
-        let in_use = match g.mounts.get(target_path) {
-            Some(prev) => {
-                prev.in_use.set_flags(mount_flags);
-                prev.in_use.clone()
+
+        if let Some(existing) = g.by_path.get(target_path).cloned() {
+            let mut old = existing.data.lock();
+            match &old.propagation {
+                MountPropagation::Shared(pg) => pg.remove_member(self_weak, target_path),
+                MountPropagation::Slave(pg) => pg.remove_slave(self_weak, target_path),
+                _ => {}
             }
-            None => MountInUseTag::new_with_flags(mount_flags),
-        };
-        g.mounts.insert(
-            String::from(target_path),
-            MountEntry {
+            let in_use = if preserve_tag {
+                old.in_use.set_flags(mount_flags);
+                old.in_use.clone()
+            } else {
+                existing.shadowed.lock().push(old.clone());
+                MountInUseTag::new_with_flags(mount_flags)
+            };
+            *old = NodeData {
                 target_inode_id,
                 root,
                 propagation,
                 in_use,
                 source: String::from(source),
                 fstype: String::from(fstype),
-            },
-        );
+            };
+            return;
+        }
+
+        let data = NodeData {
+            target_inode_id,
+            root,
+            propagation,
+            in_use: MountInUseTag::new_with_flags(mount_flags),
+            source: String::from(source),
+            fstype: String::from(fstype),
+        };
+        let node = MountNode::new(String::from(target_path), data);
+        g.link_into_tree(&node);
+        g.by_path.insert(String::from(target_path), node);
     }
 
     pub fn lookup(&self, target_path: &str) -> Option<Arc<dyn Inode>> {
         self.inner
             .lock()
-            .mounts
+            .by_path
             .get(target_path)
-            .map(|e| e.root.clone())
+            .map(|n| n.data.lock().root.clone())
     }
 
     pub fn set_flags_at(&self, target_path: &str, mount_flags: u64) -> bool {
-        match self.inner.lock().mounts.get(target_path) {
-            Some(e) => {
-                e.in_use.set_flags(mount_flags);
+        match self.inner.lock().by_path.get(target_path) {
+            Some(n) => {
+                n.data.lock().in_use.set_flags(mount_flags);
                 true
             }
             None => false,
@@ -740,18 +935,19 @@ impl MountTable {
 
     pub fn set_flags_by_inode(&self, inode_id: u64, mount_flags: u64) -> bool {
         let g = self.inner.lock();
-        let mut hit: Option<&MountEntry> = None;
-        for e in g.mounts.values() {
-            if e.root.inode_id() == inode_id {
+        let mut hit: Option<Arc<MountInUseTag>> = None;
+        for n in g.by_path.values() {
+            let d = n.data.lock();
+            if d.root.inode_id() == inode_id {
                 if hit.is_some() {
                     return false;
                 }
-                hit = Some(e);
+                hit = Some(d.in_use.clone());
             }
         }
         match hit {
-            Some(e) => {
-                e.in_use.set_flags(mount_flags);
+            Some(tag) => {
+                tag.set_flags(mount_flags);
                 true
             }
             None => false,
@@ -759,7 +955,11 @@ impl MountTable {
     }
 
     pub fn snapshot_one(&self, target_path: &str) -> Option<MountEntry> {
-        self.inner.lock().mounts.get(target_path).cloned()
+        self.inner
+            .lock()
+            .by_path
+            .get(target_path)
+            .map(|n| n.entry())
     }
 
     pub fn remove(self: &Arc<Self>, target_path: &str) -> Option<Arc<dyn Inode>> {
@@ -773,121 +973,130 @@ impl MountTable {
         self_weak: &alloc::sync::Weak<MountTable>,
         target_path: &str,
     ) -> Option<Arc<dyn Inode>> {
-        let entry = g.mounts.remove(target_path)?;
-        match &entry.propagation {
-            MountPropagation::Shared(pg) => pg.remove_member(self_weak, target_path),
-            MountPropagation::Slave(pg) => pg.remove_slave(self_weak, target_path),
-            _ => {}
+        let node = g.by_path.get(target_path).cloned()?;
+        let removed_root;
+        let restore = {
+            let mut d = node.data.lock();
+            match &d.propagation {
+                MountPropagation::Shared(pg) => pg.remove_member(self_weak, target_path),
+                MountPropagation::Slave(pg) => pg.remove_slave(self_weak, target_path),
+                _ => {}
+            }
+            removed_root = d.root.clone();
+            let next = node.shadowed.lock().pop();
+            if let Some(under) = next {
+                match &under.propagation {
+                    MountPropagation::Shared(pg) => {
+                        pg.add_member(self_weak.clone(), String::from(target_path));
+                    }
+                    MountPropagation::Slave(pg) => {
+                        pg.add_slave(self_weak.clone(), String::from(target_path));
+                    }
+                    _ => {}
+                }
+                *d = under;
+                true
+            } else {
+                false
+            }
+        };
+        if !restore {
+            g.unlink_from_tree(&node);
+            g.by_path.remove(target_path);
         }
-        Some(entry.root)
+        Some(removed_root)
     }
 
     pub fn is_mountpoint_inode(&self, inode_id: u64) -> bool {
         let g = self.inner.lock();
-        g.mounts.values().any(|e| e.target_inode_id == inode_id)
+        g.by_path
+            .values()
+            .any(|n| n.data.lock().target_inode_id == inode_id)
     }
 
     pub fn containing_mount(&self, path: &str) -> Option<MountEntry> {
-        let g = self.inner.lock();
-        Self::containing_mount_locked(&g, path).map(|(_, v)| v.clone())
+        self.containing_mount_with_path(path).map(|(_, v)| v)
     }
 
     pub fn containing_mount_with_path(&self, path: &str) -> Option<(String, MountEntry)> {
         let g = self.inner.lock();
-        Self::containing_mount_locked(&g, path).map(|(k, v)| (k.clone(), v.clone()))
-    }
-
-    fn containing_mount_locked<'a>(
-        g: &'a MountTableInner,
-        path: &str,
-    ) -> Option<(&'a String, &'a MountEntry)> {
-        let mut best: Option<(&String, &MountEntry)> = None;
-        for (k, v) in g.mounts.iter() {
-            if path == k.as_str()
-                || (path.starts_with(k.as_str())
-                    && (k == "/" || path.as_bytes().get(k.len()) == Some(&b'/')))
-            {
-                match best {
-                    None => best = Some((k, v)),
-                    Some((bk, _)) if k.len() > bk.len() => best = Some((k, v)),
-                    _ => {}
-                }
-            }
+        if let Some(n) = g.by_path.get(path) {
+            return Some((path.into(), n.entry()));
         }
-        best
-    }
-
-    fn proper_containing_mount_locked<'a>(
-        g: &'a MountTableInner,
-        path: &str,
-    ) -> Option<(&'a String, &'a MountEntry)> {
-        let mut best: Option<(&String, &MountEntry)> = None;
-        for (k, v) in g.mounts.iter() {
-            if k.as_str() == path {
-                continue;
-            }
-            if path.starts_with(k.as_str())
-                && (k == "/" || path.as_bytes().get(k.len()) == Some(&b'/'))
-            {
-                match best {
-                    None => best = Some((k, v)),
-                    Some((bk, _)) if k.len() > bk.len() => best = Some((k, v)),
-                    _ => {}
-                }
-            }
-        }
-        best
+        g.deepest_existing_ancestor(path)
+            .map(|n| (n.mountpoint(), n.entry()))
     }
 
     pub fn proper_containing_mount_with_path(&self, path: &str) -> Option<(String, MountEntry)> {
         let g = self.inner.lock();
-        Self::proper_containing_mount_locked(&g, path).map(|(k, v)| (k.clone(), v.clone()))
+        g.deepest_existing_ancestor(path)
+            .map(|n| (n.mountpoint(), n.entry()))
     }
 
-    pub fn collect_subtree(&self, prefix: &str) -> Vec<(String, MountEntry)> {
+    pub fn has_child_mount(&self, path: &str) -> bool {
+        let g = self.inner.lock();
+        match g.by_path.get(path) {
+            Some(n) => !n.children.lock().is_empty(),
+            None => g
+                .by_path
+                .keys()
+                .any(|k| MountTableInner::is_descendant_path(k, path)),
+        }
+    }
+
+    pub fn collect_subtree(&self, path: &str) -> Vec<(String, MountEntry)> {
         let g = self.inner.lock();
         let mut out = Vec::new();
-        for (k, v) in g.mounts.iter() {
-            if k.as_str() == prefix {
-                out.push((String::new(), v.clone()));
-            } else if k.starts_with(prefix)
-                && (prefix == "/" || k.as_bytes().get(prefix.len()) == Some(&b'/'))
-            {
-                let suffix = if prefix == "/" {
-                    k.clone()
-                } else {
-                    String::from(&k[prefix.len()..])
-                };
-                out.push((suffix, v.clone()));
+        let root = match g.by_path.get(path) {
+            Some(n) => n.clone(),
+            None => {
+                for (k, n) in g.by_path.iter() {
+                    if MountTableInner::is_descendant_path(k, path) {
+                        let suffix = if path == "/" {
+                            k.clone()
+                        } else {
+                            String::from(&k[path.len()..])
+                        };
+                        out.push((suffix, n.entry()));
+                    }
+                }
+                return out;
             }
+        };
+        out.push((String::new(), root.entry()));
+        let mut descendants = Vec::new();
+        root.collect_descendants(&mut descendants);
+        for n in descendants.iter() {
+            let mp = n.mountpoint();
+            let suffix = if path == "/" {
+                mp
+            } else {
+                String::from(&mp[path.len()..])
+            };
+            out.push((suffix, n.entry()));
         }
         out
     }
 
     pub fn set_propagation(self: &Arc<Self>, path: &str, new_prop: MountPropagation) -> bool {
         let weak = Arc::downgrade(self);
-        let mut g = self.inner.lock();
-        let existing = match g.mounts.get(path) {
-            Some(e) => (
-                e.target_inode_id,
-                e.root.clone(),
-                e.source.clone(),
-                e.fstype.clone(),
-                e.in_use.flags(),
-            ),
+        let g = self.inner.lock();
+        let node = match g.by_path.get(path) {
+            Some(n) => n.clone(),
             None => return false,
         };
-        Self::install_locked(
-            &mut g,
-            &weak,
-            path,
-            existing.0,
-            existing.1,
-            new_prop,
-            &existing.2,
-            &existing.3,
-            existing.4,
-        );
+        let mut d = node.data.lock();
+        match &d.propagation {
+            MountPropagation::Shared(pg) => pg.remove_member(&weak, path),
+            MountPropagation::Slave(pg) => pg.remove_slave(&weak, path),
+            _ => {}
+        }
+        match &new_prop {
+            MountPropagation::Shared(pg) => pg.add_member(weak.clone(), String::from(path)),
+            MountPropagation::Slave(pg) => pg.add_slave(weak.clone(), String::from(path)),
+            _ => {}
+        }
+        d.propagation = new_prop;
         true
     }
 
@@ -895,17 +1104,22 @@ impl MountTable {
         self: &Arc<Self>,
         owner_user_ns: Option<Arc<crate::process_model::UserNamespace>>,
     ) -> Arc<MountTable> {
-        let parent_entries: alloc::vec::Vec<(String, MountEntry)> = {
+        let parent_entries: Vec<(String, NodeData)> = {
             let g = self.inner.lock();
-            g.mounts
+            let mut ordered: Vec<Arc<MountNode>> = Vec::new();
+            for n in g.roots.iter() {
+                ordered.push(n.clone());
+                n.collect_descendants(&mut ordered);
+            }
+            ordered
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|n| (n.mountpoint(), n.data.lock().clone()))
                 .collect()
         };
         Arc::new_cyclic(|child_weak| {
-            let mut new_mounts = BTreeMap::new();
-            for (path, entry) in parent_entries.iter() {
-                match &entry.propagation {
+            let mut inner = MountTableInner::new();
+            for (path, data) in parent_entries.iter() {
+                match &data.propagation {
                     MountPropagation::Shared(pg) => {
                         pg.add_member(child_weak.clone(), path.clone());
                     }
@@ -914,16 +1128,161 @@ impl MountTable {
                     }
                     _ => {}
                 }
-                let mut child_entry = entry.clone();
-                child_entry.in_use = MountInUseTag::new_with_flags(entry.in_use.flags());
-                new_mounts.insert(path.clone(), child_entry);
+                let mut child_data = data.clone();
+                child_data.in_use = MountInUseTag::new_with_flags(data.in_use.flags());
+                let node = MountNode::new(path.clone(), child_data);
+                inner.link_into_tree(&node);
+                inner.by_path.insert(path.clone(), node);
             }
             MountTable {
-                inner: VfsSpinIrq::new(MountTableInner { mounts: new_mounts }),
+                inner: VfsSpinIrq::new(inner),
                 owner_user_ns: owner_user_ns.clone(),
             }
         })
     }
+
+    pub fn is_stacked(&self, path: &str) -> bool {
+        match self.inner.lock().by_path.get(path) {
+            Some(n) => !n.shadowed.lock().is_empty(),
+            None => false,
+        }
+    }
+
+    pub fn mount_path_for_root_inode(&self, inode_id: u64) -> Option<String> {
+        let g = self.inner.lock();
+        let mut best: Option<String> = None;
+        for (k, n) in g.by_path.iter() {
+            if n.data.lock().root.inode_id() == inode_id {
+                match &best {
+                    None => best = Some(k.clone()),
+                    Some(b) if k.len() > b.len() => best = Some(k.clone()),
+                    _ => {}
+                }
+            }
+        }
+        best
+    }
+
+    pub fn pivot_root(self: &Arc<Self>, new_root: &str, put_old: &str) -> Result<(), Errno> {
+        if new_root == "/" {
+            return Err(Errno::INVAL);
+        }
+        let under_new = |p: &str| -> bool {
+            p == new_root
+                || (p.starts_with(new_root) && p.as_bytes().get(new_root.len()) == Some(&b'/'))
+        };
+        if !(put_old == new_root || under_new(put_old)) {
+            return Err(Errno::INVAL);
+        }
+
+        let weak = Arc::downgrade(self);
+        let mut g = self.inner.lock();
+
+        let put_old_rebased = strip_prefix_path(put_old, new_root);
+
+        let mut ordered: Vec<Arc<MountNode>> = Vec::new();
+        for n in g.roots.iter() {
+            ordered.push(n.clone());
+            n.collect_descendants(&mut ordered);
+        }
+
+        let same_dir = put_old == new_root;
+        let old_root_data = ordered
+            .iter()
+            .find(|n| n.mountpoint() == "/")
+            .map(|n| n.data.lock().clone());
+
+        let mut keep: Vec<(Arc<MountNode>, String)> = Vec::new();
+        let mut stack_old: Vec<(String, NodeData)> = Vec::new();
+        for node in ordered.iter() {
+            let old_path = node.mountpoint();
+            {
+                let d = node.data.lock();
+                match &d.propagation {
+                    MountPropagation::Shared(pg) => pg.remove_member(&weak, &old_path),
+                    MountPropagation::Slave(pg) => pg.remove_slave(&weak, &old_path),
+                    _ => {}
+                }
+            }
+            if under_new(&old_path) {
+                keep.push((node.clone(), strip_prefix_path(&old_path, new_root)));
+            } else if !same_dir {
+                stack_old.push((
+                    rebase_into(&put_old_rebased, &old_path),
+                    node.data.lock().clone(),
+                ));
+            }
+        }
+        if same_dir {
+            if let Some(data) = old_root_data {
+                stack_old.push((String::from("/"), data));
+            }
+        }
+
+        let mut rebuilt = MountTableInner::new();
+        keep.sort_by_key(|e| e.1.len());
+        for (node, path) in keep.iter() {
+            node.children.lock().clear();
+            *node.parent.lock() = alloc::sync::Weak::new();
+            *node.mountpoint.lock() = path.clone();
+        }
+        for (node, path) in keep.iter() {
+            {
+                let d = node.data.lock();
+                match &d.propagation {
+                    MountPropagation::Shared(pg) => pg.add_member(weak.clone(), path.clone()),
+                    MountPropagation::Slave(pg) => pg.add_slave(weak.clone(), path.clone()),
+                    _ => {}
+                }
+            }
+            rebuilt.link_into_tree(node);
+            rebuilt.by_path.insert(path.clone(), node.clone());
+        }
+
+        stack_old.sort_by_key(|e| e.0.len());
+        for (path, mut data) in stack_old.into_iter() {
+            match &data.propagation {
+                MountPropagation::Shared(pg) => pg.add_member(weak.clone(), path.clone()),
+                MountPropagation::Slave(pg) => pg.add_slave(weak.clone(), path.clone()),
+                _ => {}
+            }
+            if let Some(existing) = rebuilt.by_path.get(&path).cloned() {
+                let mut d = existing.data.lock();
+                let prev = core::mem::replace(&mut *d, data);
+                existing.shadowed.lock().push(prev);
+            } else {
+                data.in_use = MountInUseTag::new_with_flags(data.in_use.flags());
+                let node = MountNode::new(path.clone(), data);
+                rebuilt.link_into_tree(&node);
+                rebuilt.by_path.insert(path, node);
+            }
+        }
+
+        *g = rebuilt;
+        Ok(())
+    }
+}
+
+fn strip_prefix_path(path: &str, prefix: &str) -> String {
+    if path == prefix {
+        return String::from("/");
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) if rest.starts_with('/') => String::from(rest),
+        _ => String::from(path),
+    }
+}
+
+fn rebase_into(base: &str, path: &str) -> String {
+    if path == "/" {
+        return String::from(base);
+    }
+    if base == "/" {
+        return String::from(path);
+    }
+    let mut s = String::from(base);
+    s.push_str(path);
+    s
 }
 
 static GLOBAL_MOUNTS_SLOT: VfsSpinIrq<Option<Arc<MountTable>>> = VfsSpinIrq::new(None);

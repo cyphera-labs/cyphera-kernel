@@ -127,6 +127,7 @@ bitflags::bitflags! {
         const RDWR      = 0o2;
         const CREAT     = 0o100;
         const EXCL      = 0o200;
+        const NOCTTY    = 0o400;
         const TRUNC     = 0o1000;
         const APPEND    = 0o2000;
         const NONBLOCK  = 0o4000;

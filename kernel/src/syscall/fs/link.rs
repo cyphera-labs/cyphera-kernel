@@ -39,12 +39,32 @@ pub(crate) fn sys_unlinkat(dirfd: u64, pathname: u64, flags: u64) -> i64 {
     }
     if is_dir {
         match parent.rmdir(leaf) {
-            Ok(()) => return 0,
+            Ok(()) => {
+                if crate::fsnotify::watching() {
+                    crate::fsnotify::dir_event(
+                        parent.as_ref(),
+                        leaf,
+                        true,
+                        crate::fsnotify::IN_DELETE,
+                    );
+                }
+                return 0;
+            }
             Err(e) => return e.as_neg_i64(),
         }
     }
     match parent.unlink(leaf) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if crate::fsnotify::watching() {
+                crate::fsnotify::dir_event(
+                    parent.as_ref(),
+                    leaf,
+                    false,
+                    crate::fsnotify::IN_DELETE,
+                );
+            }
+            0
+        }
         Err(e) => e.as_neg_i64(),
     }
 }

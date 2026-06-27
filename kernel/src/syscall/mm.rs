@@ -77,7 +77,7 @@ pub(super) fn sys_mprotect(addr: u64, length: u64, prot: u64) -> i64 {
     if prot & PROT_WRITE_BIT != 0 {
         use crate::process_model::{VmaBacking, VmaFlags};
         let sealed = sched::with_current_mmap(|m| {
-            m.vmas.iter().any(|v| {
+            m.vmas().iter().any(|v| {
                 v.start < hi
                     && v.end > addr
                     && v.flags.contains(VmaFlags::SHARED)
@@ -156,22 +156,33 @@ pub(super) fn sys_brk(addr: u64) -> u64 {
     sched::set_current_brk(target)
 }
 
-fn map_shared_segment(
+pub(crate) fn map_shared_segment(
     vaddr: u64,
     length_aligned: u64,
     perms: Perms,
     segment: Arc<crate::ipc::shm::ShmSegment>,
     offset: u64,
+    reserved: bool,
 ) -> i64 {
     use crate::process_model::{Vma, VmaBacking, VmaFlags};
     let pages = (length_aligned / 4096) as usize;
     let skip_pages = (offset / 4096) as usize;
     if skip_pages + pages > segment.frames.len() {
+        if reserved {
+            sched::with_current_mmap_mut(|m| m.release_reservation(vaddr, vaddr + length_aligned));
+        }
         return EINVAL;
     }
     let vm_arc = match sched::current_vmspace() {
         Some(v) => v,
-        None => return EINVAL,
+        None => {
+            if reserved {
+                sched::with_current_mmap_mut(|m| {
+                    m.release_reservation(vaddr, vaddr + length_aligned)
+                });
+            }
+            return EINVAL;
+        }
     };
     {
         let mut vm = vm_arc.lock();
@@ -203,10 +214,19 @@ fn map_shared_segment(
             for j in 0..mapped {
                 vm.unmap_keep_frame(VirtAddr::new(vaddr + (j * 4096) as u64));
             }
+            drop(vm);
+            if reserved {
+                sched::with_current_mmap_mut(|m| {
+                    m.release_reservation(vaddr, vaddr + length_aligned)
+                });
+            }
             return ENOMEM;
         }
     }
     sched::with_current_mmap_mut(|m| {
+        if reserved {
+            m.release_reservation(vaddr, vaddr + length_aligned);
+        }
         m.insert(Vma {
             start: vaddr,
             end: vaddr + length_aligned,
@@ -287,27 +307,29 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
         return ENOMEM;
     }
     let picked = sched::with_current_mmap_mut(|m| -> Result<(u64, alloc::vec::Vec<Vma>), i64> {
-        if (flags & MAP_FIXED_NOREPLACE) != 0 {
+        let chosen = if (flags & MAP_FIXED_NOREPLACE) != 0 {
             if m.overlaps(addr, addr + length_aligned) {
                 return Err(EEXIST);
             }
-            Ok((addr, alloc::vec::Vec::new()))
+            (addr, alloc::vec::Vec::new())
         } else if (flags & MAP_FIXED) != 0 {
             let dropped = m.unmap_range(addr, addr + length_aligned);
-            Ok((addr, dropped))
+            (addr, dropped)
         } else if addr != 0
-            && addr >= m.arena_lo
+            && addr >= m.arena_lo()
             && addr
                 .checked_add(length_aligned)
-                .is_some_and(|e| e <= m.arena_hi)
+                .is_some_and(|e| e <= m.arena_hi())
             && !m.overlaps(addr, addr + length_aligned)
         {
-            Ok((addr, alloc::vec::Vec::new()))
+            (addr, alloc::vec::Vec::new())
         } else {
-            m.find_gap(length_aligned)
-                .map(|a| (a, alloc::vec::Vec::new()))
-                .ok_or(ENOMEM)
-        }
+            let a = m.find_gap(length_aligned).ok_or(ENOMEM)?;
+            (a, alloc::vec::Vec::new())
+        };
+        let (va, dropped) = chosen;
+        m.reserve(va, va + length_aligned);
+        Ok((va, dropped))
     });
     let (vaddr, fixed_dropped) = match picked {
         Ok(v) => v,
@@ -323,9 +345,14 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
     if is_anon && is_shared {
         let segment = match crate::ipc::shm::create_anon_shared(length_aligned as usize) {
             Some(s) => s,
-            None => return ENOMEM,
+            None => {
+                sched::with_current_mmap_mut(|m| {
+                    m.release_reservation(vaddr, vaddr + length_aligned)
+                });
+                return ENOMEM;
+            }
         };
-        return map_shared_segment(vaddr, length_aligned, perms, segment, 0);
+        return map_shared_segment(vaddr, length_aligned, perms, segment, 0, true);
     }
 
     if let VmaBacking::File {
@@ -333,18 +360,27 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
         file_offset_base,
     } = &backing
     {
-        if inode.is_drm_card() {
+        if inode.is_drm_card() || inode.is_drm_render() {
             if !is_shared {
+                sched::with_current_mmap_mut(|m| {
+                    m.release_reservation(vaddr, vaddr + length_aligned)
+                });
                 return EINVAL;
             }
-            let segment = match crate::device::drm::segment_for_mmap(
-                *file_offset_base,
-                length_aligned as usize,
-            ) {
+            let off = *file_offset_base;
+            let len = length_aligned as usize;
+            let segment = match crate::device::drm::segment_for_mmap(off, len)
+                .or_else(|| crate::device::virtgpu::segment_for_mmap(off, len))
+            {
                 Some(s) => s,
-                None => return EINVAL,
+                None => {
+                    sched::with_current_mmap_mut(|m| {
+                        m.release_reservation(vaddr, vaddr + length_aligned)
+                    });
+                    return EINVAL;
+                }
             };
-            return map_shared_segment(vaddr, length_aligned, perms, segment, 0);
+            return map_shared_segment(vaddr, length_aligned, perms, segment, 0, true);
         }
     }
 
@@ -365,6 +401,7 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
         vflags |= VmaFlags::SHARED;
     }
     let mlockall_flags = sched::with_current_mmap_mut(|m| {
+        m.release_reservation(vaddr, vaddr + length_aligned);
         m.insert(Vma {
             start: vaddr,
             end: vaddr + length_aligned,
@@ -372,7 +409,7 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, o
             flags: vflags,
             backing,
         });
-        m.mlockall_flags as u64
+        m.mlockall_flags() as u64
     });
 
     let lock_future = mlockall_flags & MCL_FUTURE != 0;
@@ -476,7 +513,8 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> i64 {
         }
         n
     };
-    let dropped = sched::with_current_mmap_mut(|m| m.unmap_range(addr, addr + length_aligned));
+    let hi = addr + length_aligned;
+    let dropped = sched::with_current_mmap_mut(|m| m.unmap_range_reserve(addr, hi));
     for vma in &dropped {
         if let crate::process_model::VmaBacking::File {
             inode,
@@ -485,10 +523,10 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> i64 {
         {
             if vma.flags.contains(crate::process_model::VmaFlags::SHARED) {
                 let lo = vma.start.max(addr);
-                let hi = vma.end.min(addr + length_aligned);
-                if lo < hi {
+                let vhi = vma.end.min(hi);
+                if lo < vhi {
                     let file_lo = file_offset_base + (lo - vma.start);
-                    let file_hi = file_lo + (hi - lo);
+                    let file_hi = file_lo + (vhi - lo);
                     let _ = crate::fs::pagecache::writeback(
                         inode.inode_id(),
                         file_lo,
@@ -500,8 +538,9 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> i64 {
         }
     }
     let mut vmspace = VmSpace::current();
-    detach_shared_dropped(&mut vmspace, &dropped, addr, addr + length_aligned);
+    detach_shared_dropped(&mut vmspace, &dropped, addr, hi);
     unmap_pages_locked(addr, pages);
+    sched::with_current_mmap_mut(|m| m.release_reservation(addr, hi));
     if present_pages > 0 {
         sched::sub_cgroup_charge((present_pages as u64) * 4096);
     }
@@ -579,22 +618,12 @@ pub(super) fn sys_mremap(
             return old_addr as i64;
         }
 
-        let tail_lo = old_addr + old_aligned;
         let tail_hi = old_addr + new_aligned;
-        let in_place = whole_vma
-            && !is_shm
-            && sched::with_current_mmap(|m| tail_hi <= m.arena_hi && !m.overlaps(tail_lo, tail_hi));
-        if in_place {
-            sched::with_current_mmap_mut(|m| {
-                for v in m.vmas.iter_mut() {
-                    if v.start == old_addr {
-                        v.end = tail_hi;
-                        m_last_end_bump(m, tail_hi);
-                        break;
-                    }
-                }
-            });
-            return old_addr as i64;
+        if whole_vma && !is_shm {
+            let grown = sched::with_current_mmap_mut(|m| m.extend_vma_end(old_addr, tail_hi));
+            if grown {
+                return old_addr as i64;
+            }
         }
 
         if flags & MREMAP_MAYMOVE == 0 {
@@ -620,9 +649,14 @@ pub(super) fn sys_mremap(
             }
         }
         sys_munmap(new_addr, new_aligned);
+        sched::with_current_mmap_mut(|m| m.reserve(new_addr, new_addr + new_aligned));
         new_addr
     } else {
-        match sched::with_current_mmap_mut(|m| m.find_gap(new_aligned).ok_or(ENOMEM)) {
+        match sched::with_current_mmap_mut(|m| -> Result<u64, i64> {
+            let a = m.find_gap(new_aligned).ok_or(ENOMEM)?;
+            m.reserve(a, a + new_aligned);
+            Ok(a)
+        }) {
             Ok(a) => a,
             Err(e) => return e,
         }
@@ -632,13 +666,14 @@ pub(super) fn sys_mremap(
 
     match &backing {
         VmaBacking::Shm { segment, offset } => {
-            let r = map_shared_segment(dest, new_aligned, perms, segment.clone(), *offset);
+            let r = map_shared_segment(dest, new_aligned, perms, segment.clone(), *offset, true);
             if r < 0 {
                 return r;
             }
         }
         _ => {
             sched::with_current_mmap_mut(|m| {
+                m.release_reservation(dest, dest + new_aligned);
                 m.insert(Vma {
                     start: dest,
                     end: dest + new_aligned,
@@ -666,7 +701,16 @@ pub(super) fn sys_mremap(
         }
     }
 
-    sys_munmap(old_addr, old_aligned);
+    let source_intact = sched::with_current_mmap(|m| {
+        m.find_containing(old_addr).is_some_and(|v| {
+            v.start == vstart
+                && v.end == vend
+                && core::mem::discriminant(&v.backing) == core::mem::discriminant(&src_backing)
+        })
+    });
+    if source_intact {
+        sys_munmap(old_addr, old_aligned);
+    }
     dest as i64
 }
 
@@ -700,12 +744,6 @@ fn unmap_pages_locked(vaddr: u64, pages: usize) {
     }
 }
 
-fn m_last_end_bump(m: &mut crate::process_model::MmapState, new_end: u64) {
-    if new_end > m.last_end {
-        m.last_end = new_end;
-    }
-}
-
 pub(super) fn sys_msync(addr: u64, length: u64, _flags: u64) -> i64 {
     if length == 0 || addr & 0xfff != 0 {
         return EINVAL;
@@ -714,7 +752,7 @@ pub(super) fn sys_msync(addr: u64, length: u64, _flags: u64) -> i64 {
     let end = addr.saturating_add(length_aligned);
     type MsyncTarget = (u64, u64, u64, u64, Arc<dyn Inode>);
     let targets: alloc::vec::Vec<MsyncTarget> = sched::with_current_mmap(|m| {
-        m.vmas
+        m.vmas()
             .iter()
             .filter(|v| v.flags.contains(crate::process_model::VmaFlags::SHARED))
             .filter(|v| v.start < end && addr < v.end)
@@ -814,7 +852,7 @@ pub(super) fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
         None => return EINVAL,
     };
     let ranges: alloc::vec::Vec<(u64, u64)> = sched::with_current_mmap(|m| {
-        m.vmas
+        m.vmas()
             .iter()
             .filter(|v| v.start < end && addr < v.end)
             .filter(|v| {
@@ -928,7 +966,7 @@ pub(super) fn sys_mlockall(flags: u64) -> i64 {
     }
     if flags & MCL_CURRENT != 0 {
         let ranges: alloc::vec::Vec<(u64, u64)> =
-            sched::with_current_mmap(|m| m.vmas.iter().map(|v| (v.start, v.end)).collect());
+            sched::with_current_mmap(|m| m.vmas().iter().map(|v| (v.start, v.end)).collect());
         if flags & MCL_ONFAULT == 0 {
             for (s, e) in &ranges {
                 let mut p = *s;
@@ -950,14 +988,14 @@ pub(super) fn sys_mlockall(flags: u64) -> i64 {
         }
     }
     sched::with_current_mmap_mut(|m| {
-        m.mlockall_flags = (flags & (MCL_FUTURE | MCL_ONFAULT)) as u32;
+        m.set_mlockall((flags & (MCL_FUTURE | MCL_ONFAULT)) as u32);
     });
     0
 }
 
 pub(super) fn sys_munlockall() -> i64 {
     let ranges: alloc::vec::Vec<(u64, u64)> =
-        sched::with_current_mmap(|m| m.vmas.iter().map(|v| (v.start, v.end)).collect());
+        sched::with_current_mmap(|m| m.vmas().iter().map(|v| (v.start, v.end)).collect());
     if let (Some(min), Some(max)) = (
         ranges.iter().map(|r| r.0).min(),
         ranges.iter().map(|r| r.1).max(),
@@ -967,7 +1005,7 @@ pub(super) fn sys_munlockall() -> i64 {
         });
     }
     sched::with_current_mmap_mut(|m| {
-        m.mlockall_flags = 0;
+        m.set_mlockall(0);
     });
     0
 }

@@ -28,6 +28,18 @@ fn lookup_timerfd(fd: i32) -> Option<Arc<crate::ipc::fdtypes::TimerFdInode>> {
     TIMERFD_FD_INDEX.lock().get(&key).cloned()
 }
 
+pub(crate) fn unregister_epoll(key: usize) {
+    EPOLL_INDEX.lock().remove(&key);
+}
+
+pub(crate) fn unregister_signalfd(key: usize) {
+    SIGNALFD_INDEX.lock().remove(&key);
+}
+
+pub(crate) fn unregister_timerfd_index(key: usize) {
+    TIMERFD_FD_INDEX.lock().remove(&key);
+}
+
 pub(super) const FD_SETSIZE: usize = 1024;
 
 pub(super) fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> i64 {
@@ -651,6 +663,7 @@ pub(super) fn sys_eventfd2(initval: u64, flags: u64) -> i64 {
 const TFD_NONBLOCK: u64 = 0o4000;
 const TFD_CLOEXEC: u64 = 0o2_000_000;
 const TFD_TIMER_ABSTIME: u64 = 1;
+const TFD_TIMER_CANCEL_ON_SET: u64 = 2;
 
 pub(super) fn sys_timerfd_create(clockid: u64, flags: u64) -> i64 {
     if (flags & !(TFD_NONBLOCK | TFD_CLOEXEC)) != 0 {
@@ -710,6 +723,12 @@ fn write_itimerspec(addr: u64, interval_ns: u64, remaining_ns: u64) -> i64 {
 }
 
 pub(super) fn sys_timerfd_settime(fd: u64, flags: u64, new_value: u64, old_value: u64) -> i64 {
+    if (flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 {
+        return EINVAL;
+    }
+    if (flags & TFD_TIMER_CANCEL_ON_SET) != 0 {
+        return EINVAL;
+    }
     let timerfd = match lookup_timerfd(fd as i32) {
         Some(t) => t,
         None => return EBADF,

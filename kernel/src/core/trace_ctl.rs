@@ -97,7 +97,11 @@ pub(crate) fn forward_signal_to_tracer_if_any(tf: &mut TrapFrame) {
         if inject < NSIG as u32 {
             let mut g = GLOBAL.lock();
             if let Some(p) = g.processes.get_mut(&cur) {
-                p.signals.raise(1u64 << inject);
+                p.signals.enqueue_signal(
+                    inject,
+                    crate::core::signal::SigInfo::for_kernel(inject),
+                    usize::MAX,
+                );
                 p.trace.clear_pending_inject();
             }
         }
@@ -132,43 +136,39 @@ pub(crate) fn detach_orphaned_tracees(tracer: Pid) {
 }
 
 pub fn park_for_trace_stop(reason: crate::process_model::TraceStop) {
-    let cur = current_pid();
-    let (tracer, cur_ctx, cur_xsave, cur_kstack) = {
-        let mut q = CPU_QUEUES[this_cpu() as usize].lock();
-        let mut g = GLOBAL.lock();
-        let me = match g.processes.get_mut(&cur) {
-            Some(p) => p,
-            None => return,
-        };
-        let tracer = me.trace.tracer_pid();
-        if tracer.is_none() || (me.signals.pending() & (1u64 << SIGKILL)) != 0 {
-            return;
-        }
-        let _ = q.current.take();
-        bank_slice_off_cpu(me);
-        set_state(me, ProcessState::Traced, "trace_ctl");
-        set_sched_owner(me, SchedOwner::Traced, "park_for_trace_stop");
-        me.trace.enter_stop(reason);
-        (
-            tracer,
-            me.task.0.context_ptr(),
-            me.task.0.xsave_ptr(),
-            me.task.0.kstack_bounds(),
-        )
-    };
-    if let Some(tracer_pid) = tracer {
-        let waiters = {
-            let mut g = GLOBAL.lock();
-            match g.processes.get_mut(&tracer_pid) {
-                Some(p) => p.wait_sites.child_exit.drain(),
-                None => alloc::vec::Vec::new(),
+    let tracer = core::cell::Cell::new(None);
+    park_current_then(
+        "park_for_trace_stop",
+        &|g, cur| {
+            let me = match g.processes.get_mut(&cur) {
+                Some(p) => p,
+                None => return ParkArm::Abort,
+            };
+            let t = me.trace.tracer_pid();
+            if t.is_none() || (me.signals.pending() & (1u64 << SIGKILL)) != 0 {
+                return ParkArm::Abort;
             }
-        };
-        for pid in waiters {
-            let _ = wake_pid(pid);
-        }
-    }
-    park_current_off_cpu("park_for_trace_stop", cur, cur_kstack, cur_ctx, cur_xsave);
+            me.trace.enter_stop(reason);
+            tracer.set(t);
+            ParkArm::Park {
+                dest: ParkDest::Traced,
+            }
+        },
+        &|_| {
+            if let Some(tracer_pid) = tracer.get() {
+                let waiters = {
+                    let mut g = GLOBAL.lock();
+                    match g.processes.get_mut(&tracer_pid) {
+                        Some(p) => p.wait_sites.child_exit.drain(),
+                        None => alloc::vec::Vec::new(),
+                    }
+                };
+                for pid in waiters {
+                    let _ = wake_pid(pid);
+                }
+            }
+        },
+    );
 }
 
 pub fn resume_traced(
@@ -305,11 +305,19 @@ pub fn request_ptrace_continue(target: Pid, caller: Pid, how: PtraceResume) -> b
             PtraceResume::Detach { signal } => {
                 p.trace.detach();
                 if signal != 0 && signal < 64 {
-                    p.signals.raise(1u64 << signal);
+                    p.signals.enqueue_signal(
+                        signal,
+                        crate::core::signal::SigInfo::for_kernel(signal),
+                        usize::MAX,
+                    );
                 }
             }
             PtraceResume::Kill => {
-                p.signals.raise(1u64 << crate::process_model::SIGKILL);
+                p.signals.enqueue_signal(
+                    crate::process_model::SIGKILL,
+                    crate::core::signal::SigInfo::for_kernel(crate::process_model::SIGKILL),
+                    usize::MAX,
+                );
             }
         }
         if p.state.0 == ProcessState::Traced {

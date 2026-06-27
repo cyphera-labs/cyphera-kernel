@@ -20,7 +20,7 @@ members = [
 default-members = ["runtime/boot"]
 
 [workspace.package]
-version = "0.0.5"
+version = "0.0.666"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Horizon Digital Engineering LLC <security@horizondigital.dev>"]

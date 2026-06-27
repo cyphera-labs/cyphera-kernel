@@ -129,18 +129,36 @@ impl Inode for PidFdInode {
 
 pub struct SignalFdInode {
     pub mask: SpinIrq<u64>,
+    poll_wait: crate::core::wait::WaitQueue,
     inode_id: u64,
 }
 
 static NEXT_SIGNALFD_ID: AtomicU64 = AtomicU64::new(1);
 
+static SIGNALFD_POLL_QUEUES: SpinIrq<alloc::vec::Vec<alloc::sync::Weak<SignalFdInode>>> =
+    SpinIrq::new(alloc::vec::Vec::new());
+
+pub fn wake_signalfd_poll_waiters() {
+    let snapshot: alloc::vec::Vec<Arc<SignalFdInode>> = {
+        let mut reg = SIGNALFD_POLL_QUEUES.lock();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for sfd in snapshot {
+        sfd.poll_wait.wake_all();
+    }
+}
+
 impl SignalFdInode {
     pub fn new(mask: u64) -> Arc<Self> {
         let inode_id = 0xfe00_0000_0000_0000 | NEXT_SIGNALFD_ID.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Self {
+        let this = Arc::new(Self {
             mask: SpinIrq::new(mask),
+            poll_wait: crate::core::wait::WaitQueue::new(),
             inode_id,
-        })
+        });
+        SIGNALFD_POLL_QUEUES.lock().push(Arc::downgrade(&this));
+        this
     }
     pub fn set_mask(&self, mask: u64) {
         *self.mask.lock() = mask;
@@ -168,16 +186,19 @@ impl Inode for SignalFdInode {
         let mask = *self.mask.lock();
         let mut written = 0;
         loop {
-            let candidate = crate::core::current_pending_in_mask(mask);
+            let candidate = crate::core::current_signalfd_ready(mask);
             if candidate == 0 {
                 if written > 0 {
                     return Ok(written);
+                }
+                if crate::core::current_signal_pending() {
+                    return Err(Errno::INTR);
                 }
                 crate::core::park_on_signalfd_wait();
                 continue;
             }
             let signum = candidate.trailing_zeros();
-            let (si_code, aux) = crate::core::consume_pending_signal(signum);
+            let (si_code, aux) = crate::core::consume_signalfd_signal(mask, signum);
 
             let off = written;
             if off + SIGINFO_SZ > buf.len() {
@@ -195,11 +216,20 @@ impl Inode for SignalFdInode {
 
     fn poll(&self) -> PollMask {
         let mask = *self.mask.lock();
-        if crate::core::current_pending_in_mask(mask) != 0 {
+        if crate::core::current_signalfd_ready(mask) != 0 {
             PollMask::IN
         } else {
             PollMask::empty()
         }
+    }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
+        f(&self.poll_wait);
+    }
+
+    fn on_close(&self, _flags: crate::vfs::OpenFlags) {
+        let key = self as *const SignalFdInode as *const () as usize;
+        crate::syscall::event::unregister_signalfd(key);
     }
 }
 
@@ -207,6 +237,7 @@ pub struct EventFdInode {
     pub counter: SpinIrq<u64>,
     pub semaphore: bool,
     wait: crate::core::wait::WaitQueue,
+    poll_wait: crate::core::wait::WaitQueue,
     inode_id: u64,
 }
 
@@ -223,6 +254,7 @@ impl EventFdInode {
             counter: SpinIrq::new(initval),
             semaphore,
             wait: crate::core::wait::WaitQueue::new(),
+            poll_wait: crate::core::wait::WaitQueue::new(),
             inode_id,
         })
     }
@@ -268,6 +300,7 @@ impl Inode for EventFdInode {
                     drop(c);
                     buf[..8].copy_from_slice(&val.to_le_bytes());
                     self.wait.wake_all();
+                    self.poll_wait.wake_all();
                     IoAttempt::Ready(8)
                 } else {
                     IoAttempt::WouldBlock
@@ -302,6 +335,7 @@ impl Inode for EventFdInode {
                     *c += add;
                     drop(c);
                     self.wait.wake_all();
+                    self.poll_wait.wake_all();
                     IoAttempt::Ready(8)
                 } else {
                     IoAttempt::WouldBlock
@@ -321,6 +355,10 @@ impl Inode for EventFdInode {
         }
         m
     }
+
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
+        f(&self.poll_wait);
+    }
 }
 
 use alloc::collections::BTreeMap;
@@ -329,6 +367,7 @@ pub struct TimerFdInode {
     pub state: SpinIrq<TimerFdState>,
     pub clock_id: u32,
     wait: crate::core::wait::WaitQueue,
+    poll_wait: crate::core::wait::WaitQueue,
     inode_id: u64,
 }
 
@@ -350,6 +389,7 @@ impl TimerFdInode {
             state: SpinIrq::new(TimerFdState::default()),
             clock_id,
             wait: crate::core::wait::WaitQueue::new(),
+            poll_wait: crate::core::wait::WaitQueue::new(),
             inode_id,
         })
     }
@@ -405,6 +445,7 @@ fn timerfd_callback(key: u64) {
         crate::core::timeout::register_callback(next, key, timerfd_callback);
     }
     arc.wait.wake_all();
+    arc.poll_wait.wake_all();
 }
 
 impl Inode for TimerFdInode {
@@ -460,9 +501,14 @@ impl Inode for TimerFdInode {
         }
     }
 
+    fn for_each_wait_queue(&self, f: &mut dyn FnMut(&crate::core::wait::WaitQueue)) {
+        f(&self.poll_wait);
+    }
+
     fn on_close(&self, _flags: crate::vfs::OpenFlags) {
         let key = self as *const TimerFdInode as *const () as u64;
         TIMERFD_INDEX.lock().remove(&key);
         crate::core::timeout::cancel_callback(key);
+        crate::syscall::event::unregister_timerfd_index(key as usize);
     }
 }

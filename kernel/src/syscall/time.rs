@@ -23,9 +23,18 @@ fn process_cputime_nanos() -> u64 {
     sched::current_cputime_nanos()
 }
 
+fn apply_offset(base_ns: u64, offset_ns: i64) -> u64 {
+    if offset_ns >= 0 {
+        base_ns.saturating_add(offset_ns as u64)
+    } else {
+        base_ns.saturating_sub((-offset_ns) as u64)
+    }
+}
+
 fn timespec_for_clock(clock: u64) -> Option<(i64, i64)> {
     let monotonic_ns = frame::cpu::nanos_since_boot();
     let wall_ns = frame::cpu::wall_clock_nanos();
+    let (mono_off, boot_off) = sched::current_time_ns_offsets();
     let ns = match clock {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
             if wall_ns != 0 {
@@ -34,8 +43,10 @@ fn timespec_for_clock(clock: u64) -> Option<(i64, i64)> {
                 monotonic_ns
             }
         }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => monotonic_ns,
-        CLOCK_BOOTTIME => monotonic_ns,
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+            apply_offset(monotonic_ns, mono_off)
+        }
+        CLOCK_BOOTTIME => apply_offset(monotonic_ns, boot_off),
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => process_cputime_nanos(),
         _ => return None,
     };

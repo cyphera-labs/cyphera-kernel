@@ -46,76 +46,42 @@ pub fn exit_group_current(tf: &mut TrapFrame, code: i32) -> ! {
         g.processes.get(&cur_pid).map(|p| p.tgid).unwrap_or(cur_pid)
     };
 
-    let siblings: alloc::vec::Vec<Pid> = {
-        let g = GLOBAL.lock();
-        g.processes
+    let live_peers: alloc::vec::Vec<Pid> = {
+        let mut g = GLOBAL.lock();
+        let peers: alloc::vec::Vec<Pid> = g
+            .processes
             .iter()
-            .filter(|(pid, p)| **pid != cur_pid && p.tgid == tgid)
+            .filter(|(pid, p)| {
+                **pid != cur_pid
+                    && p.tgid == tgid
+                    && !matches!(
+                        p.state.0,
+                        ProcessState::Zombie(_)
+                            | ProcessState::KilledByFault { .. }
+                            | ProcessState::KilledBySignal { .. }
+                    )
+            })
             .map(|(pid, _)| *pid)
-            .collect()
+            .collect();
+        if tgid != cur_pid {
+            if let Some(leader) = g.processes.get_mut(&tgid) {
+                if leader.lifecycle.pending_exit().is_none() {
+                    leader
+                        .lifecycle
+                        .set_pending_exit(ProcessState::Zombie(code));
+                }
+            }
+        }
+        peers
     };
-    let mut dying_sibling_fds: alloc::vec::Vec<Arc<crate::vfs::fd::FdTable>> =
-        alloc::vec::Vec::new();
-    for sib in siblings {
-        let mut info = None;
-        loop {
-            let home = {
-                let g = GLOBAL.lock();
-                match g.processes.get(&sib) {
-                    Some(p) => p.sched.home_cpu,
-                    None => break,
-                }
-            };
-            let mut q = CPU_QUEUES[home as usize].lock();
-            let mut g = GLOBAL.lock();
-            let Some(p) = g.processes.get_mut(&sib) else {
-                break;
-            };
-            if p.sched.home_cpu != home {
-                continue;
-            }
-            let was_live = !matches!(
-                p.state.0,
-                ProcessState::Zombie(_)
-                    | ProcessState::KilledByFault { .. }
-                    | ProcessState::KilledBySignal { .. }
-            );
-            let sib_as = if was_live { p.addr_space.clone() } else { None };
-            let sib_ipc = if was_live { p.namespaces.ipc() } else { None };
-            if matches!(p.state.0, ProcessState::Running) {
-                if p.lifecycle.pending_exit().is_none() {
-                    p.lifecycle.set_pending_exit(ProcessState::Zombie(code));
-                }
-            } else {
-                set_state(p, ProcessState::Zombie(code), "death");
-                dying_sibling_fds.push(core::mem::replace(
-                    &mut p.fds,
-                    Arc::new(crate::vfs::fd::FdTable::new()),
-                ));
-            }
-            let (rt, dl, cfs) = q.runnable.remove_pid(sib);
-            if rt + dl + cfs > 0 {
-                record_dequeue(sib);
-            }
-            info = Some((was_live, sib_as, sib_ipc));
-            break;
-        }
-        if let Some((was_live, sib_as, sib_ipc)) = info {
-            if let Some(sib_as) = sib_as {
-                release_addr_space_user(&sib_as, sib_ipc.as_ref());
-            }
-            if was_live {
-                wake_tracer_on_exit(sib);
-            }
-            drain_vfork_done(sib);
-        }
+    for peer in live_peers {
+        let _ = send_signal(peer, SIGKILL);
     }
-    drop(dying_sibling_fds);
     exit_current(tf, code)
 }
 
 pub(crate) fn publish_corpse(dead: Pid) {
-    let (final_state, parent, exit_waiters) = {
+    let (final_state, parent, exit_waiters, is_leader) = {
         let mut g = GLOBAL.lock();
         let Some(p) = g.processes.get_mut(&dead) else {
             return;
@@ -125,42 +91,66 @@ pub(crate) fn publish_corpse(dead: Pid) {
         };
         set_state(p, st.clone(), "death");
         let exit_waiters = p.wait_sites.exit_waiters.drain();
-        (st, p.parent, exit_waiters)
+        let is_leader = p.tgid == dead;
+        (st, p.parent, exit_waiters, is_leader)
     };
-    if let Some(ppid) = parent {
-        const CLD_EXITED: i32 = 1;
-        const CLD_KILLED: i32 = 2;
-        let info = match final_state {
-            ProcessState::Zombie(code) => {
-                crate::core::signal::SigInfo::for_child(dead.0, code, CLD_EXITED)
-            }
-            ProcessState::KilledBySignal { signal } => {
-                crate::core::signal::SigInfo::for_child(dead.0, signal as i32, CLD_KILLED)
-            }
-            ProcessState::KilledByFault { vector, .. } => {
-                crate::core::signal::SigInfo::for_child(dead.0, 128 + vector as i32, CLD_KILLED)
-            }
-            _ => return,
-        };
-        let waiters = {
-            let mut g = GLOBAL.lock();
-            if let Some(p) = g.processes.get_mut(&ppid) {
-                p.signals.raise(1u64 << SIGCHLD);
-                p.signals.set_siginfo(SIGCHLD as usize, info);
-                p.wait_sites.child_exit.drain()
-            } else {
-                Vec::new()
-            }
-        };
-        for w in waiters {
-            let _ = wake_pid(w);
-        }
-        let _ = wake_pid(ppid);
-    }
     wake_tracer_on_exit(dead);
     for w in exit_waiters {
         let _ = wake_pid(w);
     }
+    if !is_leader {
+        reap_thread_corpse(dead);
+        return;
+    }
+    if parent.is_some() {
+        let (code, status) = match final_state {
+            ProcessState::Zombie(c) => (CLD_EXITED, c),
+            ProcessState::KilledBySignal { signal } => (CLD_KILLED, signal as i32),
+            ProcessState::KilledByFault { vector, .. } => (CLD_KILLED, 128 + vector as i32),
+            _ => return,
+        };
+        notify_parent_status_change(dead, code, status);
+    }
+}
+
+fn reap_thread_corpse(dead: Pid) {
+    let stale = crate::core::find_stale_scheduled(dead);
+    if let Some((slot, cpu)) = stale {
+        print_stale_pid_provenance(dead, this_cpu(), "thread_corpse_reap");
+        panic!(
+            "[STALE-RQ] thread corpse reap: pid {} still in {} on cpu {} at reap time",
+            dead.0, slot, cpu,
+        );
+    }
+    let removed = {
+        let mut g = GLOBAL.lock();
+        g.processes.remove(&dead)
+    };
+    if let Some(boxed) = removed {
+        if let Some(pns) = boxed.namespaces.pid() {
+            crate::process_model::PidNamespace::drop_chain(&pns, dead);
+        }
+        if let Some(root) = boxed.addr_space_root {
+            let root_phys = root.as_phys();
+            if !root_has_live_user(root_phys) {
+                crate::ipc::futex::drop_vmspace(root_phys);
+            }
+        }
+        drop(boxed);
+    }
+}
+
+fn root_has_live_user(root_phys: u64) -> bool {
+    let g = GLOBAL.lock();
+    g.processes.values().any(|p| {
+        p.addr_space_root.map(|r| r.as_phys()) == Some(root_phys)
+            && !matches!(
+                p.state.0,
+                ProcessState::Zombie(_)
+                    | ProcessState::KilledByFault { .. }
+                    | ProcessState::KilledBySignal { .. }
+            )
+    })
 }
 
 pub(crate) fn release_addr_space_user(
@@ -235,6 +225,7 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
     }
     crate::core::timeout::drop_pid(cur);
     crate::core::timeout::cancel_callback((cur.raw() as u64) | (1u64 << 63));
+    crate::syscall::posix_timer::clear_timers(cur);
     crate::vfs::locks::posix::drop_owner(cur);
 
     let dying_fds = {
@@ -270,7 +261,9 @@ pub fn exit_current(_tf: &mut TrapFrame, code: i32) -> ! {
     if let Some((a, ipc)) = as_release {
         release_addr_space_user(&a, ipc.as_ref());
     }
+    crate::core::tty::session_leader_exit(cur);
     handle_dying_children(cur);
+    crate::core::tty::handle_orphaned_pgrps_on_exit(cur);
     if let Some(cg) = process_cgroup(cur) {
         let charged = process_charged_bytes(cur);
         if charged > 0 {
@@ -320,6 +313,7 @@ pub fn terminate_current_with_signal(signal: u32) -> ! {
         run_task_exit_hook(vmspace_id, cur, clear_child_tid_addr, robust_list_head);
     }
     crate::core::timeout::drop_pid(cur);
+    crate::syscall::posix_timer::clear_timers(cur);
     crate::vfs::locks::posix::drop_owner(cur);
 
     let as_release = {
@@ -341,6 +335,8 @@ pub fn terminate_current_with_signal(signal: u32) -> ! {
     if let Some((a, ipc)) = as_release {
         release_addr_space_user(&a, ipc.as_ref());
     }
+    crate::core::tty::session_leader_exit(cur);
+    crate::core::tty::handle_orphaned_pgrps_on_exit(cur);
     if let Some(cg) = process_cgroup(cur) {
         let charged = process_charged_bytes(cur);
         if charged > 0 {

@@ -179,7 +179,12 @@ impl Inode for CgroupFile {
 impl CgroupFile {
     fn render(&self) -> String {
         match self.file {
-            ControlFile::CgroupControllers => String::from("cpu io memory pids\n"),
+            ControlFile::CgroupControllers => {
+                format!(
+                    "{}\n",
+                    crate::cgroup::controllers_string(self.cg.available_controllers())
+                )
+            }
             ControlFile::CgroupEvents => {
                 let pop = !self.cg.pids.lock().is_empty();
                 format!("populated {}\nfrozen 0\n", if pop { 1 } else { 0 })
@@ -195,7 +200,12 @@ impl CgroupFile {
                 }
                 out
             }
-            ControlFile::CgroupSubtreeControl => String::from("cpu io memory pids\n"),
+            ControlFile::CgroupSubtreeControl => {
+                format!(
+                    "{}\n",
+                    crate::cgroup::controllers_string(*self.cg.subtree_control.lock())
+                )
+            }
             ControlFile::CgroupThreads => {
                 let pids = self.cg.pids.lock();
                 let mut out = String::new();
@@ -388,6 +398,10 @@ impl CgroupFile {
                     return Err(Errno::INVAL);
                 }
                 self.cg.io.lock().weight = w;
+                Ok(())
+            }
+            ControlFile::CgroupSubtreeControl => {
+                self.cg.set_subtree_control(text)?;
                 Ok(())
             }
             _ => Err(Errno::ACCES),

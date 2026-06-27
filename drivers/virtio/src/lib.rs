@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod blk;
 pub mod gpu;
+pub mod gpu3d;
 pub mod hal;
 pub mod input;
 pub mod mmio;
@@ -73,28 +74,55 @@ pub fn init() {
     }
 
     if let Some(gpu_dev) = probed.iter().find(|d| d.device_id == mmio::DEVICE_GPU) {
-        match gpu::Gpu::new_mmio(gpu_dev.base) {
-            Ok(mut g) => {
-                let (w, h) = (g.width(), g.height());
-                match g.setup_framebuffer() {
-                    Ok(fb) => {
-                        let len = fb.len();
-                        let ptr = fb.as_mut_ptr() as u64;
-                        frame::println!(
-                            "[virtio] gpu: brought up at {:#x}, {}x{} fb @ {:#x} len {}",
-                            gpu_dev.base,
-                            w,
-                            h,
-                            ptr,
-                            len,
-                        );
-                        *FB_PTR.lock() = Some((ptr, len, w, h));
+        if gpu3d::mmio_offers_virgl(gpu_dev.base) {
+            match gpu3d::Gpu3d::new_mmio(gpu_dev.base) {
+                Ok(mut g) => {
+                    let (w, h) = (g.width(), g.height());
+                    match g.setup_framebuffer() {
+                        Ok(fb) => {
+                            let len = fb.len();
+                            let ptr = fb.as_mut_ptr() as u64;
+                            frame::println!(
+                                "[virtio] gpu: brought up at {:#x} (virgl={}), {}x{} fb @ {:#x} len {}",
+                                gpu_dev.base,
+                                g.virgl_enabled(),
+                                w,
+                                h,
+                                ptr,
+                                len,
+                            );
+                            *FB_PTR.lock() = Some((ptr, len, w, h));
+                        }
+                        Err(e) => frame::println!("[virtio] gpu3d fb setup failed: {e:?}"),
                     }
-                    Err(e) => frame::println!("[virtio] gpu fb setup failed: {e:?}"),
+                    *GPU3D.lock() = Some(g);
                 }
-                *GPU.lock() = Some(g);
+                Err(e) => frame::println!("[virtio] gpu3d init failed: {e:?}"),
             }
-            Err(e) => frame::println!("[virtio] gpu init failed: {e:?}"),
+        } else {
+            match gpu::Gpu::new_mmio(gpu_dev.base) {
+                Ok(mut g) => {
+                    let (w, h) = (g.width(), g.height());
+                    match g.setup_framebuffer() {
+                        Ok(fb) => {
+                            let len = fb.len();
+                            let ptr = fb.as_mut_ptr() as u64;
+                            frame::println!(
+                                "[virtio] gpu: brought up at {:#x}, {}x{} fb @ {:#x} len {}",
+                                gpu_dev.base,
+                                w,
+                                h,
+                                ptr,
+                                len,
+                            );
+                            *FB_PTR.lock() = Some((ptr, len, w, h));
+                        }
+                        Err(e) => frame::println!("[virtio] gpu fb setup failed: {e:?}"),
+                    }
+                    *GPU.lock() = Some(g);
+                }
+                Err(e) => frame::println!("[virtio] gpu init failed: {e:?}"),
+            }
         }
     }
 
@@ -172,29 +200,66 @@ pub fn init() {
                 }
                 Err(e) => frame::println!("[virtio] pci rng init failed at {df:?}: {e:?}"),
             },
-            Dt::GPU if GPU.lock().is_none() => match gpu::Gpu::new_pci(dev.transport) {
-                Ok(mut g) => {
-                    let (w, h) = (g.width(), g.height());
-                    match g.setup_framebuffer() {
-                        Ok(fb) => {
-                            let len = fb.len();
-                            let ptr = fb.as_mut_ptr() as u64;
-                            frame::println!(
-                                "[virtio] gpu: brought up via PCI at {:?}, {}x{} fb @ {:#x} len {}",
-                                df,
-                                w,
-                                h,
-                                ptr,
-                                len,
-                            );
-                            *FB_PTR.lock() = Some((ptr, len, w, h));
+            Dt::GPU if GPU.lock().is_none() && GPU3D.lock().is_none() => {
+                let host_visible = dev.host_visible;
+                let mut transport = dev.transport;
+                if gpu3d::transport_offers_virgl(&mut transport) {
+                    match gpu3d::Gpu3d::new_pci(transport, host_visible) {
+                        Ok(mut g) => {
+                            let (w, h) = (g.width(), g.height());
+                            match g.setup_framebuffer() {
+                                Ok(fb) => {
+                                    let len = fb.len();
+                                    let ptr = fb.as_mut_ptr() as u64;
+                                    frame::println!(
+                                        "[virtio] gpu: brought up via PCI at {:?} (virgl={}), {}x{} fb @ {:#x} len {}",
+                                        df,
+                                        g.virgl_enabled(),
+                                        w,
+                                        h,
+                                        ptr,
+                                        len,
+                                    );
+                                    *FB_PTR.lock() = Some((ptr, len, w, h));
+                                }
+                                Err(e) => {
+                                    frame::println!("[virtio] pci gpu3d fb setup failed: {e:?}")
+                                }
+                            }
+                            *GPU3D.lock() = Some(g);
                         }
-                        Err(e) => frame::println!("[virtio] pci gpu fb setup failed: {e:?}"),
+                        Err(e) => {
+                            frame::println!("[virtio] pci gpu3d init failed at {df:?}: {e:?}")
+                        }
                     }
-                    *GPU.lock() = Some(g);
+                } else {
+                    match gpu::Gpu::new_pci(transport) {
+                        Ok(mut g) => {
+                            let (w, h) = (g.width(), g.height());
+                            match g.setup_framebuffer() {
+                                Ok(fb) => {
+                                    let len = fb.len();
+                                    let ptr = fb.as_mut_ptr() as u64;
+                                    frame::println!(
+                                        "[virtio] gpu: brought up via PCI at {:?}, {}x{} fb @ {:#x} len {}",
+                                        df,
+                                        w,
+                                        h,
+                                        ptr,
+                                        len,
+                                    );
+                                    *FB_PTR.lock() = Some((ptr, len, w, h));
+                                }
+                                Err(e) => {
+                                    frame::println!("[virtio] pci gpu fb setup failed: {e:?}")
+                                }
+                            }
+                            *GPU.lock() = Some(g);
+                        }
+                        Err(e) => frame::println!("[virtio] pci gpu init failed at {df:?}: {e:?}"),
+                    }
                 }
-                Err(e) => frame::println!("[virtio] pci gpu init failed at {df:?}: {e:?}"),
-            },
+            }
             Dt::Input => match input::Input::new_pci(dev.transport) {
                 Ok(i) => {
                     frame::println!("[virtio] input: brought up via PCI at {:?}", df);
@@ -232,6 +297,7 @@ static RNG: SpinIrq<Option<rng::Rng>> = SpinIrq::new(None);
 static BLK: SpinIrq<Option<blk::Blk>> = SpinIrq::new(None);
 static NET: SpinIrq<Option<net::Net>> = SpinIrq::new(None);
 static GPU: SpinIrq<Option<gpu::Gpu>> = SpinIrq::new(None);
+static GPU3D: SpinIrq<Option<gpu3d::Gpu3d>> = SpinIrq::new(None);
 static FB_PTR: SpinIrq<Option<(u64, usize, u32, u32)>> = SpinIrq::new(None);
 static INPUTS: SpinIrq<alloc::vec::Vec<input::Input>> = SpinIrq::new(alloc::vec::Vec::new());
 static SND: SpinIrq<Option<sound::Sound>> = SpinIrq::new(None);
@@ -295,12 +361,141 @@ pub fn fb_scroll_up(rows: usize) {
 }
 
 pub fn gpu_flush() -> Result<(), Error> {
+    if let Some(g) = GPU3D.lock().as_mut() {
+        return g.flush().map_err(|e| match e {
+            gpu3d::Gpu3dError::Driver(d) => Error::Driver(d),
+            _ => Error::Driver(virtio_drivers::Error::IoError),
+        });
+    }
     let mut g = GPU.lock();
     let gpu = g.as_mut().ok_or(Error::NoDevice)?;
     gpu.flush().map_err(|e| match e {
         gpu::GpuError::Driver(d) => Error::Driver(d),
         gpu::GpuError::Mmio(_) => Error::Driver(virtio_drivers::Error::IoError),
     })
+}
+
+pub fn gpu_virgl_enabled() -> bool {
+    GPU3D
+        .lock()
+        .as_ref()
+        .map(|g| g.virgl_enabled())
+        .unwrap_or(false)
+}
+
+pub fn gpu_capset(cap_set_id: u32) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    GPU3D
+        .lock()
+        .as_ref()
+        .and_then(|g| g.capset(cap_set_id).map(|(v, d)| (v, d.to_vec())))
+}
+
+pub fn gpu_has_capset(cap_set_id: u32) -> bool {
+    GPU3D
+        .lock()
+        .as_ref()
+        .map(|g| g.capset(cap_set_id).is_some())
+        .unwrap_or(false)
+}
+
+pub fn gpu_blob_supported() -> bool {
+    GPU3D
+        .lock()
+        .as_ref()
+        .map(|g| g.blob_supported())
+        .unwrap_or(false)
+}
+
+pub fn gpu_host_visible_region() -> Option<(u64, u64)> {
+    GPU3D.lock().as_ref().and_then(|g| g.host_visible_region())
+}
+
+fn map_gpu3d(e: gpu3d::Gpu3dError) -> Error {
+    match e {
+        gpu3d::Gpu3dError::Driver(d) => Error::Driver(d),
+        _ => Error::Driver(virtio_drivers::Error::IoError),
+    }
+}
+
+fn with_gpu3d_ctl<R>(
+    f: impl FnOnce(&mut dyn gpu3d::Gpu3dCtl) -> Result<R, gpu3d::Gpu3dError>,
+) -> Result<R, Error> {
+    let mut g = GPU3D.lock();
+    let gpu = g.as_mut().ok_or(Error::NoDevice)?;
+    f(gpu.ctl()).map_err(map_gpu3d)
+}
+
+pub fn gpu_ctx_create(ctx_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.ctx_create(ctx_id))
+}
+
+pub fn gpu_ctx_destroy(ctx_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.ctx_destroy(ctx_id))
+}
+
+pub fn gpu_ctx_attach_resource(ctx_id: u32, resource_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.ctx_attach_resource(ctx_id, resource_id))
+}
+
+pub fn gpu_ctx_detach_resource(ctx_id: u32, resource_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.ctx_detach_resource(ctx_id, resource_id))
+}
+
+pub fn gpu_create_resource_3d(args: &gpu3d::ResourceCreate3d) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.create_resource_3d(args))
+}
+
+pub fn gpu_attach_backing(resource_id: u32, entries: &[(u64, u32)]) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.attach_backing(resource_id, entries))
+}
+
+pub fn gpu_detach_backing(resource_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.detach_backing(resource_id))
+}
+
+pub fn gpu_unref_resource(resource_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.unref_resource(resource_id))
+}
+
+pub fn gpu_transfer_to_host_3d(ctx_id: u32, t: &gpu3d::Transfer3d) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.transfer_to_host_3d(ctx_id, t))
+}
+
+pub fn gpu_transfer_from_host_3d(ctx_id: u32, t: &gpu3d::Transfer3d) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.transfer_from_host_3d(ctx_id, t))
+}
+
+pub fn gpu_submit_3d(ctx_id: u32, blob: &[u8]) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.submit_3d(ctx_id, blob))
+}
+
+pub fn gpu_resource_create_blob(
+    ctx_id: u32,
+    resource_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| {
+        c.resource_create_blob(ctx_id, resource_id, blob_mem, blob_flags, blob_id, size)
+    })
+}
+
+pub fn gpu_resource_map_blob(resource_id: u32, offset: u64) -> Result<u32, Error> {
+    with_gpu3d_ctl(|c| c.resource_map_blob(resource_id, offset))
+}
+
+pub fn gpu_resource_unmap_blob(resource_id: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.resource_unmap_blob(resource_id))
+}
+
+pub fn gpu_present_resource(resource_id: u32, w: u32, h: u32) -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.present_resource(resource_id, w, h))
+}
+
+pub fn gpu_restore_console_scanout() -> Result<(), Error> {
+    with_gpu3d_ctl(|c| c.restore_console())
 }
 
 pub fn input_drain() -> alloc::vec::Vec<(usize, input::InputEvent)> {
@@ -316,6 +511,10 @@ pub fn input_drain() -> alloc::vec::Vec<(usize, input::InputEvent)> {
 
 pub fn input_count() -> usize {
     INPUTS.lock().len()
+}
+
+pub fn input_caps(idx: usize) -> Option<input::InputCaps> {
+    INPUTS.lock().get(idx).map(|d| d.caps().clone())
 }
 
 pub fn fill_random(buf: &mut [u8]) -> Result<usize, Error> {
@@ -391,10 +590,69 @@ pub fn sound_play_blocking(
     let mut g = SND.lock();
     let snd = g.as_mut().ok_or(Error::NoDevice)?;
     snd.play_blocking(stream_id, channels, format, rate, frames)
-        .map_err(|e| match e {
-            sound::SoundErr::Driver(d) => Error::Driver(d),
-            sound::SoundErr::Mmio(_) => Error::Driver(virtio_drivers::Error::IoError),
-        })
+        .map_err(map_snd_err)
+}
+
+fn map_snd_err(e: sound::SoundErr) -> Error {
+    match e {
+        sound::SoundErr::Driver(d) => Error::Driver(d),
+        sound::SoundErr::Mmio(_) => Error::Driver(virtio_drivers::Error::IoError),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sound_pcm_set_params(
+    stream_id: u32,
+    buffer_bytes: u32,
+    period_bytes: u32,
+    channels: u8,
+    format: sound::PcmFormat,
+    rate: sound::PcmRate,
+) -> Result<(), Error> {
+    let mut g = SND.lock();
+    let snd = g.as_mut().ok_or(Error::NoDevice)?;
+    snd.pcm_set_params(
+        stream_id,
+        buffer_bytes,
+        period_bytes,
+        sound::PcmFeatures::empty(),
+        channels,
+        format,
+        rate,
+    )
+    .map_err(map_snd_err)
+}
+
+pub fn sound_pcm_prepare(stream_id: u32) -> Result<(), Error> {
+    let mut g = SND.lock();
+    g.as_mut()
+        .ok_or(Error::NoDevice)?
+        .pcm_prepare(stream_id)
+        .map_err(map_snd_err)
+}
+
+pub fn sound_pcm_start(stream_id: u32) -> Result<(), Error> {
+    let mut g = SND.lock();
+    g.as_mut()
+        .ok_or(Error::NoDevice)?
+        .pcm_start(stream_id)
+        .map_err(map_snd_err)
+}
+
+pub fn sound_pcm_stop(stream_id: u32) -> Result<(), Error> {
+    let mut g = SND.lock();
+    g.as_mut()
+        .ok_or(Error::NoDevice)?
+        .pcm_stop(stream_id)
+        .map_err(map_snd_err)
+}
+
+pub fn sound_pcm_write(stream_id: u32, frames: &[u8]) -> Result<usize, Error> {
+    let mut g = SND.lock();
+    g.as_mut()
+        .ok_or(Error::NoDevice)?
+        .pcm_write(stream_id, frames)
+        .map_err(map_snd_err)
 }
 
 #[derive(Debug)]

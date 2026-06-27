@@ -114,12 +114,12 @@ impl AddressSpace {
 }
 
 pub struct MmapState {
-    pub vmas: alloc::vec::Vec<Vma>,
-    pub last_end: u64,
-    pub arena_lo: u64,
-    pub arena_hi: u64,
-    pub generation: u64,
-    pub mlockall_flags: u32,
+    vmas: alloc::vec::Vec<Vma>,
+    last_end: u64,
+    arena_lo: u64,
+    arena_hi: u64,
+    generation: u64,
+    mlockall_flags: u32,
 }
 
 #[derive(Clone)]
@@ -138,6 +138,7 @@ bitflags::bitflags! {
         const ANON = 0x2;
         const GROWSDOWN = 0x4;
         const LOCKED = 0x8;
+        const RESERVED = 0x10;
     }
 }
 
@@ -205,8 +206,96 @@ impl MmapState {
         self.generation
     }
 
+    pub fn vmas(&self) -> &[Vma] {
+        &self.vmas
+    }
+
+    pub fn arena_lo(&self) -> u64 {
+        self.arena_lo
+    }
+
+    pub fn arena_hi(&self) -> u64 {
+        self.arena_hi
+    }
+
+    pub fn mlockall_flags(&self) -> u32 {
+        self.mlockall_flags
+    }
+
+    pub fn set_mlockall(&mut self, flags: u32) {
+        self.mlockall_flags = flags;
+    }
+
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn bump_last_end(&mut self, new_end: u64) {
+        if new_end > self.last_end {
+            self.last_end = new_end;
+        }
+    }
+
+    pub fn extend_vma_end(&mut self, start: u64, new_end: u64) -> bool {
+        let old_end = match self.vmas.iter().find(|v| v.start == start) {
+            Some(v) => v.end,
+            None => return false,
+        };
+        if new_end <= old_end || new_end > self.arena_hi {
+            return false;
+        }
+        if self.overlaps(old_end, new_end) {
+            return false;
+        }
+        if let Some(v) = self.vmas.iter_mut().find(|v| v.start == start) {
+            v.end = new_end;
+        } else {
+            return false;
+        }
+        self.bump_last_end(new_end);
+        self.bump_generation();
+        true
+    }
+
+    pub fn truncate_vma_end(&mut self, start: u64, new_end: u64) -> bool {
+        let ok = match self.vmas.iter_mut().find(|v| v.start == start) {
+            Some(v) if new_end > v.start && new_end < v.end => {
+                v.end = new_end;
+                true
+            }
+            _ => false,
+        };
+        if ok {
+            self.bump_generation();
+        }
+        ok
+    }
+
+    pub fn remove_vma_at(&mut self, start: u64) -> Option<Vma> {
+        let pos = self.vmas.iter().position(|v| v.start == start)?;
+        let removed = self.vmas.remove(pos);
+        self.bump_generation();
+        Some(removed)
+    }
+
+    pub fn drain_vmas_where<F: FnMut(&Vma) -> bool>(
+        &mut self,
+        mut pred: F,
+    ) -> alloc::vec::Vec<Vma> {
+        let mut removed = alloc::vec::Vec::new();
+        let mut kept = alloc::vec::Vec::with_capacity(self.vmas.len());
+        for v in self.vmas.drain(..) {
+            if pred(&v) {
+                removed.push(v);
+            } else {
+                kept.push(v);
+            }
+        }
+        self.vmas = kept;
+        if !removed.is_empty() {
+            self.bump_generation();
+        }
+        removed
     }
 
     pub fn find_gap(&self, length: u64) -> Option<u64> {
@@ -394,6 +483,39 @@ impl MmapState {
         self.vmas = new_vmas;
         self.bump_generation();
         removed
+    }
+
+    pub fn reserve(&mut self, lo: u64, hi: u64) {
+        let pos = self
+            .vmas
+            .binary_search_by_key(&lo, |v| v.start)
+            .unwrap_or_else(|p| p);
+        self.vmas.insert(
+            pos,
+            Vma {
+                start: lo,
+                end: hi,
+                prot: frame::mm::vm::Perms::USER,
+                flags: VmaFlags::RESERVED,
+                backing: VmaBacking::Anonymous,
+            },
+        );
+        if hi > self.last_end {
+            self.last_end = hi;
+        }
+        self.bump_generation();
+    }
+
+    pub fn unmap_range_reserve(&mut self, lo: u64, hi: u64) -> alloc::vec::Vec<Vma> {
+        let removed = self.unmap_range(lo, hi);
+        self.reserve(lo, hi);
+        removed
+    }
+
+    pub fn release_reservation(&mut self, lo: u64, hi: u64) {
+        self.vmas
+            .retain(|v| !(v.start == lo && v.end == hi && v.flags.contains(VmaFlags::RESERVED)));
+        self.bump_generation();
     }
 
     pub fn protect_range(

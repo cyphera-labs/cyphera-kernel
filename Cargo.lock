@@ -31,9 +31,9 @@ dependencies = [
 
 [[package]]
 name = "buddy_system_allocator"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
+checksum = "c1af5a01adeeade54c9f5060300227a8ee64c05b6376f28e9b8ee3b72dd2056f"
 
 [[package]]
 name = "byteorder"
@@ -95,14 +95,14 @@ dependencies = [
 
 [[package]]
 name = "cyphera-kapi"
-version = "0.0.5"
+version = "0.0.666"
 dependencies = [
  "bitflags 2.13.0",
 ]
 
 [[package]]
 name = "cyphera-kernel"
-version = "0.0.5"
+version = "0.0.666"
 dependencies = [
  "frame",
  "kernel",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "frame"
-version = "0.0.5"
+version = "0.0.666"
 dependencies = [
  "bitflags 2.13.0",
  "buddy_system_allocator",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "frame_host"
-version = "0.0.5"
+version = "0.0.666"
 
 [[package]]
 name = "hash32"
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.0.5"
+version = "0.0.666"
 dependencies = [
  "bitflags 2.13.0",
  "chacha20",
@@ -259,9 +259,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "object"
-version = "0.36.7"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "memchr",
 ]
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "bd5231412d905519dca6a5deb0327d407be68d6c941feec004533401d3a0a715"
 
 [[package]]
 name = "stable_deref_trait"
@@ -392,11 +392,11 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "verification"
-version = "0.0.5"
+version = "0.0.666"
 
 [[package]]
 name = "virtio"
-version = "0.0.5"
+version = "0.0.666"
 dependencies = [
  "frame",
  "virtio-drivers",

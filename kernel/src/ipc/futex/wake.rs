@@ -16,7 +16,7 @@ pub fn wake(vmspace_id: u64, uaddr: u64, n: u32) -> i64 {
         Some(q) => q,
         None => return 0,
     };
-    let waiters = q.drain();
+    let waiters = order_by_priority(q.drain());
     let mut woken = 0i64;
     for pid in waiters {
         if (woken as u32) >= n {
@@ -45,7 +45,7 @@ pub fn wake_bitset(vmspace_id: u64, uaddr: u64, n: u32, mask: u32) -> i64 {
         Some(q) => q,
         None => return 0,
     };
-    let waiters = q.drain();
+    let waiters = order_by_priority(q.drain());
     let masks = BITSET_MASKS.lock().clone();
     let mut woken = 0i64;
     for pid in waiters {
@@ -97,7 +97,7 @@ pub fn requeue(
     };
     let q2 = queue_for(key2);
 
-    let waiters = q1.drain();
+    let waiters = order_by_priority(q1.drain());
     let mut woken: u32 = 0;
     let mut requeued: u32 = 0;
     for pid in waiters {

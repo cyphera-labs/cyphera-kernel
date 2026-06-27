@@ -450,8 +450,6 @@ const EXEC_MAX_ARG_LEN: usize = 4096;
 const EXEC_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
-    use alloc::vec;
-
     let mut path_buf = [0u8; PATH_MAX];
     let len =
         frame::user::copy_cstr_from_user(tf.arg(0), &mut path_buf).map_err(|_| ENAMETOOLONG)?;
@@ -461,6 +459,17 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
 
     let argv: Vec<Vec<u8>> = read_user_string_vec(tf.arg(1), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
     let envp: Vec<Vec<u8>> = read_user_string_vec(tf.arg(2), EXEC_MAX_ARGS, EXEC_MAX_ARG_LEN)?;
+
+    exec_normalized_path(normalized, argv, envp, tf)
+}
+
+fn exec_normalized_path(
+    normalized: alloc::string::String,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    tf: &mut TrapFrame,
+) -> Result<(), i64> {
+    use alloc::vec;
 
     let argv = if argv.is_empty() {
         alloc::vec![normalized.as_bytes().to_vec()]
@@ -577,17 +586,24 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
     let (ruid, pre_euid, rgid, pre_egid) =
         sched::with_current_creds(|c| (c.ruid, c.euid, c.rgid, c.egid));
     let nosuid = exe_nosuid;
+    let no_new_privs = sched::current_no_new_privs();
     let t = crate::security::setid::exec_transition(
-        exe_mode, exe_uid, exe_gid, ruid, pre_euid, rgid, pre_egid, nosuid,
+        exe_mode,
+        exe_uid,
+        exe_gid,
+        ruid,
+        pre_euid,
+        rgid,
+        pre_egid,
+        nosuid,
+        no_new_privs,
     );
     crate::process_model::exec_current(
         &buf,
         exe_for_proc,
         &argv_refs,
         &envp_refs,
-        t.post_euid,
-        t.post_egid,
-        t.secure,
+        &t,
         resolved_inode,
         resolved_mnt_flags,
         tf,
@@ -602,7 +618,6 @@ pub(super) fn sys_execve(tf: &mut TrapFrame) -> Result<(), i64> {
         sched::set_current_name(comm);
     }
 
-    sched::with_current_creds_mut(|c| crate::security::setid::apply_exec_transition(c, &t));
     Ok(())
 }
 
@@ -664,32 +679,41 @@ pub(super) fn sys_execveat(tf: &mut TrapFrame) -> Result<(), i64> {
         };
         let argv_refs: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
         let envp_refs: Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
-        let (cur_euid, cur_egid) = sched::with_current_creds(|c| (c.euid, c.egid));
+        let (ruid, pre_euid, rgid, pre_egid) =
+            sched::with_current_creds(|c| (c.ruid, c.euid, c.rgid, c.egid));
+        let nosuid = fd_mnt_flags & crate::vfs::mount::MS_NOSUID != 0;
+        let no_new_privs = sched::current_no_new_privs();
+        let t = crate::security::setid::exec_transition(
+            stat.mode,
+            stat.uid,
+            stat.gid,
+            ruid,
+            pre_euid,
+            rgid,
+            pre_egid,
+            nosuid,
+            no_new_privs,
+        );
         crate::process_model::exec_current(
             &buf,
             argv_refs[0],
             &argv_refs,
             &envp_refs,
-            cur_euid,
-            cur_egid,
-            false,
+            &t,
             Some(inode.clone()),
             fd_mnt_flags,
             tf,
         )
         .map_err(|e| e.as_neg_i64())?;
-        let t = crate::security::setid::ExecCredTransition {
-            post_euid: cur_euid,
-            post_egid: cur_egid,
-            secure: false,
-            suid_owner: None,
-            sgid_owner: None,
-        };
-        sched::with_current_creds_mut(|c| crate::security::setid::apply_exec_transition(c, &t));
         return Ok(());
     }
 
-    Err(ENOSYS)
+    if path.is_empty() {
+        return Err(crate::errno::ENOENT);
+    }
+
+    let normalized = resolve_user_path(dirfd as i64, path)?;
+    exec_normalized_path(normalized, argv, envp, tf)
 }
 
 fn read_user_string_vec(
@@ -762,7 +786,14 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
             );
             return ENOSYS;
         }
-        if (flags & (CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNET)) != 0 {
+        const CLONE_NS_MASK: u64 = CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWPID
+            | CLONE_NEWCGROUP
+            | CLONE_NEWTIME
+            | CLONE_NEWNET;
+        if (flags & CLONE_NS_MASK) != 0 {
             let ns_owner = sched::with_current_creds(|c| c.user_ns.clone());
             if !crate::security::capable_in(crate::process_model::CAP_SYS_ADMIN, ns_owner.as_ref())
             {
@@ -784,6 +815,29 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
             let owner = sched::with_current_creds(|c| c.user_ns.clone());
             sched::set_current_pending_net_ns(Some(crate::net::new_namespace_with_owner(owner)));
         }
+        if (flags & CLONE_NEWUTS) != 0 {
+            let owner = sched::with_current_creds(|c| c.user_ns.clone());
+            let snap = sched::with_current_uts(|u| u.snapshot(owner));
+            sched::set_current_pending_uts_ns(Some(snap));
+        }
+        if (flags & CLONE_NEWCGROUP) != 0 {
+            let root =
+                sched::process_cgroup(sched::current_pid()).unwrap_or_else(crate::cgroup::root);
+            sched::set_current_pending_cgroup_ns(Some(crate::process_model::CgroupNamespace::new(
+                root,
+            )));
+        }
+        if (flags & CLONE_NEWTIME) != 0 {
+            sched::set_current_pending_time_ns(Some(crate::process_model::TimeNamespace::fresh()));
+        }
+        if (flags & CLONE_NEWNS) != 0 {
+            let owner = sched::with_current_creds(|c| c.user_ns.clone());
+            let snap = match sched::with_current_mount_table(|m| m.clone()).flatten() {
+                Some(existing) => existing.snapshot(owner),
+                None => crate::vfs::global_mount_table().snapshot(owner),
+            };
+            sched::set_current_pending_mount_table(Some(snap));
+        }
         if child_stack != 0 {
             let mut tf_for_child = tf.clone();
             tf_for_child.rsp_user = child_stack;
@@ -795,7 +849,12 @@ fn do_clone(tf: &TrapFrame, flags: u64, child_stack: u64, ptid: u64, ctid: u64, 
 
     let child_pid = match child_pid_result {
         Ok(p) => p,
-        Err(e) => return e.as_neg_i64(),
+        Err(e) => {
+            if !is_pthread {
+                sched::clear_current_pending_ns();
+            }
+            return e.as_neg_i64();
+        }
     };
 
     let tid_local = sched::host_to_caller_local(child_pid) as i32;
@@ -1034,37 +1093,37 @@ pub(super) fn sys_unshare(flags: u64) -> i64 {
     {
         return EPERM;
     }
+    let mut staged = sched::StagedNamespaces::default();
     if flags & CLONE_NEWNS != 0 {
         let snap = match sched::with_current_mount_table(|m| m.clone()).flatten() {
             Some(existing) => existing.snapshot(ns_owner.clone()),
             None => crate::vfs::global_mount_table().snapshot(ns_owner.clone()),
         };
-        sched::set_current_mount_table(Some(snap));
+        staged.mount_table = Some(snap);
     }
     if flags & CLONE_NEWUTS != 0 {
-        let snap = sched::with_current_uts(|u| u.snapshot(ns_owner.clone()));
-        sched::set_current_uts(Some(snap));
+        staged.uts = Some(sched::with_current_uts(|u| u.snapshot(ns_owner.clone())));
     }
     if flags & CLONE_NEWIPC != 0 {
-        sched::set_current_ipc(Some(crate::process_model::IpcNamespace::fresh_with_owner(
+        staged.ipc = Some(crate::process_model::IpcNamespace::fresh_with_owner(
             ns_owner.clone(),
-        )));
+        ));
     }
     if flags & CLONE_NEWNET != 0 {
-        sched::set_current_net(Some(crate::net::new_namespace_with_owner(ns_owner.clone())));
+        staged.net = Some(crate::net::new_namespace_with_owner(ns_owner.clone()));
     }
     if flags & CLONE_NEWPID != 0 {
         let parent = sched::with_current_pid_ns(|p| p.clone());
-        let new_ns = crate::process_model::PidNamespace::child(parent);
-        sched::set_current_pending_pid_ns(Some(new_ns));
+        staged.pending_pid = Some(crate::process_model::PidNamespace::child(parent));
     }
     if flags & CLONE_NEWCGROUP != 0 {
         let root = sched::process_cgroup(sched::current_pid()).unwrap_or_else(crate::cgroup::root);
-        sched::set_current_cgroup_ns(Some(crate::process_model::CgroupNamespace::new(root)));
+        staged.cgroup = Some(crate::process_model::CgroupNamespace::new(root));
     }
     if flags & CLONE_NEWTIME != 0 {
-        sched::set_current_time_ns(Some(crate::process_model::TimeNamespace::fresh()));
+        staged.time = Some(crate::process_model::TimeNamespace::fresh());
     }
+    sched::commit_current_ns_set(staged);
     0
 }
 

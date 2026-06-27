@@ -7,6 +7,57 @@ use cyphera_kapi::{Errno, KResult};
 
 use crate::vfs::{Inode, InodeKind, Stat};
 
+pub fn alsa_control() -> Arc<dyn Inode> {
+    Arc::new(AlsaNode {
+        kind: crate::device::snd::ALSA_CONTROL,
+    })
+}
+
+pub fn alsa_pcm_playback() -> Arc<dyn Inode> {
+    Arc::new(AlsaNode {
+        kind: crate::device::snd::ALSA_PCM_PLAYBACK,
+    })
+}
+
+struct AlsaNode {
+    kind: u8,
+}
+
+impl Inode for AlsaNode {
+    fn kind(&self) -> InodeKind {
+        InodeKind::CharDevice
+    }
+    fn stat(&self) -> Stat {
+        let minor = if self.kind == crate::device::snd::ALSA_PCM_PLAYBACK {
+            16
+        } else {
+            0
+        };
+        let mut s = Stat::fresh(InodeKind::CharDevice, 0, 0o660);
+        s.rdev = crate::vfs::makedev(116, minor);
+        s
+    }
+    fn alsa_kind(&self) -> Option<u8> {
+        Some(self.kind)
+    }
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> KResult<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> KResult<usize> {
+        Ok(buf.len())
+    }
+    fn on_open(&self, _flags: crate::vfs::OpenFlags) {
+        if self.kind == crate::device::snd::ALSA_PCM_PLAYBACK {
+            crate::device::snd::pcm_open();
+        }
+    }
+    fn on_close(&self, _flags: crate::vfs::OpenFlags) {
+        if self.kind == crate::device::snd::ALSA_PCM_PLAYBACK {
+            crate::device::snd::pcm_close();
+        }
+    }
+}
+
 pub fn null() -> Arc<dyn Inode> {
     Arc::new(Null)
 }
@@ -68,6 +119,32 @@ pub fn vda() -> Arc<dyn Inode> {
     Arc::new(Vda)
 }
 
+struct VdaClaim {
+    mounted: bool,
+    exclusive: bool,
+    open_count: usize,
+}
+
+static VDA_CLAIM: frame::sync::SpinIrq<VdaClaim> = frame::sync::SpinIrq::new(VdaClaim {
+    mounted: false,
+    exclusive: false,
+    open_count: 0,
+});
+
+pub fn vda_mount_claim() -> KResult<()> {
+    let mut c = VDA_CLAIM.lock();
+    if c.mounted || c.exclusive {
+        return Err(Errno::BUSY);
+    }
+    c.mounted = true;
+    Ok(())
+}
+
+pub fn vda_mount_release() {
+    let mut c = VDA_CLAIM.lock();
+    c.mounted = false;
+}
+
 struct Vda;
 
 impl Inode for Vda {
@@ -76,6 +153,29 @@ impl Inode for Vda {
     }
     fn stat(&self) -> Stat {
         char_stat()
+    }
+    fn check_open(&self, flags: crate::vfs::OpenFlags) -> KResult<()> {
+        let mut c = VDA_CLAIM.lock();
+        if c.exclusive {
+            return Err(Errno::BUSY);
+        }
+        if flags.contains(crate::vfs::OpenFlags::EXCL) {
+            if c.mounted || c.open_count > 0 {
+                return Err(Errno::BUSY);
+            }
+            c.exclusive = true;
+        } else if c.mounted && flags.is_writable() {
+            return Err(Errno::BUSY);
+        }
+        c.open_count += 1;
+        Ok(())
+    }
+    fn on_close(&self, _flags: crate::vfs::OpenFlags) {
+        let mut c = VDA_CLAIM.lock();
+        c.open_count = c.open_count.saturating_sub(1);
+        if c.open_count == 0 {
+            c.exclusive = false;
+        }
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
         if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
@@ -178,6 +278,15 @@ impl Inode for Console {
     }
     fn stat(&self) -> Stat {
         char_stat()
+    }
+    fn inode_id(&self) -> u64 {
+        crate::core::tty::CONSOLE_INODE_ID
+    }
+    fn on_open(&self, flags: crate::vfs::OpenFlags) {
+        crate::core::tty::maybe_acquire_on_open(
+            crate::core::tty::TtyId::Console,
+            flags.contains(crate::vfs::OpenFlags::NOCTTY),
+        );
     }
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
         Ok(crate::console::read_blocking(buf))
@@ -323,31 +432,29 @@ impl Inode for InputEvent {
         InodeKind::CharDevice
     }
     fn stat(&self) -> Stat {
-        Stat::fresh(InodeKind::CharDevice, 0, 0o600)
+        let mut s = Stat::fresh(InodeKind::CharDevice, 0, 0o600);
+        s.rdev = crate::vfs::makedev(13, 64 + self.idx as u32);
+        s
     }
-    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> KResult<usize> {
+    fn on_open(&self, _flags: crate::vfs::OpenFlags) {}
+    fn evdev_idx(&self) -> Option<usize> {
+        Some(self.idx)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> KResult<usize> {
+        self.read_at_with_flags(offset, buf, crate::vfs::OpenFlags::empty())
+    }
+    fn read_at_with_flags(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        flags: crate::vfs::OpenFlags,
+    ) -> KResult<usize> {
         const EV_SIZE: usize = 24;
         if buf.len() < EV_SIZE {
             return Err(Errno::INVAL);
         }
-        let drained = crate::device::input::drain_for(self.idx);
-        if drained.is_empty() {
-            return crate::device::input::read_blocking(self.idx, buf);
-        }
-        let max = buf.len() / EV_SIZE;
-        let n = drained.len().min(max);
-        for (i, ev) in drained.iter().take(n).enumerate() {
-            let off = i * EV_SIZE;
-            let now = frame::cpu::clock::nanos_since_boot();
-            let sec = (now / 1_000_000_000) as i64;
-            let usec = ((now / 1_000) % 1_000_000) as i64;
-            buf[off..off + 8].copy_from_slice(&sec.to_le_bytes());
-            buf[off + 8..off + 16].copy_from_slice(&usec.to_le_bytes());
-            buf[off + 16..off + 18].copy_from_slice(&ev.event_type.to_le_bytes());
-            buf[off + 18..off + 20].copy_from_slice(&ev.code.to_le_bytes());
-            buf[off + 20..off + 24].copy_from_slice(&ev.value.to_le_bytes());
-        }
-        Ok(n * EV_SIZE)
+        let nb = flags.contains(crate::vfs::OpenFlags::NONBLOCK);
+        crate::device::input::read_blocking(self.idx, buf, nb)
     }
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> KResult<usize> {
         Err(Errno::NOSYS)

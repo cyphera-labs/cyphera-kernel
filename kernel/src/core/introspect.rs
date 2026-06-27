@@ -3,15 +3,19 @@ use super::*;
 pub fn signal_pgrp(pgid: Pid, signal: u32) -> usize {
     let targets: alloc::vec::Vec<Pid> = {
         let g = GLOBAL.lock();
-        g.processes
-            .iter()
-            .filter(|(_, p)| p.identity.pgid() == pgid)
-            .map(|(pid, _)| *pid)
-            .collect()
+        let mut tgids: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+        for (pid, p) in g.processes.iter() {
+            if p.identity.pgid() == pgid && p.tgid == *pid && !tgids.contains(pid) {
+                tgids.push(*pid);
+            }
+        }
+        tgids
     };
+    let sender = current_pid().raw();
     let mut count = 0;
-    for pid in targets {
-        if send_signal(pid, signal).is_ok() {
+    for tgid in targets {
+        let info = crate::core::signal::SigInfo::for_kill(signal, sender);
+        if send_group_signal(tgid, signal, info).is_ok() {
             count += 1;
         }
     }
@@ -92,7 +96,14 @@ pub fn process_summary(pid: Pid) -> Option<ProcessSummary> {
     };
     let (vsize, brk_cur, brk_start): (u64, u64, u64) = match proc.addr_space.as_ref() {
         Some(a) => {
-            let vsize = a.mmap.lock().vmas.iter().map(|v| v.end - v.start).sum();
+            let vsize = a
+                .mmap
+                .lock()
+                .vmas()
+                .iter()
+                .filter(|v| !v.flags.contains(crate::process_model::VmaFlags::RESERVED))
+                .map(|v| v.end - v.start)
+                .sum();
             let b = *a.brk.lock();
             (vsize, b.current, b.start)
         }

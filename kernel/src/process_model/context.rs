@@ -282,6 +282,10 @@ pub struct NamespaceContext {
     pending_pid: Option<Arc<PidNamespace>>,
     pending_ipc: Option<Arc<IpcNamespace>>,
     pending_net: Option<Arc<crate::net::NetNamespace>>,
+    pending_uts: Option<Arc<UtsNamespace>>,
+    pending_cgroup: Option<Arc<CgroupNamespace>>,
+    pending_time: Option<Arc<TimeNamespace>>,
+    pending_mount: Option<Arc<crate::vfs::MountTable>>,
 }
 
 impl NamespaceContext {
@@ -300,6 +304,10 @@ impl NamespaceContext {
             pending_pid: None,
             pending_ipc: None,
             pending_net: None,
+            pending_uts: None,
+            pending_cgroup: None,
+            pending_time: None,
+            pending_mount: None,
         }
     }
 
@@ -374,6 +382,48 @@ impl NamespaceContext {
     pub fn set_pending_net(&mut self, ns: Option<Arc<crate::net::NetNamespace>>) {
         self.pending_net = ns;
     }
+
+    pub fn take_pending_uts(&mut self) -> Option<Arc<UtsNamespace>> {
+        self.pending_uts.take()
+    }
+
+    pub fn set_pending_uts(&mut self, ns: Option<Arc<UtsNamespace>>) {
+        self.pending_uts = ns;
+    }
+
+    pub fn take_pending_cgroup(&mut self) -> Option<Arc<CgroupNamespace>> {
+        self.pending_cgroup.take()
+    }
+
+    pub fn set_pending_cgroup(&mut self, ns: Option<Arc<CgroupNamespace>>) {
+        self.pending_cgroup = ns;
+    }
+
+    pub fn take_pending_time(&mut self) -> Option<Arc<TimeNamespace>> {
+        self.pending_time.take()
+    }
+
+    pub fn set_pending_time(&mut self, ns: Option<Arc<TimeNamespace>>) {
+        self.pending_time = ns;
+    }
+
+    pub fn take_pending_mount(&mut self) -> Option<Arc<crate::vfs::MountTable>> {
+        self.pending_mount.take()
+    }
+
+    pub fn set_pending_mount(&mut self, table: Option<Arc<crate::vfs::MountTable>>) {
+        self.pending_mount = table;
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending_pid = None;
+        self.pending_ipc = None;
+        self.pending_net = None;
+        self.pending_uts = None;
+        self.pending_cgroup = None;
+        self.pending_time = None;
+        self.pending_mount = None;
+    }
 }
 
 #[derive(Default)]
@@ -383,6 +433,7 @@ pub struct LifecycleContext {
     vfork_done_set: core::sync::atomic::AtomicBool,
     vfork_shared_vm: core::sync::atomic::AtomicBool,
     child_subreaper: core::sync::atomic::AtomicBool,
+    execd: core::sync::atomic::AtomicBool,
 }
 
 impl LifecycleContext {
@@ -442,6 +493,15 @@ impl LifecycleContext {
         self.child_subreaper
             .store(v, core::sync::atomic::Ordering::Release);
     }
+
+    pub fn has_execd(&self) -> bool {
+        self.execd.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn mark_execd(&self) {
+        self.execd
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
 }
 
 pub const RT_SIG_MIN: u32 = 32;
@@ -463,7 +523,13 @@ pub struct SignalContext {
     itimer_virtual_value_ns: u64,
     itimer_prof_interval_ns: u64,
     itimer_prof_value_ns: u64,
+    group_stop_remaining: u32,
+    group_stop_notified: bool,
+    continued_latch: bool,
 }
+
+pub const STOP_SIGNAL_MASK: u64 =
+    (1u64 << SIGSTOP) | (1u64 << SIGTSTP) | (1u64 << SIGTTIN) | (1u64 << SIGTTOU);
 
 impl SignalContext {
     pub fn new() -> Self {
@@ -479,6 +545,9 @@ impl SignalContext {
             itimer_virtual_value_ns: 0,
             itimer_prof_interval_ns: 0,
             itimer_prof_value_ns: 0,
+            group_stop_remaining: 0,
+            group_stop_notified: false,
+            continued_latch: false,
         }
     }
 
@@ -489,12 +558,15 @@ impl SignalContext {
             siginfo: [crate::core::signal::PendingSigInfo::default(); NSIG],
             rt_queue: alloc::collections::VecDeque::new(),
             altstack: parent.altstack,
-            itimer_real_interval_ns: parent.itimer_real_interval_ns,
-            itimer_real_deadline_ns: parent.itimer_real_deadline_ns,
+            itimer_real_interval_ns: 0,
+            itimer_real_deadline_ns: 0,
             itimer_virtual_interval_ns: 0,
             itimer_virtual_value_ns: 0,
             itimer_prof_interval_ns: 0,
             itimer_prof_value_ns: 0,
+            group_stop_remaining: 0,
+            group_stop_notified: false,
+            continued_latch: false,
         }
     }
 
@@ -510,17 +582,8 @@ impl SignalContext {
         self.pending & !self.blocked
     }
 
-    pub fn set_pending(&mut self, mask: u64) {
-        self.pending = mask;
-        self.rt_queue.retain(|(s, _)| mask & (1u64 << s) != 0);
-    }
-
     pub fn set_blocked(&mut self, mask: u64) {
         self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    }
-
-    pub fn raise(&mut self, mask: u64) {
-        self.pending |= mask;
     }
 
     pub fn clear_pending(&mut self, mask: u64) {
@@ -535,9 +598,13 @@ impl SignalContext {
         self.siginfo[signal] = info;
     }
 
-    pub fn reset_siginfo(&mut self) {
-        self.siginfo = [crate::core::signal::PendingSigInfo::default(); NSIG];
+    pub fn reset_for_exec(&mut self) {
+        let kill_bit = self.pending & (1u64 << SIGKILL);
+        let kill_info = self.siginfo[SIGKILL as usize];
+        self.pending = kill_bit;
         self.rt_queue.clear();
+        self.siginfo = [crate::core::signal::PendingSigInfo::default(); NSIG];
+        self.siginfo[SIGKILL as usize] = kill_info;
     }
 
     pub fn rt_pending_count(&self) -> usize {
@@ -593,6 +660,61 @@ impl SignalContext {
         if is_rt_signal(signo) {
             self.rt_queue.retain(|(s, _)| *s != signo);
         }
+    }
+
+    pub fn discard_stop_signals(&mut self) {
+        self.pending &= !STOP_SIGNAL_MASK;
+        for s in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+            self.siginfo[s as usize] = crate::core::signal::PendingSigInfo::default();
+        }
+    }
+
+    pub fn enqueue_with_annihilation(
+        &mut self,
+        signo: u32,
+        info: crate::core::signal::PendingSigInfo,
+        rt_cap: usize,
+    ) -> bool {
+        if signo == SIGCONT {
+            self.discard_stop_signals();
+        } else if (1u64 << signo) & STOP_SIGNAL_MASK != 0 {
+            self.discard_signal(SIGCONT);
+        }
+        self.enqueue_signal(signo, info, rt_cap)
+    }
+
+    pub fn arm_group_stop(&mut self, remaining: u32) {
+        self.group_stop_remaining = remaining;
+        self.group_stop_notified = false;
+    }
+
+    pub fn group_stop_arrive(&mut self) -> bool {
+        if self.group_stop_remaining > 0 {
+            self.group_stop_remaining -= 1;
+        }
+        if self.group_stop_remaining == 0 && !self.group_stop_notified {
+            self.group_stop_notified = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_group_stop(&mut self) {
+        self.group_stop_remaining = 0;
+        self.group_stop_notified = false;
+    }
+
+    pub fn set_continued_latch(&mut self) {
+        self.continued_latch = true;
+    }
+
+    pub fn take_continued_latch(&mut self) -> bool {
+        core::mem::take(&mut self.continued_latch)
+    }
+
+    pub fn continued_latch(&self) -> bool {
+        self.continued_latch
     }
 
     pub fn altstack(&self) -> crate::core::signal::AltStack {
@@ -781,6 +903,65 @@ impl MemoryContext {
     }
 }
 
+pub const SIGEV_SIGNAL: i32 = 0;
+pub const SIGEV_NONE: i32 = 1;
+pub const SIGEV_THREAD: i32 = 2;
+pub const SIGEV_THREAD_ID: i32 = 4;
+
+#[derive(Copy, Clone)]
+pub struct PosixTimer {
+    pub clockid: u64,
+    pub sigev_notify: i32,
+    pub sigev_signo: u32,
+    pub sigev_value: u64,
+    pub sigev_thread_id: u32,
+    pub deadline_ns: u64,
+    pub interval_ns: u64,
+    pub overrun_last: i32,
+}
+
+impl PosixTimer {
+    pub fn is_armed(&self) -> bool {
+        self.deadline_ns != 0
+    }
+}
+
+#[derive(Default)]
+pub struct TimerContext {
+    timers: alloc::collections::BTreeMap<i32, PosixTimer>,
+    next_id: i32,
+}
+
+impl TimerContext {
+    pub fn alloc(&mut self, timer: PosixTimer) -> i32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.timers.insert(id, timer);
+        id
+    }
+
+    pub fn get(&self, id: i32) -> Option<&PosixTimer> {
+        self.timers.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: i32) -> Option<&mut PosixTimer> {
+        self.timers.get_mut(&id)
+    }
+
+    pub fn remove(&mut self, id: i32) -> Option<PosixTimer> {
+        self.timers.remove(&id)
+    }
+
+    pub fn ids(&self) -> alloc::vec::Vec<i32> {
+        self.timers.keys().copied().collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.timers.clear();
+        self.next_id = 0;
+    }
+}
+
 pub struct FileContext {
     cwd: Option<CwdState>,
     fs_root: Option<Arc<dyn Inode>>,
@@ -849,6 +1030,7 @@ impl Default for FileContext {
 pub struct IdentityContext {
     pgid: Pid,
     sid: Pid,
+    ctty: Option<crate::core::tty::TtyId>,
     cmdline: alloc::vec::Vec<u8>,
     exe_path: alloc::vec::Vec<u8>,
     exe_inode: Option<Arc<dyn Inode>>,
@@ -860,6 +1042,7 @@ impl IdentityContext {
         Self {
             pgid: pid,
             sid: pid,
+            ctty: None,
             cmdline: alloc::vec::Vec::new(),
             exe_path: alloc::vec::Vec::new(),
             exe_inode: None,
@@ -871,6 +1054,7 @@ impl IdentityContext {
         Self {
             pgid: parent.pgid,
             sid: parent.sid,
+            ctty: parent.ctty,
             cmdline: parent.cmdline.clone(),
             exe_path: parent.exe_path.clone(),
             exe_inode: parent.exe_inode.clone(),
@@ -892,6 +1076,14 @@ impl IdentityContext {
 
     pub fn set_sid(&mut self, sid: Pid) {
         self.sid = sid;
+    }
+
+    pub fn ctty(&self) -> Option<crate::core::tty::TtyId> {
+        self.ctty
+    }
+
+    pub fn set_ctty(&mut self, ctty: Option<crate::core::tty::TtyId>) {
+        self.ctty = ctty;
     }
 
     pub fn cmdline(&self) -> &[u8] {
@@ -933,9 +1125,13 @@ pub const SIGKILL: u32 = 9;
 pub const SIGTRAP: u32 = 5;
 pub const SIGSEGV: u32 = 11;
 pub const SIGSTOP: u32 = 19;
+pub const SIGALRM: u32 = 14;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 
 pub const NSIG: usize = 64;
 

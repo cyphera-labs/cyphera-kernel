@@ -117,7 +117,12 @@ pub extern "C" fn _start() -> ! {
             name_end += 1;
         }
         let name = &dirbuf[name_start..name_end];
-        if d_type != DT_CHR && name != b"input" && name != b"shm" {
+        if d_type != DT_CHR
+            && name != b"input"
+            && name != b"shm"
+            && name != b"snd"
+            && name != b"dri"
+        {
             log("/dev entry has non-CHR d_type\n");
             sys_exit(1);
         }

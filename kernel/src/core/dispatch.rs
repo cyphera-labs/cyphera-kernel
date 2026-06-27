@@ -573,11 +573,42 @@ pub fn on_tick(is_timer: bool) {
                 }
             }
         }
-        let next = match q.runnable.pick_next(!rt_throttled()) {
-            Some(n) => {
-                record_dequeue(n);
-                n
+        let picked = loop {
+            match q.runnable.pick_next(!rt_throttled()) {
+                Some(n) => {
+                    record_dequeue(n);
+                    let throttled_member = {
+                        let mut g = GLOBAL.lock();
+                        if let Some(proc) = g.processes.get_mut(&n) {
+                            let cg_throttled = matches!(proc.sched.sched_class, SchedClass::Cfs)
+                                && proc
+                                    .cgroup
+                                    .as_ref()
+                                    .map(|cg| cg.cpu.lock().throttled)
+                                    .unwrap_or(false);
+                            if cg_throttled {
+                                set_state(proc, ProcessState::CgroupThrottled, "dispatch");
+                                set_sched_owner(
+                                    proc,
+                                    SchedOwner::Parked { waitq_addr: 0 },
+                                    "on_tick/throttle_peer",
+                                );
+                            }
+                            cg_throttled
+                        } else {
+                            false
+                        }
+                    };
+                    if throttled_member {
+                        continue;
+                    }
+                    break Some(n);
+                }
+                None => break None,
             }
+        };
+        let next = match picked {
+            Some(n) => n,
             None => {
                 if force_throttle {
                     q.current = None;

@@ -16,7 +16,6 @@ fn root_has_live_user(root_phys: u64) -> bool {
 
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
-#[allow(dead_code)]
 const WCONTINUED: u64 = 8;
 
 fn wait_selector_matches(target_pid: i64, cpid: Pid, child_pgid: Pid, caller_pgid: Pid) -> bool {
@@ -32,6 +31,7 @@ enum WaitScan {
     NoChildren,
     Reap(Pid, i32),
     Report(Pid, i32, bool),
+    Continued(Pid),
     NoneReady,
 }
 
@@ -87,6 +87,9 @@ fn wait4_scan(g: &Global, cur: Pid, target_pid: i64, options: u64) -> WaitScan {
                 let sig = crate::ptrace::stop_status_signal(child).unwrap_or(SIGSTOP);
                 return WaitScan::Report(*cpid, (sig as i32) << 8 | 0x7f, true);
             }
+            _ if (options & WCONTINUED) != 0 && child.signals.continued_latch() => {
+                return WaitScan::Continued(*cpid);
+            }
             _ => continue,
         }
     }
@@ -134,9 +137,11 @@ pub fn wait4_current(
                         rpid.0, slot, cpu,
                     );
                 }
-                let mut g = GLOBAL.lock();
-                let removed = g.processes.remove(&rpid);
-                drop(g);
+                let (removed, reaped_tgid) = {
+                    let mut g = GLOBAL.lock();
+                    let tgid = g.processes.get(&rpid).map(|p| p.tgid).unwrap_or(rpid);
+                    (g.processes.remove(&rpid), tgid)
+                };
                 let caller_ns = process_pid_ns(cur_pid).unwrap_or_else(host_pid_ns);
                 let local_in_caller = caller_ns.host_to_local_in(rpid);
                 if let Some(boxed) = removed {
@@ -151,6 +156,7 @@ pub fn wait4_current(
                     }
                     drop(boxed);
                 }
+                sweep_thread_group_zombies(reaped_tgid, rpid);
                 return Ok(Some((rpid, local_in_caller, status)));
             }
             WaitScan::Report(rpid, status, is_trace_stop) => {
@@ -163,6 +169,15 @@ pub fn wait4_current(
                 let caller_ns = process_pid_ns(cur_pid).unwrap_or_else(host_pid_ns);
                 let local_in_caller = caller_ns.host_to_local_in(rpid);
                 return Ok(Some((rpid, local_in_caller, status)));
+            }
+            WaitScan::Continued(rpid) => {
+                if let Some(p) = g.processes.get_mut(&rpid) {
+                    p.signals.take_continued_latch();
+                }
+                drop(g);
+                let caller_ns = process_pid_ns(cur_pid).unwrap_or_else(host_pid_ns);
+                let local_in_caller = caller_ns.host_to_local_in(rpid);
+                return Ok(Some((rpid, local_in_caller, 0xffff)));
             }
             WaitScan::NoneReady => {
                 drop(g);
@@ -189,6 +204,47 @@ pub fn wait4_current(
                     return Err(cyphera_kapi::Errno::INTR);
                 }
             }
+        }
+    }
+}
+
+fn sweep_thread_group_zombies(tgid: Pid, leader: Pid) {
+    let peers: alloc::vec::Vec<Pid> = {
+        let g = GLOBAL.lock();
+        g.processes
+            .iter()
+            .filter(|(pid, p)| {
+                **pid != leader
+                    && p.tgid == tgid
+                    && matches!(
+                        *p.state.get(),
+                        ProcessState::Zombie(_)
+                            | ProcessState::KilledByFault { .. }
+                            | ProcessState::KilledBySignal { .. }
+                    )
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
+    };
+    for peer in peers {
+        if crate::core::find_stale_scheduled(peer).is_some() {
+            continue;
+        }
+        let removed = {
+            let mut g = GLOBAL.lock();
+            g.processes.remove(&peer)
+        };
+        if let Some(boxed) = removed {
+            if let Some(pns) = boxed.namespaces.pid() {
+                crate::process_model::PidNamespace::drop_chain(&pns, peer);
+            }
+            if let Some(root) = boxed.addr_space_root {
+                let root_phys = root.as_phys();
+                if !root_has_live_user(root_phys) {
+                    crate::ipc::futex::drop_vmspace(root_phys);
+                }
+            }
+            drop(boxed);
         }
     }
 }

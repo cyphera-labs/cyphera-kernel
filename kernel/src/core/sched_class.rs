@@ -170,6 +170,7 @@ pub fn set_sched_class(
         proc.sched.sched_class,
         crate::process_model::SchedClass::Deadline { .. }
     ) && !matches!(new_class, crate::process_model::SchedClass::Deadline { .. });
+    let mut unthrottled = false;
     if let crate::process_model::SchedClass::Deadline {
         runtime_ns: rt,
         period_ns: pe,
@@ -184,6 +185,7 @@ pub fn set_sched_class(
             proc.sched.dl_throttled = false;
             if proc.state.0 == ProcessState::DlThrottled {
                 set_state(proc, ProcessState::Runnable, "sched_class");
+                unthrottled = true;
             }
         }
     }
@@ -191,6 +193,14 @@ pub fn set_sched_class(
     if matches!(new_class, crate::process_model::SchedClass::Cfs) {
         let placed_floor = q.runnable.cfs_min_vruntime();
         proc.sched.vruntime = proc.sched.vruntime.max(placed_floor);
+    }
+    if unthrottled {
+        set_sched_owner(proc, SchedOwner::Runnable { cpu: home }, "set_sched_class");
+        let placed = q
+            .runnable
+            .enqueue(target, enqueue_data_from_proc(proc), CfsPlace::Wake);
+        proc.sched.vruntime = placed;
+        record_enqueue(target, "set_sched_class", proc);
     }
     if was_queued {
         let placed = q
@@ -204,7 +214,9 @@ pub fn set_sched_class(
     if leaving_dl {
         crate::core::timeout::cancel_callback(target.raw() as u64);
     }
-    if matches!(new_class, crate::process_model::SchedClass::Rt { .. }) && home != this_cpu() {
+    if (unthrottled || matches!(new_class, crate::process_model::SchedClass::Rt { .. }))
+        && home != this_cpu()
+    {
         send_resched_ipi(home);
     }
     Ok(())

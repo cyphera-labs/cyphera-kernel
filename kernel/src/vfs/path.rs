@@ -17,6 +17,7 @@ type ResolveWithMount = KResult<(Arc<dyn Inode>, Option<Arc<MountInUseTag>>)>;
 pub struct Context {
     pub root: Arc<dyn Inode>,
     pub mounts: Arc<MountTable>,
+    chrooted: bool,
 }
 
 #[cfg(not(host_test))]
@@ -27,13 +28,22 @@ impl Context {
         let mounts = crate::core::with_current_mount_table(|m| m.clone())
             .flatten()
             .unwrap_or_else(super::global_mount_table);
-        Self { root, mounts }
+        let chrooted = mounts
+            .lookup("/")
+            .map(|r| r.inode_id() != root.inode_id())
+            .unwrap_or(false);
+        Self {
+            root,
+            mounts,
+            chrooted,
+        }
     }
 
     pub fn global() -> Self {
         Self {
             root: super::root_inode(),
             mounts: super::global_mount_table(),
+            chrooted: false,
         }
     }
 
@@ -41,6 +51,7 @@ impl Context {
         Self {
             root: super::root_inode(),
             mounts,
+            chrooted: false,
         }
     }
 
@@ -237,11 +248,27 @@ impl Context {
         self.mounts.containing_mount(path)
     }
 
+    pub fn has_child_mount(&self, path: &str) -> bool {
+        self.mounts.has_child_mount(path)
+    }
+
     pub fn collect_subtree(
         &self,
         prefix: &str,
     ) -> alloc::vec::Vec<(alloc::string::String, MountEntry)> {
         self.mounts.collect_subtree(prefix)
+    }
+
+    pub fn pivot_root(&self, new_root: &str, put_old: &str) -> KResult<()> {
+        self.mounts.pivot_root(new_root, put_old)
+    }
+
+    pub fn mount_path_for_root_inode(&self, inode_id: u64) -> Option<alloc::string::String> {
+        self.mounts.mount_path_for_root_inode(inode_id)
+    }
+
+    pub fn is_stacked(&self, path: &str) -> bool {
+        self.mounts.is_stacked(path)
     }
 }
 
@@ -299,6 +326,14 @@ fn join_canonical(base_canonical: &str, component: &str) -> alloc::string::Strin
 }
 
 #[cfg(not(host_test))]
+fn parent_of_canonical(canonical: &str) -> alloc::string::String {
+    match canonical.rfind('/') {
+        Some(0) | None => String::from("/"),
+        Some(i) => String::from(&canonical[..i]),
+    }
+}
+
+#[cfg(not(host_test))]
 fn join_for_mirror(peer_path: &str, suffix: &str) -> alloc::string::String {
     use alloc::string::String;
     if suffix.is_empty() {
@@ -341,17 +376,30 @@ fn resolve_with_depth(
     let last_idx = components.len();
     for (i, component) in components.iter().enumerate() {
         if *component == ".." {
-            return Err(Errno::NOSYS);
+            if canonical != "/" {
+                let parent_canonical = parent_of_canonical(&canonical);
+                let r = resolve_with_depth(ctx, &ctx.root, "/", &parent_canonical, depth, true)?;
+                if let Some(t) = r.mount_tag {
+                    deepest_mount_tag = Some(t);
+                }
+                current = r.inode;
+                canonical = parent_canonical;
+            }
+            continue;
         }
         let is_last = i + 1 == last_idx;
-        let child = current.lookup(component)?;
         let child_canonical = join_canonical(&canonical, component);
-        let (child, child_canonical) = match ctx.lookup_mount_full(&child_canonical) {
+        let mount = if ctx.chrooted {
+            None
+        } else {
+            ctx.lookup_mount_full(&child_canonical)
+        };
+        let (child, child_canonical) = match mount {
             Some(entry) => {
                 deepest_mount_tag = Some(entry.in_use.clone());
                 (entry.root.clone(), child_canonical)
             }
-            None => (child, child_canonical),
+            None => (current.lookup(component)?, child_canonical),
         };
         let should_follow = if is_last { follow_last } else { true };
         let (next, next_canonical) = if should_follow && child.kind() == InodeKind::Symlink {

@@ -38,19 +38,19 @@ pub(crate) fn bank_cpu_time(proc: &mut Process, delta_ns: u64) {
     let (virt_fired, prof_fired) = proc.signals.charge_cpu_itimers(user_ns, sys_ns);
     if virt_fired {
         const SIGVTALRM: u32 = 26;
-        proc.signals.set_siginfo(
-            SIGVTALRM as usize,
+        proc.signals.enqueue_signal(
+            SIGVTALRM,
             crate::core::signal::SigInfo::for_kernel(SIGVTALRM),
+            usize::MAX,
         );
-        proc.signals.raise(1u64 << SIGVTALRM);
     }
     if prof_fired {
         const SIGPROF: u32 = 27;
-        proc.signals.set_siginfo(
-            SIGPROF as usize,
+        proc.signals.enqueue_signal(
+            SIGPROF,
             crate::core::signal::SigInfo::for_kernel(SIGPROF),
+            usize::MAX,
         );
-        proc.signals.raise(1u64 << SIGPROF);
     }
 }
 

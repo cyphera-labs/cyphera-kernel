@@ -263,6 +263,14 @@ name = "proc_pipe_size"
 version = "0.0.1"
 
 [[package]]
+name = "proc_pollable_fd_wake"
+version = "0.0.1"
+
+[[package]]
+name = "proc_posix_timer"
+version = "0.0.1"
+
+[[package]]
 name = "proc_process_vm"
 version = "0.0.1"
 

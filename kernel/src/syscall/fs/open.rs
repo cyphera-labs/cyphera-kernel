@@ -40,6 +40,14 @@ fn resolve_or_create_regular(
                 .map_err(|e| e.as_neg_i64())?;
             apply_create_owner(&inode);
             apply_create_mode(&inode, mode as u16);
+            if crate::fsnotify::watching() {
+                crate::fsnotify::dir_event(
+                    parent.as_ref(),
+                    leaf,
+                    false,
+                    crate::fsnotify::IN_CREATE,
+                );
+            }
             let tag = vfs::path::resolve_with_mount(ctx, base, path)
                 .ok()
                 .and_then(|(_, t)| t);
@@ -98,6 +106,11 @@ fn finish_open(
         && inode.kind() == InodeKind::Regular
     {
         if let Err(e) = inode.truncate(0) {
+            return e.as_neg_i64();
+        }
+    }
+    if !open_flags.contains(OpenFlags::PATH) {
+        if let Err(e) = inode.check_open(open_flags) {
             return e.as_neg_i64();
         }
     }
@@ -244,11 +257,16 @@ pub(crate) fn sys_close_range(first: u64, last: u64, _flags: u64) -> i64 {
     if first > last {
         return EINVAL;
     }
-    sched::with_current_fds(|t| {
+    let removed = sched::with_current_fds(|t| {
+        let mut taken: alloc::vec::Vec<Arc<vfs::OpenFile>> = alloc::vec::Vec::new();
         for fd in (first as i32)..=(last as i32) {
-            let _ = t.remove(fd);
+            if let Some(of) = t.remove(fd) {
+                taken.push(of);
+            }
         }
+        taken
     });
+    drop(removed);
     0
 }
 

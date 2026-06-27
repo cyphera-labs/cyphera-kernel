@@ -91,6 +91,7 @@ fn pack_stat(st: &Stat) -> [u8; STAT_SIZE] {
         crate::core::with_current_creds(|c| (c.uid_from_kernel(st.uid), c.gid_from_kernel(st.gid)));
     buf[28..32].copy_from_slice(&vis_uid.to_le_bytes());
     buf[32..36].copy_from_slice(&vis_gid.to_le_bytes());
+    buf[40..48].copy_from_slice(&st.rdev.to_le_bytes());
     buf[48..56].copy_from_slice(&st.size.to_le_bytes());
     buf[56..64].copy_from_slice(&(st.blksize as i64).to_le_bytes());
     buf[64..72].copy_from_slice(&(st.blocks as i64).to_le_bytes());
@@ -386,7 +387,20 @@ pub(crate) fn sys_statfs(arg: u64, statfs_ptr: u64, fd: bool) -> i64 {
     0
 }
 
-pub(crate) fn sys_utimensat(dirfd: u64, pathname: u64, times_ptr: u64, _flags: u64) -> i64 {
+fn wall_now() -> TimeSpec {
+    let nanos = frame::cpu::clock::wall_clock_nanos();
+    TimeSpec {
+        sec: (nanos / 1_000_000_000) as i64,
+        nsec: (nanos % 1_000_000_000) as i32,
+    }
+}
+
+fn utimes_apply(
+    dirfd: u64,
+    pathname: u64,
+    atime: Option<TimeSpec>,
+    mtime: Option<TimeSpec>,
+) -> i64 {
     let inode = if pathname == 0 {
         match sched::with_current_fds(|t| t.get(dirfd as i32)) {
             Some(f) => {
@@ -403,10 +417,56 @@ pub(crate) fn sys_utimensat(dirfd: u64, pathname: u64, times_ptr: u64, _flags: u
             Err(e) => return e,
         }
     };
-    let now = TimeSpec {
-        sec: (frame::cpu::clock::wall_clock_nanos() / 1_000_000_000) as i64,
-        nsec: (frame::cpu::clock::wall_clock_nanos() % 1_000_000_000) as i32,
+    match inode.set_times(atime, mtime) {
+        Ok(()) => 0,
+        Err(e) => e.as_neg_i64(),
+    }
+}
+
+fn read_timeval_as_timespec(addr: u64) -> Result<TimeSpec, i64> {
+    let mut buf = [0u8; 16];
+    if frame::user::copy_from_user(addr, &mut buf).is_err() {
+        return Err(EFAULT);
+    }
+    let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if !(0..1_000_000).contains(&usec) {
+        return Err(EINVAL);
+    }
+    Ok(TimeSpec {
+        sec,
+        nsec: (usec * 1000) as i32,
+    })
+}
+
+fn timeval_pair(times_ptr: u64) -> Result<(Option<TimeSpec>, Option<TimeSpec>), i64> {
+    if times_ptr == 0 {
+        let now = wall_now();
+        return Ok((Some(now), Some(now)));
+    }
+    let a = read_timeval_as_timespec(times_ptr)?;
+    let m = read_timeval_as_timespec(times_ptr + 16)?;
+    Ok((Some(a), Some(m)))
+}
+
+pub(crate) fn sys_utimes(pathname: u64, times_ptr: u64) -> i64 {
+    let (atime, mtime) = match timeval_pair(times_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
+    utimes_apply(AT_FDCWD as u64, pathname, atime, mtime)
+}
+
+pub(crate) fn sys_futimesat(dirfd: u64, pathname: u64, times_ptr: u64) -> i64 {
+    let (atime, mtime) = match timeval_pair(times_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    utimes_apply(dirfd, pathname, atime, mtime)
+}
+
+pub(crate) fn sys_utimensat(dirfd: u64, pathname: u64, times_ptr: u64, _flags: u64) -> i64 {
+    let now = wall_now();
     let (atime, mtime) = if times_ptr == 0 {
         (Some(now), Some(now))
     } else {
@@ -430,8 +490,5 @@ pub(crate) fn sys_utimensat(dirfd: u64, pathname: u64, times_ptr: u64, _flags: u
         };
         (a, m)
     };
-    match inode.set_times(atime, mtime) {
-        Ok(()) => 0,
-        Err(e) => e.as_neg_i64(),
-    }
+    utimes_apply(dirfd, pathname, atime, mtime)
 }

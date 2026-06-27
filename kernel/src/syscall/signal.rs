@@ -74,7 +74,12 @@ pub(super) fn sys_kill(pid: u64, signal: u64) -> i64 {
     if !permitted {
         return EPERM;
     }
-    match sched::send_signal(target, signal as u32) {
+    if signal == 0 {
+        return 0;
+    }
+    let tgid = sched::process_tgid(target).unwrap_or(target);
+    let info = crate::core::signal::SigInfo::for_kill(signal as u32, sched::current_pid().raw());
+    match sched::send_group_signal(tgid, signal as u32, info) {
         Ok(()) => 0,
         Err(e) => e.as_neg_i64(),
     }

@@ -14,7 +14,7 @@ answer.
 
 It's an independent, **pure-Rust, memory-safe** kernel that
 reimplements the Linux syscall ABI, so software built for Linux runs
-on it unmodified — within the syscall surface implemented so far (270
+on it unmodified — within the syscall surface implemented so far (283
 of 385; this is an early release). It targets **virtual machines** —
 not bare metal — with confidential-computing deployment (SEV-SNP /
 TDX) on the roadmap. By sidestepping the bare-metal driver universe,
@@ -108,7 +108,7 @@ Headline numbers:
 
 | | |
 |---|---|
-| Linux-ABI x86_64 syscalls implemented | 270 of 385 (90 missing; see [docs/SYSCALLS.md](docs/SYSCALLS.md)) |
+| Linux-ABI x86_64 syscalls implemented | 283 of 385 (73 missing; see [docs/SYSCALLS.md](docs/SYSCALLS.md)) |
 | In-tree integration tests | 80 |
 | MIRI tests | 159 |
 | Kani proofs | 120 |

@@ -1,3 +1,4 @@
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
@@ -14,6 +15,9 @@ use crate::hal::FrameHal;
 
 pub struct Sound {
     inner: SoundInner,
+    tx_pending: VecDeque<u16>,
+    residual: Vec<u8>,
+    period_bytes: usize,
 }
 
 enum SoundInner {
@@ -59,6 +63,9 @@ impl Sound {
         let inner = InnerSound::new(transport).map_err(SoundErr::Driver)?;
         Ok(Self {
             inner: SoundInner::Mmio(inner),
+            tx_pending: VecDeque::new(),
+            residual: Vec::new(),
+            period_bytes: 0,
         })
     }
 
@@ -66,6 +73,9 @@ impl Sound {
         let inner = InnerSound::new(transport).map_err(SoundErr::Driver)?;
         Ok(Self {
             inner: SoundInner::Pci(inner),
+            tx_pending: VecDeque::new(),
+            residual: Vec::new(),
+            period_bytes: 0,
         })
     }
 
@@ -125,11 +135,18 @@ impl Sound {
                 rate
             )
         )
-        .map_err(SoundErr::Driver)
+        .map_err(SoundErr::Driver)?;
+        self.period_bytes = period_bytes as usize;
+        self.drain_tx();
+        self.residual.clear();
+        Ok(())
     }
 
     pub fn pcm_prepare(&mut self, stream_id: u32) -> Result<(), SoundErr> {
-        sound_dispatch_mut!(self, pcm_prepare(stream_id)).map_err(SoundErr::Driver)
+        sound_dispatch_mut!(self, pcm_prepare(stream_id)).map_err(SoundErr::Driver)?;
+        self.drain_tx();
+        self.residual.clear();
+        Ok(())
     }
 
     pub fn pcm_start(&mut self, stream_id: u32) -> Result<(), SoundErr> {
@@ -137,7 +154,10 @@ impl Sound {
     }
 
     pub fn pcm_stop(&mut self, stream_id: u32) -> Result<(), SoundErr> {
-        sound_dispatch_mut!(self, pcm_stop(stream_id)).map_err(SoundErr::Driver)
+        sound_dispatch_mut!(self, pcm_stop(stream_id)).map_err(SoundErr::Driver)?;
+        self.drain_tx();
+        self.residual.clear();
+        Ok(())
     }
 
     pub fn pcm_release(&mut self, stream_id: u32) -> Result<(), SoundErr> {
@@ -146,6 +166,63 @@ impl Sound {
 
     pub fn pcm_xfer(&mut self, stream_id: u32, frames: &[u8]) -> Result<(), SoundErr> {
         sound_dispatch_mut!(self, pcm_xfer(stream_id, frames)).map_err(SoundErr::Driver)
+    }
+
+    fn pcm_xfer_nb(&mut self, stream_id: u32, frames: &[u8]) -> Result<u16, SoundErr> {
+        sound_dispatch_mut!(self, pcm_xfer_nb(stream_id, frames)).map_err(SoundErr::Driver)
+    }
+
+    fn pcm_xfer_ok(&mut self, token: u16) -> Result<(), SoundErr> {
+        sound_dispatch_mut!(self, pcm_xfer_ok(token)).map_err(SoundErr::Driver)
+    }
+
+    fn drain_tx(&mut self) {
+        while let Some(token) = self.tx_pending.front().copied() {
+            if self.pcm_xfer_ok(token).is_err() {
+                break;
+            }
+            self.tx_pending.pop_front();
+        }
+        self.tx_pending.clear();
+    }
+
+    pub fn pcm_write(&mut self, stream_id: u32, frames: &[u8]) -> Result<usize, SoundErr> {
+        while let Some(token) = self.tx_pending.front().copied() {
+            if self.pcm_xfer_ok(token).is_err() {
+                break;
+            }
+            self.tx_pending.pop_front();
+        }
+        let pb = self.period_bytes;
+        if pb == 0 {
+            return Ok(0);
+        }
+        let carried = self.residual.len();
+        let mut buf = core::mem::take(&mut self.residual);
+        buf.extend_from_slice(frames);
+
+        let mut off = 0;
+        while buf.len() - off >= pb {
+            match self.pcm_xfer_nb(stream_id, &buf[off..off + pb]) {
+                Ok(token) => {
+                    self.tx_pending.push_back(token);
+                    off += pb;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if buf.len() - off < pb {
+            self.residual = buf.split_off(off);
+            Ok(frames.len())
+        } else if off == 0 {
+            buf.truncate(carried);
+            self.residual = buf;
+            Ok(0)
+        } else {
+            self.residual.clear();
+            Ok(off - carried)
+        }
     }
 
     pub fn play_blocking(

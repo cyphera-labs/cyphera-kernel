@@ -1,10 +1,9 @@
 # Syscalls
 
-Cyphera Kernel tracks every Linux x86_64 syscall — implemented,
-not yet implemented, or deliberately stubbed — against
-[`arch/x86/entry/syscalls/syscall_64.tbl`](https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscalls/syscall_64.tbl)
-(the `common` + `64` ABI). The wired dispatcher lives in the
-kernel's services layer.
+Cyphera Kernel tracks every x86_64 syscall in the documented ABI —
+implemented, not yet implemented, or deliberately stubbed — against the
+documented `common` + `64` x86_64 syscall table. The wired dispatcher
+lives in the kernel's services layer.
 
 That **385** is the count of `common` + `64` entries — the syscalls a
 64-bit x86_64 program actually issues. The separate `x32` compat ABI
@@ -12,18 +11,19 @@ That **385** is the count of `common` + `64` entries — the syscalls a
 non-contiguous (ours top out at 471), so the highest number is larger
 than the count.
 
-Counts: **275 of 385 implemented**. A further 15 entries (14 dead +
-1 deprecated) correctly return `-ENOSYS` / `-EPERM` like mainline,
-**10 out-of-scope**, **85 missing** (385 total per the documented
-syscall ABI table).
+Counts: **283 of 385 implemented**. A further 18 entries (16 dead +
+2 deprecated) correctly return `-ENOSYS` / `-EPERM` as the documented
+ABI specifies, **11 out-of-scope**, **73 missing** (385 total per the
+documented syscall ABI table).
 
 Each "implemented" row is either a real implementation or an
-honest "this is what Linux returns under the relevant build
-configuration" answer — e.g. `add_key` returning `-EOPNOTSUPP`
-matches Linux with `CONFIG_KEYS=n`, `pkey_alloc` returning
-`-EOPNOTSUPP` matches a CPU without memory-protection keys, and
-`uselib` / `_sysctl` / similar return `-ENOSYS` because that's
-what Linux itself returns for those deprecated entry points.
+honest "this is the documented ABI response under the relevant
+configuration" answer — e.g. `add_key` returns the documented
+`-EOPNOTSUPP` response for a build without kernel key-retention,
+`pkey_alloc` returns `-EOPNOTSUPP` on a CPU without
+memory-protection keys, and `uselib` / `_sysctl` / similar return
+`-ENOSYS` because that is the documented ABI response for those
+deprecated entry points.
 
 `ptrace(2)` is wired up for the in-tree tracer coverage (external debugger / tool compatibility is not claimed in this release). The operations currently handled:
 
@@ -44,11 +44,11 @@ These operations are validated by `runtime/boot/tests/subsystem/ptrace.rs` (run 
 ## Status table
 
 Full per-syscall status lives in **`docs/SYSCALLS.csv`** — one
-row per Linux x86_64 syscall (385 total), with columns:
+row per x86_64 syscall in the documented ABI (385 total), with columns:
 
 | Column | Meaning |
 |---|---|
-| `linux_nr` | x86_64 syscall number (matches the documented ABI table linked above) |
+| `syscall_nr` | x86_64 syscall number (matches the documented ABI table) |
 | `name` | syscall name |
 | `status` | one of `implemented` / `deprecated` / `dead` / `out-of-scope` / `missing` (see the Conventions legend below) |
 | `notes` | free-form description of what's done, what's deferred, and links to relevant code |
@@ -60,36 +60,35 @@ commit.
 
 ## Conventions
 
-- **`linux_nr`** mirrors the Linux ABI table 1:1; nothing is
+- **`syscall_nr`** mirrors the documented ABI table 1:1; nothing is
   omitted or renumbered.
 - **`status`** is one of:
   - `implemented` — happy path works; exercised by an in-tree
     test, or (where the notes say so) manually verified.
-  - `deprecated` — Linux still defines it but discourages it; we
-    return `-ENOSYS` exactly as mainline does. Correct + final.
-  - `dead` — Linux **removed** it (slot returns `-ENOSYS` in
-    mainline); we do the same. Correct + final. `notes` gives the
-    removal version.
+  - `deprecated` — the ABI still defines it but discourages it; we
+    return `-ENOSYS`, the documented ABI response. Correct + final.
+  - `dead` — a **removed** slot (the documented ABI for that
+    removed slot is `-ENOSYS`); we return the same. Correct + final.
   - `out-of-scope` — deliberately refused, never to be built.
     Two reasons, in `notes`: **`ring0 unsafe`** (would require
     unaudited ring-0 code or raw hardware access — module loading,
     kexec, iopl/ioperm) or **`32-bit not supported`** (Cyphera is
     an x86_64 64-bit-only ABI — the 32-bit TLS / LDT calls). Returns
-    `-ENOSYS` or `-EPERM`, matching what stock Linux returns when
+    `-ENOSYS` or `-EPERM`, matching what the documented ABI returns when
     the feature is absent / the capability is missing.
   - `missing` — a real gap we would build; dispatcher returns
     `-ENOSYS` today.
 
   `deprecated` + `dead` are handled/complete (the correct behavior
   *is* the `-ENOSYS`), and are counted separately — they are NOT part
-  of the 275 `implemented` rows. Only `missing` is an actual to-do.
+  of the 283 `implemented` rows. Only `missing` is an actual to-do.
 When you add or modify a syscall, update its row in the same
-commit. New syscalls land at their canonical Linux number — we
+commit. New syscalls land at their canonical ABI number — we
 do not gap or renumber.
 
 ## What's missing — a quick map
 
-Rough grouping of the 85 currently-missing syscalls. Items
+Rough grouping of the 73 currently-missing syscalls. Items
 already implemented aren't listed here; see the CSV.
 
 - **Async I/O and readiness primitives** — `io_uring_*`,
@@ -109,10 +108,6 @@ already implemented aren't listed here; see the CSV.
   `fsconfig`, `fsmount`, `fspick`, `mount_setattr`,
   `statmount`, `listmount`. Legacy `mount` / `umount` are
   implemented.
-- **POSIX timers** — `timer_create` / `timer_settime` /
-  `timer_gettime` / `timer_getoverrun` / `timer_delete`.
-  `clock_gettime` / `clock_getres` / `nanosleep` / `timerfd_*`
-  / `getitimer` / `setitimer` are implemented.
 - **Filesystem long-tail** — `name_to_handle_at` /
   `open_by_handle_at`, `quotactl` / `quotactl_fd`,
   `file_getattr` / `file_setattr`, `userfaultfd`.
@@ -149,10 +144,10 @@ already implemented aren't listed here; see the CSV.
 ## Won't-implement
 
 A set of entries are refused permanently, in three honest flavors
-(see the `status` legend above): `dead` (Linux removed it),
-`deprecated` (Linux discourages it), and `out-of-scope` (we refuse
+(see the `status` legend above): `dead` (a removed slot),
+`deprecated` (the ABI discourages it), and `out-of-scope` (we refuse
 it by design). All return a clean errno — `-ENOSYS` or `-EPERM`,
-whichever stock Linux returns — never a fault:
+whichever the documented ABI returns — never a fault:
 
 - `init_module` / `delete_module` / `finit_module` /
   `create_module` / `get_kernel_syms` / `query_module` — loadable
@@ -167,12 +162,12 @@ whichever stock Linux returns — never a fault:
   real feature we could build, not a refusal.)
 - `acct`, `lookup_dcookie`, `nfsservctl`, `getpmsg` /
   `putpmsg`, `afs_syscall`, `tuxcall`, `security`, `_sysctl`,
-  `vserver`, `uselib` — legacy or never-implemented in modern
-  Linux.
+  `vserver`, `uselib` — legacy or never-implemented reserved
+  slots.
 - `lsm_get_self_attr` / `lsm_set_self_attr` /
   `lsm_list_modules` — LSM hooks are out of scope.
 
 These are tracked in the CSV with `status = dead` / `deprecated` /
 `out-of-scope` (NOT `missing` — they behave correctly), each with a
-`notes` value giving the reason (removal version, or `ring0 unsafe`
+`notes` value giving the reason (removed slot, or `ring0 unsafe`
 / `32-bit not supported`).

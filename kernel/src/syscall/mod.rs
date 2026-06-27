@@ -10,12 +10,13 @@ use numbers::*;
 mod util;
 
 mod creds;
-mod event;
+pub(crate) mod event;
 mod fs;
 mod ipc;
 mod legacy;
-mod mm;
+pub(crate) mod mm;
 mod net;
+pub mod posix_timer;
 mod proc;
 mod ptrace_dispatch;
 mod scheduling;
@@ -34,23 +35,23 @@ use event::{
     sys_eventfd2, sys_poll, sys_ppoll, sys_pselect6, sys_select, sys_signalfd4, sys_timerfd_create,
     sys_timerfd_gettime, sys_timerfd_settime,
 };
-pub use fs::console_fg_pgrp;
 pub use fs::termios_get_pub;
 pub(crate) use fs::{DEFAULT_TERMIOS, resolve_user_path};
 use fs::{
     sys_chdir, sys_chroot, sys_close, sys_close_range, sys_copy_file_range, sys_dup, sys_dup2,
     sys_dup3, sys_faccessat, sys_fadvise64, sys_fallocate, sys_fchdir, sys_fchmod, sys_fchmodat,
     sys_fchown, sys_fchownat, sys_fcntl, sys_fgetxattr, sys_flistxattr, sys_flock,
-    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_fsync, sys_ftruncate, sys_getcwd, sys_getdents,
-    sys_getdents64, sys_getxattr, sys_getxattrat, sys_ioctl, sys_linkat, sys_listxattr,
-    sys_listxattrat, sys_lseek, sys_memfd_create, sys_mkdirat, sys_mknodat, sys_mount,
-    sys_newfstatat, sys_openat, sys_openat2, sys_pipe, sys_pipe2, sys_pivot_root, sys_pread64,
-    sys_preadv, sys_pwrite64, sys_pwritev, sys_read, sys_readahead, sys_readlinkat, sys_readv,
-    sys_removexattr, sys_removexattrat, sys_renameat, sys_renameat2, sys_sendfile, sys_setxattr,
-    sys_setxattrat, sys_splice, sys_stat, sys_statfs, sys_statx, sys_symlinkat,
+    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_fsync, sys_ftruncate, sys_futimesat,
+    sys_getcwd, sys_getdents, sys_getdents64, sys_getxattr, sys_getxattrat, sys_ioctl, sys_linkat,
+    sys_listxattr, sys_listxattrat, sys_lseek, sys_memfd_create, sys_mkdirat, sys_mknodat,
+    sys_mount, sys_newfstatat, sys_openat, sys_openat2, sys_pipe, sys_pipe2, sys_pivot_root,
+    sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_read, sys_readahead, sys_readlinkat,
+    sys_readv, sys_removexattr, sys_removexattrat, sys_renameat, sys_renameat2, sys_sendfile,
+    sys_setxattr, sys_setxattrat, sys_splice, sys_stat, sys_statfs, sys_statx, sys_symlinkat,
     sys_sync_file_range, sys_tee, sys_truncate, sys_umount2, sys_unlinkat, sys_utimensat,
-    sys_vmsplice, sys_write, sys_writev,
+    sys_utimes, sys_vmsplice, sys_write, sys_writev,
 };
+use fs::{sys_inotify_add_watch, sys_inotify_init, sys_inotify_init1, sys_inotify_rm_watch};
 use ipc::{
     sys_futex, sys_futex_requeue, sys_futex_wait, sys_futex_waitv, sys_futex_wake, sys_keyctl,
     sys_shmat, sys_shmctl, sys_shmdt, sys_shmget,
@@ -65,6 +66,9 @@ use net::{
     sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
     sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_shutdown,
     sys_socket, sys_socketpair,
+};
+use posix_timer::{
+    sys_timer_create, sys_timer_delete, sys_timer_getoverrun, sys_timer_gettime, sys_timer_settime,
 };
 pub use proc::default_rlimit;
 use proc::{
@@ -463,6 +467,12 @@ pub fn dispatch(tf: &mut TrapFrame) {
             SYS_UTIMENSAT => {
                 tf.set_ret(sys_utimensat(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
+            SYS_UTIMES => {
+                tf.set_ret(sys_utimes(tf.arg(0), tf.arg(1)) as u64);
+            }
+            SYS_FUTIMESAT => {
+                tf.set_ret(sys_futimesat(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
+            }
             SYS_SETXATTR => {
                 tf.set_ret(sys_setxattr(
                     tf.arg(0),
@@ -816,6 +826,18 @@ pub fn dispatch(tf: &mut TrapFrame) {
             SYS_MEMFD_CREATE => {
                 tf.set_ret(sys_memfd_create(tf.arg(0), tf.arg(1)) as u64);
             }
+            SYS_INOTIFY_INIT1 => {
+                tf.set_ret(sys_inotify_init1(tf.arg(0)) as u64);
+            }
+            SYS_INOTIFY_INIT => {
+                tf.set_ret(sys_inotify_init() as u64);
+            }
+            SYS_INOTIFY_ADD_WATCH => {
+                tf.set_ret(sys_inotify_add_watch(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
+            }
+            SYS_INOTIFY_RM_WATCH => {
+                tf.set_ret(sys_inotify_rm_watch(tf.arg(0), tf.arg(1)) as u64);
+            }
             SYS_RSEQ => {
                 tf.set_ret(sys_rseq(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
             }
@@ -830,6 +852,21 @@ pub fn dispatch(tf: &mut TrapFrame) {
             }
             SYS_SETITIMER => {
                 tf.set_ret(sys_setitimer(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
+            }
+            SYS_TIMER_CREATE => {
+                tf.set_ret(sys_timer_create(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);
+            }
+            SYS_TIMER_SETTIME => {
+                tf.set_ret(sys_timer_settime(tf.arg(0), tf.arg(1), tf.arg(2), tf.arg(3)) as u64);
+            }
+            SYS_TIMER_GETTIME => {
+                tf.set_ret(sys_timer_gettime(tf.arg(0), tf.arg(1)) as u64);
+            }
+            SYS_TIMER_GETOVERRUN => {
+                tf.set_ret(sys_timer_getoverrun(tf.arg(0)) as u64);
+            }
+            SYS_TIMER_DELETE => {
+                tf.set_ret(sys_timer_delete(tf.arg(0)) as u64);
             }
             SYS_SHMGET => {
                 tf.set_ret(sys_shmget(tf.arg(0), tf.arg(1), tf.arg(2)) as u64);

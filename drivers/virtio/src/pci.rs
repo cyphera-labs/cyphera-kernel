@@ -4,7 +4,7 @@ use virtio_drivers::transport::{
     DeviceType,
     pci::{
         PciTransport, VirtioPciError,
-        bus::{Cam, DeviceFunction, MmioCam, PciRoot},
+        bus::{BarInfo, Cam, ConfigurationAccess, DeviceFunction, MmioCam, PciRoot},
     },
 };
 
@@ -22,6 +22,7 @@ pub struct ProbedPciDevice {
     pub device_function: DeviceFunction,
     pub device_type: DeviceType,
     pub transport: PciTransport,
+    pub host_visible: Option<(u64, u64)>,
 }
 
 impl core::fmt::Debug for ProbedPciDevice {
@@ -29,9 +30,16 @@ impl core::fmt::Debug for ProbedPciDevice {
         f.debug_struct("ProbedPciDevice")
             .field("device_function", &self.device_function)
             .field("device_type", &self.device_type)
+            .field("host_visible", &self.host_visible)
             .finish()
     }
 }
+
+const PCI_CAP_ID_VNDR: u8 = 0x09;
+
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
+
+const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 1;
 
 #[inline]
 fn ecam_va(phys: u64) -> *mut u8 {
@@ -70,11 +78,14 @@ pub fn probe() -> Vec<ProbedPciDevice> {
             None => continue,
         };
 
+        let host_visible = parse_host_visible_region(cam_base, &mut root, device_function);
+
         match PciTransport::new::<FrameHal, _>(&mut root, device_function) {
             Ok(transport) => out.push(ProbedPciDevice {
                 device_function,
                 device_type,
                 transport,
+                host_visible,
             }),
             Err(e) => {
                 frame::println!(
@@ -104,6 +115,59 @@ fn pci_device_id_to_type(device_id: u16) -> Option<DeviceType> {
             _ => None,
         }
     }
+}
+
+fn parse_host_visible_region<C: ConfigurationAccess>(
+    cam_base: *mut u8,
+    root: &mut PciRoot<C>,
+    df: DeviceFunction,
+) -> Option<(u64, u64)> {
+    // SAFETY: a second CAM view over the same ECAM window the primary PciRoot
+    // also uses; every access here is a volatile MMIO config read (never a Rust
+    // reference), issued sequentially on this probe path and never concurrently
+    // with the primary, so there is no aliasing UB.
+    let cam = unsafe { MmioCam::new(cam_base, Cam::Ecam) };
+    let mut off = (cam.read_word(df, 0x34) & 0xFF) as u8;
+    let mut hops = 0;
+    while off != 0 && hops < 48 {
+        hops += 1;
+        if off & 0x3 != 0 || off > 0xEB {
+            break;
+        }
+        let w0 = cam.read_word(df, off);
+        let cap_id = (w0 & 0xFF) as u8;
+        let next = ((w0 >> 8) & 0xFF) as u8;
+        if cap_id == PCI_CAP_ID_VNDR {
+            let cap_len = ((w0 >> 16) & 0xFF) as u8;
+            let cfg_type = ((w0 >> 24) & 0xFF) as u8;
+            let w1 = cam.read_word(df, off + 4);
+            let bar = (w1 & 0xFF) as u8;
+            let shmid = ((w1 >> 8) & 0xFF) as u8;
+            if cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG
+                && shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE
+                && cap_len >= 16
+            {
+                let off_lo = cam.read_word(df, off + 8) as u64;
+                let len_lo = cam.read_word(df, off + 12) as u64;
+                let (off_hi, len_hi) = if cap_len >= 24 {
+                    (
+                        cam.read_word(df, off + 16) as u64,
+                        cam.read_word(df, off + 20) as u64,
+                    )
+                } else {
+                    (0, 0)
+                };
+                let region_off = (off_hi << 32) | off_lo;
+                let region_len = (len_hi << 32) | len_lo;
+                if let Ok(Some(BarInfo::Memory { address, .. })) = root.bar_info(df, bar) {
+                    return Some((address + region_off, region_len));
+                }
+                return None;
+            }
+        }
+        off = next;
+    }
+    None
 }
 
 pub fn init_ecam_window() {}

@@ -96,6 +96,22 @@ and the source tree — that is a presentation convention, separate from
 provenance. The provenance answer stays: written from specifications, by
 humans plus AI tooling held to the rules above.
 
+## Documentation exception
+
+This policy document names forbidden implementation sources (the Linux
+kernel, Asterinas, the BSDs, and others) for the limited purpose of
+defining the prohibited inputs and the obligations they place on
+contributors. Those references are provenance **controls** — they
+specify what must not inform the code — not implementation guidance, and
+they confer nothing about how any feature is built.
+
+For that reason this file (`docs/CLEAN-ROOM.md`) is exempt from the
+automated provenance scan that the pre-commit and commit-message hooks
+apply to the rest of the tree. The exemption is scoped to this file
+alone: every other document, comment, and source file remains subject to
+the scan, and naming a forbidden source anywhere outside this policy is
+still a violation.
+
 ## Patent posture
 
 Patent analysis is a separate surface from the copyright clean-room

@@ -243,12 +243,15 @@ impl Credentials {
         old_euid: u32,
         old_suid: u32,
         old_fsuid: u32,
+        keep_caps: bool,
     ) {
         let was_any_root = old_ruid == 0 || old_euid == 0 || old_suid == 0 || old_fsuid == 0;
         let now_any_root = self.ruid == 0 || self.euid == 0 || self.suid == 0 || self.fsuid == 0;
         if was_any_root && !now_any_root {
             self.caps_eff = 0;
-            self.caps_perm = 0;
+            if !keep_caps {
+                self.caps_perm = 0;
+            }
             return;
         }
         if old_euid != 0 && self.euid == 0 {

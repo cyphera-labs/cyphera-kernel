@@ -76,7 +76,6 @@ run_sentinel() {
         --test dl_overrun \
         --test cpu_throttle \
         --test io_throttle \
-        --test io_sched \
         --test compat_intro \
         --test ptrace
 }

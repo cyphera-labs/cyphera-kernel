@@ -2,10 +2,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use frame::mm::{Page, PhysFrame, Size4KiB, VirtAddr, frame_alloc, vm::Perms};
+use frame::mm::{PhysFrame, Size4KiB, VirtAddr, frame_alloc, vm::Perms};
 
 use crate::core as sched;
-use crate::process_model::{Vma, VmaBacking, VmaFlags};
+use crate::process_model::VmaBacking;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -38,10 +38,14 @@ pub struct ShmSegment {
     pub frames: Vec<PhysFrame<Size4KiB>>,
     pub attached: AtomicU32,
     pub marked_rmid: AtomicBool,
+    pub owned: bool,
 }
 
 impl Drop for ShmSegment {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         for f in self.frames.drain(..) {
             frame_alloc::free_frame(f);
         }
@@ -82,6 +86,39 @@ pub fn create_anon_shared(size: usize) -> Option<Arc<ShmSegment>> {
         frames,
         attached: AtomicU32::new(0),
         marked_rmid: AtomicBool::new(false),
+        owned: true,
+    }))
+}
+
+pub fn create_device_region(phys_base: u64, len: usize) -> Option<Arc<ShmSegment>> {
+    if len == 0 || phys_base & (PAGE_SIZE as u64 - 1) != 0 {
+        return None;
+    }
+    let pages = len.div_ceil(PAGE_SIZE);
+    let mut frames: Vec<PhysFrame<Size4KiB>> = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let pa = frame::mm::PhysAddr::new(phys_base + (i * PAGE_SIZE) as u64);
+        let frame = PhysFrame::<Size4KiB>::from_start_address(pa).ok()?;
+        frames.push(frame);
+    }
+    Some(Arc::new(ShmSegment {
+        id: -1,
+        key: IPC_PRIVATE,
+        size: pages * PAGE_SIZE,
+        mode: AtomicU32::new(0o600),
+        uid: AtomicU32::new(0),
+        gid: AtomicU32::new(0),
+        creator_uid: 0,
+        creator_gid: 0,
+        cpid: 0,
+        lpid: AtomicU32::new(0),
+        atime: AtomicU64::new(0),
+        dtime: AtomicU64::new(0),
+        ctime: AtomicU64::new(0),
+        frames,
+        attached: AtomicU32::new(0),
+        marked_rmid: AtomicBool::new(false),
+        owned: false,
     }))
 }
 
@@ -135,6 +172,7 @@ pub fn shmget(key: i32, size: usize, flags: u32) -> i64 {
             frames,
             attached: AtomicU32::new(0),
             marked_rmid: AtomicBool::new(false),
+            owned: true,
         });
         ns.shm_table.lock().insert(id, segment);
         if key != IPC_PRIVATE {
@@ -161,70 +199,25 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
         perms |= Perms::WRITE;
     }
 
-    let addr_space = match sched::current_addr_space_opt() {
+    if sched::current_addr_space_opt().is_none() {
+        return EINVAL;
+    }
+
+    let vaddr = sched::with_current_mmap_mut(|m| {
+        let vaddr = pick_address(m, addr, length)?;
+        m.reserve(vaddr, vaddr + length);
+        Some(vaddr)
+    });
+    let vaddr = match vaddr {
         Some(a) => a,
         None => return EINVAL,
     };
-    let vaddr = {
-        let mut m = addr_space.mmap.lock();
-        let vaddr = match pick_address(&m, addr, length) {
-            Some(a) => a,
-            None => return EINVAL,
-        };
-        let pos = m
-            .vmas
-            .binary_search_by_key(&vaddr, |v| v.start)
-            .unwrap_or_else(|e| e);
-        m.vmas.insert(
-            pos,
-            Vma {
-                start: vaddr,
-                end: vaddr + length,
-                prot: perms,
-                flags: VmaFlags::SHARED,
-                backing: VmaBacking::Shm {
-                    segment: seg.clone(),
-                    offset: 0,
-                },
-            },
-        );
-        let new_end = vaddr + length;
-        if new_end > m.last_end {
-            m.last_end = new_end;
-        }
-        vaddr
-    };
 
-    let vm_arc = addr_space.vmspace.clone();
-    {
-        let mut vm = vm_arc.lock();
-        let mut mapped = 0usize;
-        let mut failed = false;
-        for (i, frame) in seg.frames.iter().enumerate() {
-            let page_addr = VirtAddr::new(vaddr + (i * PAGE_SIZE) as u64);
-            let page = match Page::<Size4KiB>::from_start_address(page_addr) {
-                Ok(p) => p,
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            };
-            if vm.map_one_frame(page, *frame, perms).is_err() {
-                failed = true;
-                break;
-            }
-            mapped += 1;
-        }
-        if failed {
-            for j in 0..mapped {
-                vm.unmap_keep_frame(VirtAddr::new(vaddr + (j * PAGE_SIZE) as u64));
-            }
-            drop(vm);
-            addr_space.mmap.lock().vmas.retain(|v| v.start != vaddr);
-            return ENOMEM;
-        }
+    let r = crate::syscall::mm::map_shared_segment(vaddr, length, perms, seg.clone(), 0, true);
+    if r < 0 {
+        return r;
     }
-    seg.attached.fetch_add(1, Ordering::AcqRel);
+
     seg.atime.store(now_secs(), Ordering::Relaxed);
     seg.lpid
         .store(sched::current_tgid().raw(), Ordering::Relaxed);
@@ -234,13 +227,12 @@ pub fn shmat(shmid: i32, addr: u64, flags: u32) -> i64 {
 pub fn shmdt(addr: u64) -> i64 {
     let detached = sched::current_addr_space_opt().and_then(|addr_space| {
         let mut m = addr_space.mmap.lock();
-        let pos = m.vmas.iter().position(|v| v.start == addr)?;
-        let vma = &m.vmas[pos];
+        let vma = m.vmas().iter().find(|v| v.start == addr)?;
         match &vma.backing {
             VmaBacking::Shm { segment, .. } => {
                 let length = vma.end - vma.start;
                 let segment = segment.clone();
-                m.vmas.remove(pos);
+                m.remove_vma_at(addr);
                 Some((segment, length))
             }
             _ => None,
@@ -291,18 +283,13 @@ pub fn detach_all_for(
 ) {
     let detached: Vec<(Arc<ShmSegment>, u64, u64)> = {
         let mut m = addr_space.mmap.lock();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < m.vmas.len() {
-            if let VmaBacking::Shm { segment, .. } = &m.vmas[i].backing {
-                let v = &m.vmas[i];
-                out.push((segment.clone(), v.start, v.end - v.start));
-                m.vmas.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        out
+        m.drain_vmas_where(|v| matches!(v.backing, VmaBacking::Shm { .. }))
+            .into_iter()
+            .filter_map(|v| match v.backing {
+                VmaBacking::Shm { segment, .. } => Some((segment, v.start, v.end - v.start)),
+                _ => None,
+            })
+            .collect()
     };
 
     if detached.is_empty() {
@@ -470,7 +457,7 @@ fn pick_address(m: &crate::process_model::MmapState, addr: u64, length: u64) -> 
             Some(e) if e <= frame::mm::vm::USER_VA_END => e,
             _ => return None,
         };
-        for vma in &m.vmas {
+        for vma in m.vmas() {
             if !(vma.end <= addr || vma.start >= end) {
                 return None;
             }
