@@ -274,6 +274,11 @@ path = "tests/subsystem/mmap_extras.rs"
 harness = false
 
 [[test]]
+name = "stress_threads"
+path = "tests/subsystem/stress_threads.rs"
+harness = false
+
+[[test]]
 name = "threads"
 path = "tests/subsystem/threads.rs"
 harness = false

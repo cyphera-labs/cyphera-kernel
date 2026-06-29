@@ -84,6 +84,7 @@ members = [
     "proc_ptrace_traceexec",
     "proc_ptrace_traceexit",
     "proc_syscalls",
+    "proc_stress_threads",
     "proc_threads",
     "proc_threads_coherence",
     "proc_threads_shm",
